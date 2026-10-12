@@ -132,6 +132,23 @@ static const unsigned kTraceMax = 900;
 static const SInt32 kNVRMMinBacklight = 5;   // never 0: some panels switch the backlight off completely
 #define BLLOG(fmt, ...) do { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); } while (0)
 
+// A panel whose brightness is only reachable over the eDP AUX channel is served by NVRMEdpBL (its own kext, from
+// nvrm_edpbl.cpp): same "NVRMBacklight" function, kIOReturnNotFound when the panel is not that kind. Asked first;
+// everything else, and a machine without that kext, goes to NVRM as before.
+static IOReturn nvrmBacklightCall(IOService *rm, const OSSymbol *fn, NvU32 *percent, bool set)
+{
+    static IOService *edp;
+    if (!edp) {
+        OSDictionary *m = IOService::serviceMatching("NVRMEdpBL");
+        if (m) { edp = IOService::waitForMatchingService(m, 1000000ULL); m->release(); }
+    }
+    if (edp) {
+        IOReturn r = edp->callPlatformFunction(fn, false, percent, set ? (void *)1 : NULL, NULL, NULL);
+        if (r != kIOReturnNotFound && r != kIOReturnUnsupported) return r;
+    }
+    return rm->callPlatformFunction(fn, false, percent, set ? (void *)1 : NULL, NULL, NULL);
+}
+
 class NVRMBacklightHandler : public IODisplayParameterHandler {
     OSDeclareDefaultStructors(NVRMBacklightHandler)
     IOService *fRM = nullptr;
@@ -207,7 +224,7 @@ void NVRMBacklightHandler::applyFire(thread_call_param_t p, thread_call_param_t)
     do { v = me->fPending; } while (!OSCompareAndSwap((UInt32)v, (UInt32)-1, (volatile UInt32 *)&me->fPending));
     if (v < 0) return;
     NvU32 percent = (NvU32)(v < kNVRMMinBacklight ? kNVRMMinBacklight : v);
-    IOReturn r = me->fRM->callPlatformFunction(me->fFn, false, &percent, (void *)1, NULL, NULL);
+    IOReturn r = nvrmBacklightCall(me->fRM, me->fFn, &percent, true);
     if (r == kIOReturnSuccess) me->fLevel = v;
     else BLLOG("backlight: setting %u%% failed (0x%x)", (unsigned)percent, r);
 }
@@ -2033,7 +2050,7 @@ void NVRMNVDAFramebuffer::publishBacklight()
     while (rm && strcmp(rm->getMetaClass()->getClassName(), "NVRM") != 0) rm = rm->getProvider();
     const OSSymbol *fn = OSSymbol::withCString("NVRMBacklight");
     NvU32 level = 0;
-    IOReturn r = (rm && fn) ? rm->callPlatformFunction(fn, false, &level, NULL, NULL, NULL) : kIOReturnNotFound;
+    IOReturn r = (rm && fn) ? nvrmBacklightCall(rm, fn, &level, false) : kIOReturnNotFound;
     OSSafeReleaseNULL(fn);
     if (r != kIOReturnSuccess) { FBLOG("fb%u: internal panel, but NVKMS registered no backlight (0x%x) -- no brightness control", fIndex, r); return; }
     fBacklight = NVRMBacklightHandler::withRM(rm, level);
