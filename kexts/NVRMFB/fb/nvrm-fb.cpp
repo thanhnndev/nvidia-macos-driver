@@ -69,6 +69,26 @@ static inline void nvu_copy(void *d, const void *s, size_t n) { __asm__ __volati
 // Clears freshly granted VRAM through its BAR1 mapping. Byte stores are the slow case there: on an RTX 3070 Laptop a byte-wise clear of an
 // 8 MB grant took ~180 ms with WindowServer waiting on it; 8-byte stores do the same job with 8x fewer PCIe writes (~20 ms).
 static inline void nvu_zero_wide(void *p, size_t n) { size_t q = n >> 3; __asm__ __volatile__("rep stosq" : "+D"(p), "+c"(q) : "a"(0ull) : "memory"); nvu_zero(p, n & 7); }
+// The same clear with non-temporal 8-byte stores (MOVNTI: an integer-register instruction, so no SSE/AVX state has to be
+// saved in the kernel). `rep stos*` into the write-combined BAR1 mapping was measured at ~110 MB/s on this Ryzen AI HX 370
+// regardless of the element size (70 ms per 7.6 MB grant, NVAccel log, 7444 grants), i.e. one PCIe write per store; eight
+// consecutive MOVNTI fill a write-combining buffer, which goes out as a single 64-byte write.
+static inline void nvu_zero_stream(void *p, size_t n)
+{
+    uint8_t *d = (uint8_t *)p;
+    size_t head = (size_t)(-(uintptr_t)d) & 7;
+    if (head > n) head = n;
+    if (head) { nvu_zero(d, head); d += head; n -= head; }
+    for (size_t lines = n >> 6; lines; lines--, d += 64)
+        __asm__ __volatile__(
+            "movnti %1,  0(%0)\n\tmovnti %1,  8(%0)\n\tmovnti %1, 16(%0)\n\tmovnti %1, 24(%0)\n\t"
+            "movnti %1, 32(%0)\n\tmovnti %1, 40(%0)\n\tmovnti %1, 48(%0)\n\tmovnti %1, 56(%0)"
+            : : "r"(d), "r"(0ull) : "memory");
+    for (size_t words = (n & 63) >> 3; words; words--, d += 8)
+        __asm__ __volatile__("movnti %1, (%0)" : : "r"(d), "r"(0ull) : "memory");
+    __asm__ __volatile__("sfence" ::: "memory");
+    nvu_zero(d, n & 7);
+}
 #define FBTRACE(buf) do { trace(buf); } while (0)
 #define FBSEL(a) char _s[5] = { (char)((a) >> 24), (char)((a) >> 16), (char)((a) >> 8), (char)(a), 0 }
 #define FBLOG(fmt, ...) do { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); \
@@ -2387,6 +2407,14 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_release_bytes, CTLFLAG_RD | CTLFLAG_LO
 static volatile SInt64 gVramBudgetBytes = 0;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_budget_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramBudgetBytes, "the BAR1 grant budget in force");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_mapped_bytes,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramMappedBytes,  "the BAR1 budget counter, live");
+// vramGrant holds NVRMDisplayGate while it clears the block, and every flip and cursor update takes the same gate, so the
+// clear time is also the time the display path is stalled. These counters make it readable without a trace.
+static int gClearMode = 1;   // 1 = non-temporal stores (default), 0 = rep stosq (what 1.14.x shipped)
+static SInt64 gClearUsSum, gClearBytes, gClearUsMax;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_clear_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &gClearMode, 0, "VRAM grant clear: 1 = non-temporal stores, 0 = rep stosq");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_clear_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gClearUsSum, "microseconds spent clearing granted VRAM");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_clear_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gClearBytes, "bytes cleared");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_clear_us_max, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gClearUsMax, "the slowest clear, us");
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -2433,6 +2461,8 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_releases); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_release_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_mapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_budget_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_clear_mode); sysctl_register_oid(&sysctl__debug_nvrmfb_clear_us_sum);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_clear_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_clear_us_max);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_lean);
@@ -2508,7 +2538,10 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     }
     if (!mem) { OSAddAtomic64(-(SInt64)want, &gVramMappedBytes); return false; }
 
-    nvu_zero_wide(kva, (size_t)want);
+    {   const uint64_t c0 = mach_absolute_time();
+        if (gClearMode) nvu_zero_stream(kva, (size_t)want); else nvu_zero_wide(kva, (size_t)want);
+        const SInt64 us = (SInt64)((mach_absolute_time() - c0) / 1000);   // same unit as the flip timer above (1 tick = 1 ns)
+        OSAddAtomic64(us, &gClearUsSum); OSAddAtomic64((SInt64)want, &gClearBytes); if (us > gClearUsMax) gClearUsMax = us; }
     volatile NvU64 *q = (volatile NvU64 *)kva;
     q[0] = 0x5A5AA5A5C0FFEE01ull;
     NvU64 back = q[0];
