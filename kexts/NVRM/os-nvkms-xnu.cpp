@@ -409,6 +409,9 @@ NvU32 nvkms_enumerate_gpus(nv_gpu_info_t *gpu_info)
 NvBool nvkms_open_gpu(NvU32 gpuId, NvBool) { nv_state_t *nv = nv_xnu_gpu_state(); return nv && nv->gpu_id == gpuId; }
 void nvkms_close_gpu(NvU32, NvBool) {}
 
+extern "C" int nvrm_edpbl_get(NvU32 gpuId, NvU32 *percent);   // nvrm_edpbl.cpp: 1 handled, 0 not an AUX panel, -1 failed
+extern "C" int nvrm_edpbl_set(NvU32 gpuId, NvU32 percent);
+
 // NVKMS reports a backlight-capable internal panel here (nvRmRegisterBacklight); nvidia-modeset-linux.c
 // turns it into a Linux backlight device. Kept so NVRMFB can set the panel's brightness through
 // NVRM::callPlatformFunction("NVRMBacklight") -> nvkms_xnu_backlight().
@@ -435,6 +438,12 @@ NvBool nvkms_xnu_backlight(NvBool set, NvU32 *percent)
 {
     if (!percent || !gKmsLock) return NV_FALSE;
     if (set && *percent > 100) *percent = 100;   // NVKMS takes percent; never pass more than full brightness
+    // A panel with only an AUX (DPCD) brightness control: RM's call succeeds and the panel stays as it was, so the
+    // registers are written here (nvrm_edpbl.cpp). Not under gKmsLock: that module makes its own RM calls.
+    if (nv_state_t *nv = nv_xnu_gpu_state()) {
+        int r = set ? nvrm_edpbl_set(nv->gpu_id, *percent) : nvrm_edpbl_get(nv->gpu_id, percent);
+        if (r != 0) return r > 0 ? NV_TRUE : NV_FALSE;
+    }
     IOLockLock(gKmsLock);
     NvBool ok = gKmsBacklightRegistered && kms_pm_wait_locked(true, 0) &&
                 (set ? nvKmsSetBacklight(gKmsBacklight.display_id, gKmsBacklight.drv_priv, *percent)
