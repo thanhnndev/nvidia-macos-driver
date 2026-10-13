@@ -8,7 +8,7 @@ Noncommercial 1.0.0). **No binaries are published here.** The branch is `v1.15.0
 |---|---|
 | `kexts/NVRM/nvrm_edpbl.cpp` + 9 lines in `os-nvkms-xnu.cpp` | eDP panels with **AUX-only brightness** (no PWM pin, DPCD `0x721` = 2, level in `0x722/3`): RM's `SET_BACKLIGHT_BRIGHTNESS` returns success and does nothing there, so the level is written over DPCD on a private kernel RM client |
 | `kexts/NVRMEdpBL/` | the same code packaged as its own kext (NVRM is only buildable inside NullMoth's tree); `NVRMFB` asks that service first and falls back to NVRM, so a machine without the kext behaves as upstream |
-| `kexts/NVRMFB/fb/nvrm-fb.cpp` | VRAM grant clear with non-temporal stores (`debug.nvrmfb_clear_mode`), plus the hook above |
+| `kexts/NVRMFB/fb/nvrm-fb.cpp` | VRAM grant clear with non-temporal stores (`debug.nvrmfb_clear_mode`), plus the hook above. Optional: once the host's PAT slot PA6 is write-combining, `rep stosq` (upstream) is within 3-4 % of it, so this is not proposed upstream |
 | `kexts/NVRMEdpBL/NVRMEdpBL.cpp` | `KMOD_EXPLICIT_DECL`, without which `kmutil` cannot link the kext |
 
 Boot-arg `nvrmedpbl=0|1|2`: 0 off, 1 AUX-only panels (default), 2 any panel with the AUX capability.
