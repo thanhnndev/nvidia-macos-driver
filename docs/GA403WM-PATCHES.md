@@ -1,8 +1,8 @@
-# Branch `ga403wm`: upstream 1.14.7 + two patches for the ASUS ROG Zephyrus G14 (GA403WM)
+# Branch `ga403wm`: upstream 1.15.0 + two patches for the ASUS ROG Zephyrus G14 (GA403WM)
 
 Fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver) kept by the
 [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) project. Same licence as upstream (PolyForm
-Noncommercial 1.0.0). **No binaries are published here.** The branch is `v1.14.7` plus these changes (and this file), nothing else:
+Noncommercial 1.0.0). **No binaries are published here.** The branch is `v1.15.0` plus these changes (and this file), nothing else:
 
 | Commit | What |
 |---|---|
