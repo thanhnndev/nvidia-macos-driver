@@ -8,6 +8,7 @@
 // NVRMFB asks this service first for "NVRMBacklight"; it answers kIOReturnNotFound for panels that RM drives.
 #include "nv-xnu.h"
 #include <IOKit/IOService.h>
+#include <mach/kmod.h>
 
 extern "C" {
 nv_state_t *nv_xnu_gpu_state(void);                         // NVRM
@@ -37,5 +38,7 @@ public:
 };
 #define super IOService
 OSDefineMetaClassAndStructors(NVRMEdpBL, IOService)
+extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMEdpBL, "0.1", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
