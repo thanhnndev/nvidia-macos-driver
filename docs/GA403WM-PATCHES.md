@@ -1,8 +1,8 @@
-# Branch `ga403wm`: upstream 1.15.0 + one patch (OLED brightness) for the ASUS ROG Zephyrus G14 (GA403WM)
+# Branch `ga403wm`: upstream 2.3.1 + one patch (OLED brightness) for the ASUS ROG Zephyrus G14 (GA403WM)
 
 Fork of [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver) kept by the
 [ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh) project. Same licence as upstream (PolyForm
-Noncommercial 1.0.0). **No binaries are published here.** The branch is `v1.15.0` plus these changes (and this file), nothing else:
+Noncommercial 1.0.0). **No binaries are published here.** The branch is `v2.3.1` plus these changes (and this file), nothing else:
 
 | Commit | What |
 |---|---|
@@ -27,4 +27,4 @@ undo are in `scripts/` of the ga403wm-hackintosh repository
 `docs/OLED-BRIGHTNESS-DPCD.md`. Building needs the open-gpu-kernel-modules 610.57.04 headers.
 
 Only checked on one machine (RTX 5060 Laptop + 2880x1800 OLED, macOS 15.8.1). A panel that is not AUX-only is left to RM.
-Keep upstream's rules: macOS 15 only, back up your EFI, start once without the NVIDIA driver if something goes wrong.
+Keep upstream's rules: macOS 15/26 per the release, back up your EFI, start once without the NVIDIA driver if something goes wrong.
