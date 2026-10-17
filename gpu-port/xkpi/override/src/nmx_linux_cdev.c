@@ -213,6 +213,8 @@ struct nmx_open {
 };
 
 #define OPEN_BUCKETS 64
+/* an open id is (sequence << 8) | node minor (xnu/nmx_devfs.cpp): hash the sequence */
+#define OPEN_BUCKET(id) (((unsigned)(id) >> 8) % OPEN_BUCKETS)
 static TAILQ_HEAD(, nmx_open) opens[OPEN_BUCKETS];
 static struct mtx opens_mtx;
 MTX_SYSINIT(nmx_opens, &opens_mtx, "cdev opens", MTX_DEF);
@@ -221,7 +223,7 @@ static struct nmx_open *open_find(int id)
 {
     struct nmx_open *o;
     mtx_lock(&opens_mtx);
-    TAILQ_FOREACH(o, &opens[(unsigned)id % OPEN_BUCKETS], link)
+    TAILQ_FOREACH(o, &opens[OPEN_BUCKET(id)], link)
         if (o->id == id)
             break;
     mtx_unlock(&opens_mtx);
@@ -319,9 +321,9 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
     leave(prev);
 
     mtx_lock(&opens_mtx);
-    if (opens[(unsigned)open_id % OPEN_BUCKETS].tqh_last == NULL)
-        TAILQ_INIT(&opens[(unsigned)open_id % OPEN_BUCKETS]);
-    TAILQ_INSERT_HEAD(&opens[(unsigned)open_id % OPEN_BUCKETS], o, link);
+    if (opens[OPEN_BUCKET(open_id)].tqh_last == NULL)
+        TAILQ_INIT(&opens[OPEN_BUCKET(open_id)]);
+    TAILQ_INSERT_HEAD(&opens[OPEN_BUCKET(open_id)], o, link);
     mtx_unlock(&opens_mtx);
     return 0;
 }
@@ -342,11 +344,11 @@ int nmx_cdev_close(int open_id, int fflags)
 {
     struct nmx_open *o;
     mtx_lock(&opens_mtx);
-    TAILQ_FOREACH(o, &opens[(unsigned)open_id % OPEN_BUCKETS], link)
+    TAILQ_FOREACH(o, &opens[OPEN_BUCKET(open_id)], link)
         if (o->id == open_id)
             break;
     if (o != NULL)
-        TAILQ_REMOVE(&opens[(unsigned)open_id % OPEN_BUCKETS], o, link);
+        TAILQ_REMOVE(&opens[OPEN_BUCKET(open_id)], o, link);
     mtx_unlock(&opens_mtx);
     if (o == NULL)
         return EBADF;

@@ -3,8 +3,12 @@
  *
  * One xnu cdevsw serves every node. Each node is a clone node (devfs_make_node_clone): every open() of it is given
  * a minor number of its own, and that minor identifies the open in all later calls, which is how per-open state (a
- * Linux struct file) exists although an xnu cdevsw entry point receives only a dev_t. Node minors are 0..255; open
- * minors start at 256.
+ * Linux struct file) exists although an xnu cdevsw entry point receives only a dev_t.
+ *
+ * devfs clones at every lookup, stat(2) included, so the dev_t a process sees changes from one stat to the next. libdrm
+ * (patches/libdrm-macos.patch) identifies a DRM node by its minor and names it from it (card<minor>, renderD<minor>), so
+ * an open minor is (open sequence << 8) | node minor, and a node's minor is its DRM minor number: dri/card0 is 0,
+ * dri/renderD128 is 128. libdrm on macOS reads only the low byte of a minor; other nodes take free minors from the top.
  *
  * Entry points call into the LinuxKPI side (nmx_cdev_*). mmap is not a cdevsw operation kexts can implement on
  * macOS, so user mappings of GPU memory are made by an ioctl through nmx_xnu_map_user (an IOKit mapping in the
@@ -18,6 +22,7 @@
 #include <sys/proc.h>
 #include <sys/vnode.h>
 #include <miscfs/devfs/devfs.h>
+#include <string.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLocks.h>
@@ -34,14 +39,24 @@ kern_return_t vm_deallocate(vm_map_t target, vm_offset_t address, vm_size_t size
 }
 
 #define NODE_MINORS 256
-#define OPEN_MINOR_MAX 65536
+#define OPEN_SEQ_MAX 65536                       /* open minor = seq << 8 | node, seq 1..65535 (minor is 24 bits) */
+#define OPEN_MINOR(seq, node) (((seq) << 8) | (node))
 
 static int g_major = -1;
 static IOLock *g_lock;
 static void *g_node_cookie[NODE_MINORS];       /* node minor -> LinuxKPI cookie (struct cdev *) */
 static void *g_node_handle[NODE_MINORS];       /* devfs node handles */
-static uint16_t g_open_node[OPEN_MINOR_MAX];   /* open minor -> node minor + 1 (0 = free) */
-static int g_open_next = NODE_MINORS;
+static uint16_t g_open_node[OPEN_SEQ_MAX];     /* open sequence -> node minor + 1 (0 = free) */
+static int g_open_next = 1;
+
+/* the sequence of open minor m, or -1 when m is not a live open */
+static int open_seq(int m)
+{
+    int seq = m >> 8;
+    if (seq <= 0 || seq >= OPEN_SEQ_MAX || g_open_node[seq] != (uint16_t)((m & 0xff) + 1))
+        return -1;
+    return seq;
+}
 
 /* ---- clone minors ------------------------------------------------------------------------------------------------- */
 
@@ -50,13 +65,13 @@ static int clone_minor(dev_t dev, int action)
     int node = minor(dev);
     if (action == DEVFS_CLONE_ALLOC) {
         IOLockLock(g_lock);
-        for (int tries = 0; tries < OPEN_MINOR_MAX - NODE_MINORS; tries++) {
-            int m = g_open_next;
-            g_open_next = (g_open_next + 1 < OPEN_MINOR_MAX) ? g_open_next + 1 : NODE_MINORS;
-            if (g_open_node[m] == 0) {
-                g_open_node[m] = (uint16_t)(node + 1);
+        for (int tries = 0; tries < OPEN_SEQ_MAX - 1; tries++) {
+            int seq = g_open_next;
+            g_open_next = (g_open_next + 1 < OPEN_SEQ_MAX) ? g_open_next + 1 : 1;
+            if (g_open_node[seq] == 0) {
+                g_open_node[seq] = (uint16_t)(node + 1);
                 IOLockUnlock(g_lock);
-                return m;
+                return OPEN_MINOR(seq, node);
             }
         }
         IOLockUnlock(g_lock);
@@ -70,8 +85,8 @@ static void *cookie_for_open(int m, int *node_out)
 {
     void *cookie = nullptr;
     IOLockLock(g_lock);
-    if (m >= NODE_MINORS && m < OPEN_MINOR_MAX && g_open_node[m]) {
-        int node = g_open_node[m] - 1;
+    if (open_seq(m) > 0) {
+        int node = m & 0xff;
         cookie = g_node_cookie[node];
         if (node_out)
             *node_out = node;
@@ -91,7 +106,9 @@ static int nmx_open(dev_t dev, int flags, int devtype, struct proc *p)
     int err = nmx_cdev_open(cookie, m, flags);
     if (err) {
         IOLockLock(g_lock);
-        g_open_node[m] = 0;
+        int seq = open_seq(m);
+        if (seq > 0)
+            g_open_node[seq] = 0;
         IOLockUnlock(g_lock);
     }
     return err;
@@ -102,8 +119,9 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
     int m = minor(dev);
     int err = nmx_cdev_close(m, flags);
     IOLockLock(g_lock);
-    if (m >= NODE_MINORS && m < OPEN_MINOR_MAX)
-        g_open_node[m] = 0;
+    int seq = open_seq(m);
+    if (seq > 0)
+        g_open_node[seq] = 0;
     IOLockUnlock(g_lock);
     return err;
 }
@@ -180,8 +198,8 @@ extern "C" int nmx_xnu_devfs_busy(void)
 {
     int busy = 0;
     IOLockLock(g_lock);
-    for (int m = NODE_MINORS; m < OPEN_MINOR_MAX; m++)
-        if (g_open_node[m]) { busy++; }
+    for (int seq = 1; seq < OPEN_SEQ_MAX; seq++)
+        if (g_open_node[seq]) { busy++; }
     IOLockUnlock(g_lock);
     return busy;
 }
@@ -200,10 +218,29 @@ extern "C" void *nmx_xnu_devfs_make(const char *path, uint32_t uid, uint32_t gid
 {
     if (g_major < 0)
         return nullptr;
+    /* dri/card<N> and dri/renderD<N> take minor N (the DRM minor libdrm derives the node name from) */
+    int want = -1;
+    if (strncmp(path, "dri/", 4) == 0) {
+        const char *d = path + strlen(path);
+        while (d > path + 4 && d[-1] >= '0' && d[-1] <= '9')
+            d--;
+        if (*d != '\0') {
+            want = 0;
+            for (; *d && want < NODE_MINORS; d++)
+                want = want * 10 + (*d - '0');
+            if (want >= NODE_MINORS)
+                want = -1;
+        }
+    }
     IOLockLock(g_lock);
     int node = -1;
-    for (int i = 0; i < NODE_MINORS; i++)
-        if (g_node_cookie[i] == nullptr) { node = i; g_node_cookie[i] = cookie; break; }
+    if (want >= 0 && g_node_cookie[want] == nullptr)
+        node = want;
+    for (int i = NODE_MINORS - 1; node < 0 && i >= 0; i--)
+        if (g_node_cookie[i] == nullptr)
+            node = i;
+    if (node >= 0)
+        g_node_cookie[node] = cookie;
     IOLockUnlock(g_lock);
     if (node < 0)
         return nullptr;
