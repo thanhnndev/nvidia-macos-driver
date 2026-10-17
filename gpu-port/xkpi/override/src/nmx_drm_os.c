@@ -289,6 +289,17 @@ void debugfs_remove(struct dentry *dentry)
  * The port's libdrm uses it to enumerate GPUs (drmGetDevices2), which is how Mesa's RADV and ANV find their device;
  * drm-kmod leaves it to FreeBSD's own drm code, so the port answers it at the node. Returns -1 for any other ioctl.
  */
+/*
+ * The node's device is a PCI function. LinuxKPI's dev_is_pci() asks the device_t that LinuxKPI attached, which in the
+ * port is the DRM child of the PCI device record (as drmn is a child of vgapci on FreeBSD), so ask its parent too.
+ */
+static bool nmx_dev_is_pci(struct device *dev)
+{
+	device_t bd = dev->bsddev;
+
+	return bd != NULL && (is_pci_device(bd) || is_pci_device(device_get_parent(bd)));
+}
+
 int nmx_drm_node_ioctl(struct linux_file *filp, unsigned long cmd, void *data)
 {
 	struct drm_file *df;
@@ -333,7 +344,7 @@ int nmx_drm_node_ioctl(struct linux_file *filp, unsigned long cmd, void *data)
 		sg->len = err ? 0 : (uint32_t)len;
 		return err;
 	}
-	if (df == NULL || df->minor == NULL || df->minor->dev == NULL || !dev_is_pci(df->minor->dev->dev))
+	if (df == NULL || df->minor == NULL || df->minor->dev == NULL || !nmx_dev_is_pci(df->minor->dev->dev))
 		return ENODEV;
 	pdev = to_pci_dev(df->minor->dev->dev);
 	memset(pi, 0, sizeof(*pi));
