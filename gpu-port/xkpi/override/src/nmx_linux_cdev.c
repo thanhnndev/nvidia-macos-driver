@@ -20,6 +20,7 @@
 #include <sys/mutex.h>
 #include <sys/conf.h>
 #include <sys/file.h>
+#include <sys/vnode.h>
 #include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/stdarg.h>
@@ -77,6 +78,20 @@ static int make_dev_va(struct make_dev_args *args, struct cdev **cdevp, const ch
     c->si_gid = args->mda_gid;
     c->si_mode = (mode_t)args->mda_mode;
     c->nmx_refs = 1;                    /* the creation reference, dropped by destroy_dev */
+    /*
+     * LinuxKPI takes the Linux inode of an open from file->f_vnode: iminor() (drm_stub_open -> drm_minor_acquire) and
+     * i_cdev both read v_rdev. Without it every DRM open failed with ENODEV (iminor = -1U).
+     */
+    c->nmx_vnode = malloc(sizeof(*c->nmx_vnode), M_NMXCDEV,
+        ((args->mda_flags & MAKEDEV_NOWAIT) ? M_NOWAIT : M_WAITOK) | M_ZERO);
+    if (c->nmx_vnode == NULL) {
+        free(c, M_NMXCDEV);
+        return ENOMEM;
+    }
+    mtx_init(&c->nmx_vnode->v_interlock, "nmx vnode", NULL, MTX_DEF);
+    c->nmx_vnode->v_rdev = c;
+    c->nmx_vnode->v_type = VCHR;
+    c->nmx_vnode->v_usecount = 1;
 
     dev_lock();
     LIST_INSERT_HEAD(&c->si_devsw->d_devs, c, si_list);
@@ -88,6 +103,8 @@ static int make_dev_va(struct make_dev_args *args, struct cdev **cdevp, const ch
         dev_lock();
         LIST_REMOVE(c, si_list);
         dev_unlock();
+        mtx_destroy(&c->nmx_vnode->v_interlock);
+        free(c->nmx_vnode, M_NMXCDEV);
         free(c, M_NMXCDEV);
         return ENXIO;
     }
@@ -128,8 +145,13 @@ void dev_ref(struct cdev *c)
 
 void dev_rel(struct cdev *c)
 {
-    if (__atomic_sub_fetch(&c->nmx_refs, 1, __ATOMIC_ACQ_REL) == 0)
+    if (__atomic_sub_fetch(&c->nmx_refs, 1, __ATOMIC_ACQ_REL) == 0) {
+        if (c->nmx_vnode != NULL) {
+            mtx_destroy(&c->nmx_vnode->v_interlock);
+            free(c->nmx_vnode, M_NMXCDEV);
+        }
         free(c, M_NMXCDEV);
+    }
 }
 
 /*
@@ -268,6 +290,7 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
     fp->f_count = 1;
     fp->f_flag = (u_int)fflags & (FREAD | FWRITE | O_NONBLOCK | O_APPEND);
     fp->f_type = DTYPE_DEV;
+    fp->f_vnode = c->nmx_vnode;
     o->id = open_id;
     o->fp = fp;
     o->cdev = c;
@@ -281,6 +304,9 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
         err = sw->d_fdopen(c, fflags, curthread, fp);
     else if (sw->d_open != NULL)
         err = sw->d_open(c, fflags, 0x2000 /* S_IFCHR */, curthread);
+    /* FreeBSD devfs: d_fdopen returns ENXIO after finit() installed its own file operations - that is success */
+    if (err == ENXIO && sw->d_fdopen != NULL && fp->f_ops != NULL)
+        err = 0;
     if (err) {
         devfs_clear_cdevpriv();
         leave(prev);
