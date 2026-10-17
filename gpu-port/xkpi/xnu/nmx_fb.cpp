@@ -31,6 +31,7 @@ class NMXGPUFB : public IOFramebuffer {
     thread_call_t fVblTimer = nullptr;
     uint64_t fVblNext = 0;
     volatile bool fStopping = false;
+    bool fPowerRegistered = false;
 
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         NMXGPUFB *me = (NMXGPUFB *)p0;
@@ -67,7 +68,7 @@ public:
             fVblNext = d;
             thread_call_enter_delayed(fVblTimer, d);
         }
-        registerPowerDriver(this, kFbPowerStates, 2);
+        /* the power driver is registered in open(): see there */
         FBLOG("framebuffer %ux%u at %u.%02u Hz", fInfo.width, fInfo.height, fRefresh16 >> 16,
               ((fRefresh16 & 0xFFFF) * 100) >> 16);
         return true;
@@ -82,6 +83,21 @@ public:
             fVblTimer = nullptr;
         }
         IOFramebuffer::stop(provider);
+    }
+
+    /*
+     * ga403wm: on macOS 26 IOFramebuffer::powerStateWillChangeTo() (and getAttributeExt/handleEvent) dereference
+     * fPrivate->controller, which only IOFramebuffer::open() assigns. Registering the power driver in start() let the
+     * first power change reach it before any open and panicked (CR2 0x120, powerStateWillChangeTo+0x25). Register once
+     * the framebuffer is open.
+     */
+    IOReturn open() override {
+        IOReturn r = IOFramebuffer::open();
+        if (r == kIOReturnSuccess && !fPowerRegistered) {
+            fPowerRegistered = true;
+            registerPowerDriver(this, kFbPowerStates, 2);
+        }
+        return r;
     }
 
     IOReturn enableController() override { return kIOReturnSuccess; }

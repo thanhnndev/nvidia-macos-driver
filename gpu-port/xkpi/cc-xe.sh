@@ -4,17 +4,17 @@
 # FreeBSD LinuxKPI and drm-kmod's 6.14 DRM core. xe is not in drm-kmod, so it comes from the pristine 6.14 tree
 # (linux-6.14, MIT except the files listed in all-xe.sh, which are replaced, never compiled). Its display code is the
 # 6.14 i915 display built with xe's compat headers and -Ddrm_i915_private=xe_device, as Linux's Makefile does.
-X=/Volumes/MiniData/build/gpu-src/xkpi
-K=/Volumes/MiniData/build/gpu-src/kpi
+X=${GPU_SRC:-$HOME/develop/projects/gpu-src}/xkpi
+K=${GPU_SRC:-$HOME/develop/projects/gpu-src}/kpi
 L=$K/freebsd-src/sys/compat/linuxkpi
 D=$K/drm-kmod
-V=/Volumes/MiniData/build/gpu-src/linux-6.14
+V=${GPU_SRC:-$HOME/develop/projects/gpu-src}/linux-6.14
 XE=$X/xe-src
 SDK=$(xcrun --sdk macosx --show-sdk-path)
 KF=$SDK/System/Library/Frameworks/Kernel.framework/Headers
 src=$1; shift
 mkdir -p $X/obj-xe
-exec xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -ffile-prefix-map=/Volumes/MiniData/build/gpu-src=/src -mkernel -fapple-kext -nostdinc -std=gnu11 \
+exec xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -ffile-prefix-map=${GPU_SRC:-$HOME/develop/projects/gpu-src}=/src -mkernel -fapple-kext -nostdinc -std=gnu11 \
   -fno-builtin -fno-common -fno-strict-aliasing -fms-extensions -O2 -g0 \
   -Wno-pointer-sign -Wno-unused-parameter -Wno-microsoft-anon-tag -ferror-limit=80 \
   -D_KERNEL -DKERNEL -DKERNEL_PRIVATE -DLINUXKPI_VERSION=61400 -DNMXKPI=1 \

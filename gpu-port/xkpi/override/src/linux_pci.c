@@ -459,7 +459,16 @@ lkpifill_pci_dev(device_t dev, struct pci_dev *pdev)
 
 	/* Check if we have reached the root to satisfy pci_is_root_bus() */
 	dinfo = device_get_ivars(dev);
-	if (dinfo->cfg.pcie.pcie_location != 0 &&
+	if (1) {
+		/*
+		 * ga403wm: the xnu port records each GPU directly under its own bus, with no PCI-to-PCI
+		 * bridge devices above it, so pci_upstream_bridge() can only ever return the device
+		 * itself. amdgpu_device_partner_bandwidth() skips ATI parents and therefore never left
+		 * that walk (the attach spun forever on the Radeon 890M). Report a root bus, as for an
+		 * integrated GPU on the root complex: amdgpu then uses its APU/root-bus PCIe defaults.
+		 */
+		pdev->bus->self = NULL;
+	} else if (dinfo->cfg.pcie.pcie_location != 0 &&
 	    dinfo->cfg.pcie.pcie_type == PCIEM_TYPE_ROOT_PORT) {
 		pdev->bus->self = NULL;
 	} else {
