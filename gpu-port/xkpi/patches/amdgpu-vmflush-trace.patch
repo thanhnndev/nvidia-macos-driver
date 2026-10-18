@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -784,6 +784,18 @@
+ 			job->vm_pd_addr != AMDGPU_BO_INVALID_OFFSET;
+ 	pasid_mapping_needed &= adev->gmc.gmc_funcs->emit_pasid_mapping &&
+ 		ring->funcs->emit_wreg;
++
++	{
++		/* NullMoth: which VMID / page directory each gfx job runs with, and whether a TLB flush was emitted */
++		static unsigned int nmx_vmf;
++
++		if (ring->funcs->type == AMDGPU_RING_TYPE_GFX && nmx_vmf < 400) {
++			nmx_vmf++;
++			printf("NullMoth vmflush #%u: %s vmid %u pasid %u pd %llx vm_flush %d pasid_map %d pipe_sync %d gpu_reset %d\n",
++			    nmx_vmf, ring->name, job->vmid, job->pasid, (unsigned long long)job->vm_pd_addr,
++			    vm_flush_needed, pasid_mapping_needed, need_pipe_sync, amdgpu_vmid_had_gpu_reset(adev, id));
++		}
++	}
+ 
+ 	if (!vm_flush_needed && !gds_switch_needed && !need_pipe_sync &&
+ 	    !(job->enforce_isolation && !job->vmid))
