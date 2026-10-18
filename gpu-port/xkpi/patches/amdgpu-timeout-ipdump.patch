@@ -1,0 +1,16 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-10-18 16:08:39
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-10-18 16:08:39
+@@ -31,6 +31,13 @@
+ void amdgpu_coredump(struct amdgpu_device *adev, bool skip_vram_check,
+ 		     bool vram_lost, struct amdgpu_job *job)
+ {
++	/* NullMoth: no devcoredump on xnu - print the IP state a job timeout captured (GRBM/CP/RLC registers) to the log */
++	struct drm_printer p = drm_info_printer(adev->dev);
++	int i;
++
++	for (i = 0; i < adev->num_ip_blocks; i++)
++		if (adev->ip_blocks[i].version->funcs->print_ip_state)
++			adev->ip_blocks[i].version->funcs->print_ip_state(&adev->ip_blocks[i], &p);
+ }
+ #else
+ 

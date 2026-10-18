@@ -13,6 +13,8 @@
  */
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
+#include <mach/mach_time.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IONVRAM.h>
 #include <IOKit/pci/IOPCIDevice.h>
@@ -255,9 +257,12 @@ void NMXGPU::stop(IOService *provider)
 IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
 {
     if (dev_ != nullptr) {
+        uint64_t t0 = mach_absolute_time(), t1, ns;
+        IOLog("NullMoth GPU: setPowerState(%lu) begin\n", state);
         int err = nmx_port_power(dev_, state != 0);
-        if (err)
-            IOLog("NullMoth GPU: %s returned %d\n", state ? "resume" : "suspend", err);
+        t1 = mach_absolute_time();
+        absolutetime_to_nanoseconds(t1 - t0, &ns);
+        IOLog("NullMoth GPU: %s returned %d in %llu ms\n", state ? "resume" : "suspend", err, ns / 1000000);
     }
     return kIOPMAckImplied;
 }

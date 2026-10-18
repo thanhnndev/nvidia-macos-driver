@@ -257,7 +257,17 @@ void nmx_fb_close(void *dev)
 int nmx_fb_power(void *dev, int on)
 {
     for (int i = 0; i < MAX_FB; i++)
-        if (fbs[i].dev == dev)
-            return -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
+        if (fbs[i].dev == dev) {
+            /* traced with timings: display sleep once hung the machine ~23 s later (docs/890M-TRACE.md) */
+            struct timespec t0, t1;
+            int err;
+            nanouptime(&t0);
+            printf("NullMoth display: power %s begin\n", on ? "on" : "off");
+            err = -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
+            nanouptime(&t1);
+            printf("NullMoth display: power %s done err %d in %ld ms\n", on ? "on" : "off", err,
+                   (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+            return err;
+        }
     return ENODEV;
 }
