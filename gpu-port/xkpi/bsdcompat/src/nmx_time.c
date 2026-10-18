@@ -10,13 +10,40 @@
 
 volatile time_t time_second;
 
+extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+
+/*
+ * User CLOCK_MONOTONIC on macOS is (calendar time - kern.boottime), which trails mach_continuous_time by the ~0.4 s
+ * between mach's epoch and boottime being stamped. DRM syncobj/CS deadlines are absolute CLOCK_MONOTONIC ns, so the
+ * kernel's ktime must share that origin (with mach_absolute_time every wait timed out 0.4 s early). The offset is
+ * measured once and then fixed, so kernel time stays strictly monotonic and wall-clock steps are not followed.
+ */
+static int64_t mono_off_ns;
+static int mono_off_done;
+
+static void mono_calibrate(void)
+{
+    struct timeval bt = { 0, 0 };
+    size_t len = sizeof(bt);
+    clock_sec_t s;
+    clock_nsec_t n;
+    uint64_t cont;
+    if (sysctlbyname("kern.boottime", &bt, &len, NULL, 0) == 0 && bt.tv_sec != 0) {
+        absolutetime_to_nanoseconds(mach_continuous_time(), &cont);
+        clock_get_calendar_nanotime(&s, &n);
+        int64_t mono = ((int64_t)s - bt.tv_sec) * 1000000000LL + (int64_t)n - (int64_t)bt.tv_usec * 1000LL;
+        mono_off_ns = (int64_t)cont - mono;
+    }
+    mono_off_done = 1;
+}
+
 static uint64_t uptime_ns(void)
 {
     uint64_t ns;
-    /* continuous time (counts sleep), the base of user CLOCK_MONOTONIC: DRM syncobj/CS deadlines are absolute
-     * CLOCK_MONOTONIC ns, mach_absolute_time was ~0.47 s behind and every syncobj wait timed out early */
+    if (!mono_off_done)
+        mono_calibrate();
     absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
-    return ns;
+    return ns - (uint64_t)mono_off_ns;
 }
 
 sbintime_t sbinuptime(void)
