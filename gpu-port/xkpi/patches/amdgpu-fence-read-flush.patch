@@ -1,0 +1,27 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -117,8 +117,23 @@
+ 	struct amdgpu_fence_driver *drv = &ring->fence_drv;
+ 	u32 seq = 0;
+ 
+-	if (drv->cpu_addr)
++	if (drv->cpu_addr) {
++		/*
++		 * NullMoth: the fence page is written by the GPU through system memory and the kernel's mapping is
++		 * write-back. A line already in the CPU's cache hides the GPU's write (fences "never" complete, only the
++		 * fallback timer fires). Flush the line, read again, and count/log every case where the plain read was stale.
++		 */
++		static int stale_logged;
++		u32 plain = le32_to_cpu(*drv->cpu_addr);
++
++		__asm__ __volatile__("clflush %0" : : "m"(*(volatile char *)drv->cpu_addr) : "memory");
++		__asm__ __volatile__("mfence" : : : "memory");
+ 		seq = le32_to_cpu(*drv->cpu_addr);
++		if (seq != plain && stale_logged < 40) {
++			stale_logged++;
++			printf("NullMoth: STALE fence read on %s: cached %u, memory %u\n", ring->name, plain, seq);
++		}
++	}
+ 	else
+ 		seq = atomic_read(&drv->last_seq);
+ 
