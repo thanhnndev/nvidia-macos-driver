@@ -1,11 +1,29 @@
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-10-18 16:08:39
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-10-18 16:08:39
-@@ -31,6 +31,13 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
+@@ -28,9 +28,31 @@
+ #include "atom.h"
+ 
+ #ifndef CONFIG_DEV_COREDUMP
++/* the port's printf has no %pV, so drm_info_printer would print the va_format pointer: format the line here */
++static void nmx_ipdump_printfn(struct drm_printer *p, struct va_format *vaf)
++{
++	char line[200];
++	int n;
++
++	vsnprintf(line, sizeof(line), vaf->fmt, *vaf->va);
++	for (n = strlen(line); n > 0 && (line[n - 1] == '
++' || line[n - 1] == ' ' || line[n - 1] == '	'); n--)
++		line[n - 1] = 0;
++	if (n)
++		printf("NullMoth ipdump: %s
++", line);
++}
++
  void amdgpu_coredump(struct amdgpu_device *adev, bool skip_vram_check,
  		     bool vram_lost, struct amdgpu_job *job)
  {
 +	/* NullMoth: no devcoredump on xnu - print the IP state a job timeout captured (GRBM/CP/RLC registers) to the log */
-+	struct drm_printer p = drm_info_printer(adev->dev);
++	struct drm_printer p = { .printfn = nmx_ipdump_printfn };
 +	int i;
 +
 +	for (i = 0; i < adev->num_ip_blocks; i++)
