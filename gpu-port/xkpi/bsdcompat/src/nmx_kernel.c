@@ -235,6 +235,22 @@ void nmx_thread_leave(int created)
     nmx_thread_drop_current();
 }
 
+/*
+ * Called by the device-node glue as an entry point returns: a critical section the driver left open must not go back
+ * to user space with interrupts off (Step33c) - log it and close it.
+ */
+void nmx_thread_crit_check(const char *where)
+{
+    if (ml_at_interrupt_context())
+        return;
+    struct thread *td = nmx_curthread();
+    if (td->td_critnest != 0) {
+        printf("NullMoth xkpi: %s returned with critical nesting %d - closed\n", where, td->td_critnest);
+        td->td_critnest = 0;
+        ml_set_interrupts_enabled((boolean_t)td->td_crit_saved);
+    }
+}
+
 void nmx_thread_exit_cleanup(void)
 {
     nmx_thread_leave(1);
@@ -255,29 +271,36 @@ struct thread *tdfind(lwpid_t tid, pid_t pid)
 
 /*
  * Critical sections: xnu does not let kexts disable preemption, so a critical section runs with interrupts off on
- * this CPU, which also rules out preemption and migration. Nesting is counted per CPU; the interrupt state from the
- * outermost entry is restored at the outermost exit. LinuxKPI's critical sections are short and never sleep.
+ * this CPU, which also rules out preemption and migration. The interrupt state from the outermost entry is restored
+ * at the outermost exit.
+ *
+ * Nesting is counted per thread (ga403wm, docs/890M-TRACE.md Step33c). Every LinuxKPI spin_lock enters one
+ * (local_bh_disable -> sched_pin), and a spin_lock taken inside another can block in lck_mtx_lock and resume on
+ * another CPU: with a per-CPU count the exit then decremented the new CPU's count, the old CPU's stayed raised, and
+ * the next thread to leave a critical section there never got its interrupts back - a process exiting with
+ * interrupts off panicked in workq_exit ("unsafe thread_call_cancel_wait"). The thread record is looked up before
+ * interrupts go off (the outermost entry may create it).
  */
-static struct { int nest; boolean_t saved; } nmx_crit[MAXCPU];
-
 void nmx_critical_enter(void)
 {
+    struct thread *td = nmx_curthread();
     boolean_t was = ml_set_interrupts_enabled(FALSE);
-    int c = cpu_number();
-    if (nmx_crit[c].nest++ == 0)
-        nmx_crit[c].saved = was;
+    if (td->td_critnest++ == 0)
+        td->td_crit_saved = was;
 }
 
 void nmx_critical_exit(void)
 {
-    int c = cpu_number();
-    if (--nmx_crit[c].nest == 0)
-        ml_set_interrupts_enabled(nmx_crit[c].saved);
+    struct thread *td = nmx_curthread();
+    if (td->td_critnest <= 0)
+        panic("NullMoth xkpi: critical_exit without critical_enter");
+    if (--td->td_critnest == 0)
+        ml_set_interrupts_enabled((boolean_t)td->td_crit_saved);
 }
 
 int nmx_in_critical(void)
 {
-    return (ml_at_interrupt_context() || nmx_crit[cpu_number()].nest > 0) ? 1 : 0;
+    return (ml_at_interrupt_context() || nmx_curthread()->td_critnest > 0) ? 1 : 0;
 }
 
 int nmx_curcpu(void)

@@ -536,8 +536,10 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
 {
     uint64_t fixed = (req->flags & NMX_DRM_MMAP_FIXED) ? req->addr : 0;
     req->addr = 0;
-    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & PAGE_MASK) != 0 || req->size == 0 ||
-        req->size > (1ULL << 40) || (fixed & PAGE_MASK) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
+    /* LinuxKPI's PAGE_MASK is Linux's ~(PAGE_SIZE - 1) here, not BSD's PAGE_SIZE - 1: test the in-page bits explicitly */
+    const uint64_t inpage = PAGE_SIZE - 1;
+    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & inpage) != 0 || req->size == 0 ||
+        req->size > (1ULL << 40) || (fixed & inpage) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
         return EINVAL;
     struct linux_file *filp = o->fp->f_data;
     if (o->fp->f_ops == NULL || filp == NULL || filp->f_op == NULL || filp->f_op->mmap == NULL)

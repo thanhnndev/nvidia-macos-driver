@@ -58,6 +58,8 @@ static int open_seq(int m)
     return seq;
 }
 
+extern "C" void nmx_thread_crit_check(const char *where);   /* nmx_kernel.c */
+
 /* ---- clone minors ------------------------------------------------------------------------------------------------- */
 
 static int clone_minor(dev_t dev, int action)
@@ -104,6 +106,7 @@ static int nmx_open(dev_t dev, int flags, int devtype, struct proc *p)
     if (cookie == nullptr)
         return ENXIO;
     int err = nmx_cdev_open(cookie, m, flags);
+    nmx_thread_crit_check("open");
     if (err) {
         IOLockLock(g_lock);
         int seq = open_seq(m);
@@ -118,6 +121,7 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
 {
     int m = minor(dev);
     int err = nmx_cdev_close(m, flags);
+    nmx_thread_crit_check("close");
     IOLockLock(g_lock);
     int seq = open_seq(m);
     if (seq > 0)
@@ -128,7 +132,9 @@ static int nmx_close(dev_t dev, int flags, int devtype, struct proc *p)
 
 static int nmx_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p)
 {
-    return nmx_cdev_ioctl(minor(dev), cmd, data, fflag);
+    int err = nmx_cdev_ioctl(minor(dev), cmd, data, fflag);
+    nmx_thread_crit_check("ioctl");
+    return err;
 }
 
 /*
@@ -146,6 +152,7 @@ static int nmx_read(dev_t dev, struct uio *uio, int ioflag)
     user_size_t len = uio_curriovlen(uio);
     size_t done = 0;
     int err = nmx_cdev_read(minor(dev), (uint64_t)base, (size_t)len, &done, (ioflag & IO_NDELAY) ? 1 : 0);
+    nmx_thread_crit_check("read");
     if (done > 0)
         uio_update(uio, (user_size_t)done);
     return err;
@@ -158,7 +165,9 @@ static int nmx_read(dev_t dev, struct uio *uio, int ioflag)
 static int nmx_select(dev_t dev, int which, void *wql, struct proc *p)
 {
     int events = which == FREAD ? 0x0001 /* POLLIN */ : which == FWRITE ? 0x0004 /* POLLOUT */ : 0x0002 /* POLLPRI */;
-    return nmx_cdev_poll(minor(dev), events) != 0;
+    int ready = nmx_cdev_poll(minor(dev), events) != 0;
+    nmx_thread_crit_check("select");
+    return ready;
 }
 
 static struct cdevsw g_cdevsw = {

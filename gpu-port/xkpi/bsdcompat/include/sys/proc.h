@@ -30,7 +30,7 @@ struct thread {
     u_char td_priority;
     u_char td_base_pri;
     int td_pinned;
-    int td_critnest;
+    int td_critnest;                /* critical-section nesting of this thread (nmx_critical_enter) */
     int td_intr_nesting_level;      /* refreshed from ml_at_interrupt_context() by curthread */
     int td_flags;
     int td_owepreempt;              /* FreeBSD's deferred-preemption flag; xnu preempts on its own, so always 0 */
@@ -45,6 +45,7 @@ struct thread {
     char td_name[32];
     void *td_wchan;
     const char *td_wmesg;
+    int td_crit_saved;              /* interrupt state at the outermost nmx_critical_enter (last: layout of the rest kept) */
 };
 #define TDF_KTH_SUSP 0x00000100
 #define TDP_KTHREAD 0x00200000
