@@ -1,0 +1,36 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
+@@ -26,6 +26,8 @@
+ #include <linux/devcoredump.h>
+ #include "amdgpu_dev_coredump.h"
+ #include "atom.h"
++#include "soc15_common.h"
++#include "gc/gc_11_0_0_offset.h"
+ 
+ #ifndef CONFIG_DEV_COREDUMP
+ /* the port's printf has no %pV, so drm_info_printer would print the va_format pointer: format the line here */
+@@ -67,6 +69,24 @@
+ 				    ring->ring[(b + 3) & ring->buf_mask], ring->ring[(b + 4) & ring->buf_mask],
+ 				    ring->ring[(b + 5) & ring->buf_mask], ring->ring[(b + 6) & ring->buf_mask],
+ 				    ring->ring[(b + 7) & ring->buf_mask]);
++			}
++			{
++				/* NullMoth: the dwords the CP is stuck on (around the hardware rptr) and the CP ring/IB registers */
++				u32 rp = RREG32_SOC15(GC, 0, regCP_RB0_RPTR) & ring->buf_mask;
++				u32 ib_lo = RREG32_SOC15(GC, 0, regCP_IB1_BASE_LO), ib_hi = RREG32_SOC15(GC, 0, regCP_IB1_BASE_HI);
++
++				printf("NullMoth ringdump hw rptr 0x%x base_lo 0x%x base_hi 0x%x rb_cntl 0x%x ib1 %08x%08x bufsz 0x%x gpu_addr %llx\n",
++				    rp, RREG32_SOC15(GC, 0, regCP_RB0_BASE), RREG32_SOC15(GC, 0, regCP_RB0_BASE_HI),
++				    RREG32_SOC15(GC, 0, regCP_RB0_CNTL), ib_hi, ib_lo, RREG32_SOC15(GC, 0, regCP_IB1_BUFSZ),
++				    (unsigned long long)ring->gpu_addr);
++				for (k = 0; k < 64; k += 8) {
++					u32 b = (rp + k) & ring->buf_mask;
++					printf("NullMoth ringdump rptr+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n", k,
++					    ring->ring[b], ring->ring[(b + 1) & ring->buf_mask], ring->ring[(b + 2) & ring->buf_mask],
++					    ring->ring[(b + 3) & ring->buf_mask], ring->ring[(b + 4) & ring->buf_mask],
++					    ring->ring[(b + 5) & ring->buf_mask], ring->ring[(b + 6) & ring->buf_mask],
++					    ring->ring[(b + 7) & ring->buf_mask]);
++				}
+ 			}
+ 		}
+ 	}
