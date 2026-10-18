@@ -249,6 +249,10 @@ void nmx_thread_crit_check(const char *where)
         td->td_critnest = 0;
         ml_set_interrupts_enabled((boolean_t)td->td_crit_saved);
     }
+    if (td->td_pinned != 0) {
+        printf("NullMoth xkpi: %s returned with sched_pin nesting %d - closed\n", where, td->td_pinned);
+        td->td_pinned = 0;
+    }
 }
 
 void nmx_thread_exit_cleanup(void)
@@ -300,7 +304,11 @@ void nmx_critical_exit(void)
 
 int nmx_in_critical(void)
 {
-    return (ml_at_interrupt_context() || nmx_curthread()->td_critnest > 0) ? 1 : 0;
+    struct thread *td;
+    if (ml_at_interrupt_context())
+        return 1;
+    td = nmx_curthread();
+    return (td->td_critnest > 0 || td->td_pinned > 0) ? 1 : 0;
 }
 
 int nmx_curcpu(void)
@@ -308,14 +316,25 @@ int nmx_curcpu(void)
     return cpu_number();
 }
 
+/*
+ * sched_pin only counts. It used to be a critical section (interrupts off), and every LinuxKPI spin_lock pins, so a
+ * lock held across a long wait kept this CPU's interrupts off for as long: amdgpu's MES queue reset polls a fence under
+ * its ring lock for up to two seconds, another CPU's TLB shootdown then timed out and the Mac panicked ("NMIPI for
+ * unresponsive processor: TLB flush timeout", Kernel-2026-10-18-153556). A lock is a mutex here, which excludes
+ * other threads without needing the CPU to itself; the pin is only a marker for in_atomic-style checks. Code that
+ * really needs this CPU to itself (the FPU window, seqc) calls critical_enter.
+ */
 void sched_pin(void)
 {
-    nmx_critical_enter();
+    nmx_curthread()->td_pinned++;
 }
 
 void sched_unpin(void)
 {
-    nmx_critical_exit();
+    struct thread *td = nmx_curthread();
+    if (td->td_pinned <= 0)
+        panic("NullMoth xkpi: sched_unpin without sched_pin");
+    td->td_pinned--;
 }
 
 void sched_prio(struct thread *td, u_char prio) { if (td) td->td_priority = prio; }
