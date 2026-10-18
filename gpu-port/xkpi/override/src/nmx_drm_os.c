@@ -321,6 +321,22 @@ int nmx_drm_node_ioctl(struct linux_file *filp, unsigned long cmd, void *data)
 			return ENODEV;
 		ldev = df->minor->dev->dev;
 		sg->name[sizeof(sg->name) - 1] = '\0';
+		if (strcmp(sg->name, "nmx_wc") == 0) {
+			/* NullMoth A/B switch (no real sysctl tree on xnu): GTT cache mode of buffers created from now on */
+			extern int nmx_gtt_wc;
+
+			if (cmd == NMX_DRM_IOCTL_SYSFS_PUT) {
+				err = priv_check(curthread, PRIV_DRIVER);
+				if (err)
+					return err;
+				nmx_gtt_wc = sg->value[0] == '0' ? 0 : 1;
+				printf("NullMoth: nmx_wc set to %d\n", nmx_gtt_wc);
+				return 0;
+			}
+			sg->value[0] = nmx_gtt_wc ? '1' : '0';
+			sg->len = 1;
+			return 0;
+		}
 		oid = ldev->kobj.oidp != NULL ? nmx_sysctl_find(SYSCTL_CHILDREN(ldev->kobj.oidp), sg->name) : NULL;
 		if (oid == NULL)
 			return ENOENT;

@@ -1,0 +1,28 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
+@@ -51,6 +51,25 @@
+ 	for (i = 0; i < adev->num_ip_blocks; i++)
+ 		if (adev->ip_blocks[i].version->funcs->print_ip_state)
+ 			adev->ip_blocks[i].version->funcs->print_ip_state(&adev->ip_blocks[i], &p);
++
++	/* NullMoth: the PM4 stream the gfx CP was working through (last 96 dwords before wptr) and the rptr/wptr the driver knows */
++	{
++		struct amdgpu_ring *ring = &adev->gfx.gfx_ring[0];
++		u32 n = 96, k, w;
++
++		if (ring->ring && ring->ring_size) {
++			w = ring->wptr & ring->buf_mask;
++			printf("NullMoth ringdump %s: wptr %u buf_mask 0x%x ring_size %u\n", ring->name, ring->wptr, ring->buf_mask, ring->ring_size);
++			for (k = 0; k < n; k += 8) {
++				u32 b = (w + ring->buf_mask + 1 - n + k) & ring->buf_mask;
++				printf("NullMoth ringdump @%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n", b,
++				    ring->ring[b], ring->ring[(b + 1) & ring->buf_mask], ring->ring[(b + 2) & ring->buf_mask],
++				    ring->ring[(b + 3) & ring->buf_mask], ring->ring[(b + 4) & ring->buf_mask],
++				    ring->ring[(b + 5) & ring->buf_mask], ring->ring[(b + 6) & ring->buf_mask],
++				    ring->ring[(b + 7) & ring->buf_mask]);
++			}
++		}
++	}
+ }
+ #else
+ 

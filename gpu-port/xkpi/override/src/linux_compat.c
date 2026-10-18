@@ -127,6 +127,11 @@ int linuxkpi_debug;
 SYSCTL_INT(_compat_linuxkpi, OID_AUTO, debug, CTLFLAG_RWTUN,
     &linuxkpi_debug, 0, "Set to enable pr_debug() prints. Clear to disable.");
 
+/* NullMoth: A/B switch for the GTT cache mode, read when a TTM buffer is created (see amdgpu-ttm-force-wc.patch) */
+int nmx_gtt_wc = 1;
+SYSCTL_INT(_compat_linuxkpi, OID_AUTO, nmx_wc, CTLFLAG_RWTUN,
+    &nmx_gtt_wc, 1, "1: GTT buffers write-combined (not snooped); 0: write-back snooped (stock)");
+
 int linuxkpi_rcu_debug;
 SYSCTL_INT(_compat_linuxkpi, OID_AUTO, rcu_debug, CTLFLAG_RWTUN,
     &linuxkpi_rcu_debug, 0, "Set to enable RCU warning. Clear to disable.");
