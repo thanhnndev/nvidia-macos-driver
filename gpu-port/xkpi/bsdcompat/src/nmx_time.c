@@ -1,5 +1,5 @@
 /*
- * FreeBSD kernel time on xnu. Uptime is mach_absolute_time (monotonic, counts from boot); wall time is xnu's
+ * FreeBSD kernel time on xnu. Uptime is mach_continuous_time (= user CLOCK_MONOTONIC); wall time is xnu's
  * calendar clock. sbintime_t is a 32.32 fixed-point count of seconds.
  */
 #include <sys/param.h>
@@ -13,7 +13,9 @@ volatile time_t time_second;
 static uint64_t uptime_ns(void)
 {
     uint64_t ns;
-    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    /* continuous time (counts sleep), the base of user CLOCK_MONOTONIC: DRM syncobj/CS deadlines are absolute
+     * CLOCK_MONOTONIC ns, mach_absolute_time was ~0.47 s behind and every syncobj wait timed out early */
+    absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
     return ns;
 }
 
