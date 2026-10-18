@@ -1,6 +1,6 @@
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
-@@ -28,9 +28,31 @@
+@@ -28,9 +28,29 @@
  #include "atom.h"
  
  #ifndef CONFIG_DEV_COREDUMP
@@ -11,12 +11,10 @@
 +	int n;
 +
 +	vsnprintf(line, sizeof(line), vaf->fmt, *vaf->va);
-+	for (n = strlen(line); n > 0 && (line[n - 1] == '
-+' || line[n - 1] == ' ' || line[n - 1] == '	'); n--)
++	for (n = strlen(line); n > 0 && (line[n - 1] == '\n' || line[n - 1] == ' ' || line[n - 1] == '\t'); n--)
 +		line[n - 1] = 0;
 +	if (n)
-+		printf("NullMoth ipdump: %s
-+", line);
++		printf("NullMoth ipdump: %s\n", line);
 +}
 +
  void amdgpu_coredump(struct amdgpu_device *adev, bool skip_vram_check,
