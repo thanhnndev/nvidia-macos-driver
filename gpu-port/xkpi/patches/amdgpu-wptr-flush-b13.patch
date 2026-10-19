@@ -1,0 +1,98 @@
+diff -u -r b13old/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c b13new/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-10-19 17:26:51
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-10-19 17:26:51
+@@ -93,19 +93,40 @@
+ 						    q + 7 < nd ? ib->ptr[q + 7] : 0);
+ 				}
+ 				{
+-					u32 c;
++					u32 c, rp_a, rp_b;
+ 
+-					printf("NullMoth vmregs: L2_CNTL %08x L2_STATUS %08x FAULT_ADDR %08x%08x INV_REQ %08x INV_ACK %08x INV_SEM %08x\n",
+-					    RREG32_SOC15(GC, 0, regGCVM_L2_CNTL), RREG32_SOC15(GC, 0, regGCVM_L2_STATUS),
+-					    RREG32_SOC15(GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32),
+-					    RREG32_SOC15(GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32),
+-					    RREG32_SOC15(GC, 0, regGCVM_INVALIDATE_ENG0_REQ), RREG32_SOC15(GC, 0, regGCVM_INVALIDATE_ENG0_ACK),
+-					    RREG32_SOC15(GC, 0, regGCVM_INVALIDATE_ENG0_SEM));
++					/* NullMoth b13: the hardware is GC 11.5 but the port includes the gc_11_0_0 header, and the whole
++					 * GCVM/GCMC block sits 4 dwords higher on 11.5 - every read below is shifted by +4. */
++					printf("NullMoth vmregs: L2_CNTL %08x L2_STATUS %08x PFLT_CNTL %08x PFLT_STATUS %08x FAULT_ADDR %08x%08x INV_REQ %08x INV_ACK %08x INV_SEM %08x\n",
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_L2_CNTL, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_L2_STATUS, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_L2_PROTECTION_FAULT_CNTL, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_L2_PROTECTION_FAULT_STATUS, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_INVALIDATE_ENG0_REQ, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_INVALIDATE_ENG0_ACK, 4),
++					    RREG32_SOC15_OFFSET(GC, 0, regGCVM_INVALIDATE_ENG0_SEM, 4));
+ 					for (c = 0; c < 8; c++)
+ 						printf("NullMoth vmregs ctx%u: CNTL %08x PT_BASE %08x%08x\n", c,
+-						    RREG32_SOC15_OFFSET(GC, 0, regGCVM_CONTEXT0_CNTL, c),
+-						    RREG32_SOC15_OFFSET(GC, 0, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32, 2 * c),
+-						    RREG32_SOC15_OFFSET(GC, 0, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, 2 * c));
++						    RREG32_SOC15_OFFSET(GC, 0, regGCVM_CONTEXT0_CNTL, 4 + c),
++						    RREG32_SOC15_OFFSET(GC, 0, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32, 4 + 2 * c),
++						    RREG32_SOC15_OFFSET(GC, 0, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, 4 + 2 * c));
++					printf("NullMoth cpregs: RB_VMID %08x WPTR_DELAY %08x DOORBELL_CTRL %08x WPTR_POLL %08x%08x RPTR_ADDR %08x%08x\n",
++					    RREG32_SOC15(GC, 0, regCP_RB_VMID), RREG32_SOC15(GC, 0, regCP_RB_WPTR_DELAY),
++					    RREG32_SOC15(GC, 0, regCP_RB_DOORBELL_CONTROL),
++					    RREG32_SOC15(GC, 0, regCP_RB_WPTR_POLL_ADDR_HI), RREG32_SOC15(GC, 0, regCP_RB_WPTR_POLL_ADDR_LO),
++					    RREG32_SOC15(GC, 0, regCP_RB0_RPTR_ADDR_HI), RREG32_SOC15(GC, 0, regCP_RB0_RPTR_ADDR));
++					rp_a = RREG32_SOC15(GC, 0, regCP_RB0_RPTR);
++					mdelay(5);
++					rp_b = RREG32_SOC15(GC, 0, regCP_RB0_RPTR);
++					printf("NullMoth cpstate: %s doorbell %u wptr %u wptr_old %u sw_rptr %llu mem_rptr %08x hw_rptr %08x hw_rptr_5ms %08x\n",
++					    ring->name, ring->use_doorbell, (u32)ring->wptr, (u32)ring->wptr_old,
++					    (unsigned long long)amdgpu_ring_get_rptr(ring),
++					    ring->rptr_cpu_addr ? *(u32 *)ring->rptr_cpu_addr : 0, rp_a, rp_b);
++					printf("NullMoth cpstate: ring_gpu %llx rptr_gpu %llx wptr_gpu %llx buf_mask 0x%x\n",
++					    (unsigned long long)ring->gpu_addr, (unsigned long long)ring->rptr_gpu_addr,
++					    (unsigned long long)ring->wptr_gpu_addr, ring->buf_mask);
+ 				}
+ 				for (k = 0; k < 64; k += 8) {
+ 					u32 b = (rp + k) & ring->buf_mask;
+diff -u -r b13old/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c b13new/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c	2026-10-19 17:26:51
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c	2026-10-19 17:26:51
+@@ -165,20 +165,16 @@
+ 		ring->funcs->insert_nop(ring, count);
+ 
+ 	/*
+-	 * NullMoth: the ring lives in system memory and the kernel maps it write-back; flush the dwords just written
+-	 * (wptr_old..wptr, wrapping) so a non-snooping GPU fetch sees them, then ring the doorbell.
++	 * NullMoth: the ring lives in system memory and the kernel maps it write-back; flush the whole ring (8K, cheap)
++	 * so a non-snooping CP fetch sees every dword the driver wrote, whatever the wrap arithmetic did, then ring
++	 * the doorbell.
+ 	 */
+ 	{
+-		u32 from = (u32)(ring->wptr_old & ring->buf_mask) * 4, to = (u32)(ring->wptr & ring->buf_mask) * 4, i;
+ 		char *base = (char *)ring->ring;
++		u32 i;
+ 
+-		if (from > to) {
+-			for (i = from & ~63U; i < ring->ring_size; i += 64)
+-				__asm__ __volatile__("clflush %0" : : "m"(base[i]) : "memory");
+-			from = 0;
+-		}
+-		for (i = from & ~63U; i < to + 64 && i < ring->ring_size; i += 64)
+-			__asm__ __volatile__("clflush %0" : : "m"(base[i]) : "memory");
++		for (i = 0; i < ring->ring_size; i += 64)
++			__asm__ __volatile__("clflush (%0)" : : "r"(base + i) : "memory");
+ 	}
+ 	mb();
+ 	amdgpu_ring_set_wptr(ring);
+diff -u -r b13old/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c b13new/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c	2026-10-19 17:26:51
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c	2026-10-19 17:26:51
+@@ -5599,6 +5599,10 @@
+ 		/* XXX check if swapping is necessary on BE */
+ 		atomic64_set((atomic64_t *)ring->wptr_cpu_addr,
+ 			     ring->wptr);
++		/* NullMoth b13: the CP reads this wptr page through CP_RB_WPTR_POLL_ADDR; the kernel mapping is
++		 * write-back, so push the line out before the doorbell or a non-snooping CP keeps the old wptr. */
++		__asm__ __volatile__("clflush (%0)" : : "r"(ring->wptr_cpu_addr) : "memory");
++		mb();
+ 		WDOORBELL64(ring->doorbell_index, ring->wptr);
+ 	} else {
+ 		WREG32_SOC15(GC, 0, regCP_RB0_WPTR,
