@@ -1,0 +1,14 @@
+amdgpu-timeout-ipdump.patch
+amdgpu-fence-read-flush.patch
+amdgpu-fence-irq-diag.patch
+amdgpu-ringdump.patch
+amdgpu-ringdump2.patch
+amdgpu-ttm-force-wc.patch
+amdgpu-ttm-wc-sysctl.patch
+amdgpu-noretry.patch
+amdgpu-ibdump.patch
+amdgpu-vmflush-trace.patch
+amdgpu-vmregs.patch
+amdgpu-wptr-flush-b13.patch
+amdgpu-ibmap-b14.patch
+amdgpu-zz-ibprepare-b15.patch

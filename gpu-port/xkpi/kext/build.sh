@@ -5,6 +5,9 @@ set -euo pipefail
 X=${GPU_SRC:-$HOME/develop/projects/gpu-src}/xkpi
 OUT=$1
 cd "$X"
+for failed in .nmx-driver-build-incomplete .nmx-runtime-build-incomplete logs/*.failed; do
+  [ ! -e "$failed" ] || { echo "refusing stale-object link: $failed"; exit 1; }
+done
 ./ccxx.sh xnu/nmx_kext.cpp > xlog_nmx_kext.txt 2>&1 || { grep -A3 error: xlog_nmx_kext.txt | head -20; exit 1; }
 # xe carries its own build of the Intel display code (compiled for xe_device), which would collide with i915's at link.
 # So xe is first folded into one object that exports nothing: every xe symbol becomes local, xe's calls bind to its

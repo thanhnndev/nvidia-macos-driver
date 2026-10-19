@@ -5,6 +5,7 @@
 X=${GPU_SRC:-$HOME/develop/projects/gpu-src}/xkpi
 L=${GPU_SRC:-$HOME/develop/projects/gpu-src}/kpi/freebsd-src/sys/compat/linuxkpi/common/src
 cd "$X" || exit 1
+touch .nmx-runtime-build-incomplete
 # networking, USB and wireless are not part of the GPU driver; i2c/i2cbb are replaced by nmx_linux_i2c.c;
 # cmdline and eventfd are unused (drm-kmod's own headers answer them)
 SKIP=" linux_80211 linux_80211_macops linuxkpi_80211_pm linux_netdev linux_usb linux_i2c linux_i2cbb linux_cmdline linux_eventfd "
@@ -30,3 +31,6 @@ for f in xnu/*.cpp; do
     ./ccxx.sh "$f" > "xlog_$b.txt" 2>&1 || { echo "XNU FAIL $b"; fail=$((fail + 1)); }
 done
 echo "runtime sources: $n  failed: $fail"
+
+[ "$fail" -eq 0 ] || exit 1
+rm -f .nmx-runtime-build-incomplete

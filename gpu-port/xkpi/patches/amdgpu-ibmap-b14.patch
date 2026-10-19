@@ -34,13 +34,13 @@ diff -u -r b14old/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c b14new/driver
  				}
  				{
  					u32 c, rp_a, rp_b;
-diff -u -r b14old/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b14new/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c	2026-10-19 20:38:59
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c	2026-10-19 20:38:59
-@@ -35,8 +35,46 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -34,6 +34,46 @@
+ #include "amdgpu.h"
  #include "atom.h"
  #include "amdgpu_trace.h"
- 
++
 +/*
 + * NullMoth b14: a user IB has no kernel pointer (ib->ptr is NULL) and its dwords reach memory through the process's
 + * own mapping. Push the IB's lines out before the CP fetches them, and say which IB each submission carries, so a
@@ -53,10 +53,10 @@ diff -u -r b14old/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b14new/drivers/gpu/drm/
 +	void *kaddr = NULL;
 +	u64 off;
 +	u32 i;
- 
++
 +	if (!job || !job->vm || !ib->length_dw || ib->ptr || !ib->gpu_addr)
 +		return;
- 
++
 +	m = amdgpu_vm_bo_lookup_mapping(job->vm, ib->gpu_addr >> PAGE_SHIFT);
 +	if (!m || !m->bo_va || !m->bo_va->base.bo)
 +		return;
@@ -80,11 +80,10 @@ diff -u -r b14old/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c b14new/drivers/gpu/drm/
 +	amdgpu_bo_kunmap(bo);
 +}
 +
-+
+ 
  #define AMDGPU_IB_TEST_TIMEOUT	msecs_to_jiffies(1000)
  #define AMDGPU_IB_TEST_GFX_XGMI_TIMEOUT	msecs_to_jiffies(2000)
- 
-@@ -261,6 +299,7 @@
+@@ -259,6 +299,7 @@
  			}
  		}
  

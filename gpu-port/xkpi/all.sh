@@ -6,10 +6,11 @@
 X=${GPU_SRC:-$HOME/develop/projects/gpu-src}/xkpi
 K=${GPU_SRC:-$HOME/develop/projects/gpu-src}/kpi
 cd "$X" || exit 1
+touch .nmx-driver-build-incomplete
 mkdir -p logs && rm -f logs/*.log logs/*.failed
 
-# patches against the vendored drm-kmod (idempotent: -N skips a patch that is already applied)
-for p in patches/*.patch; do [ -f "$p" ] && patch -N -s -p1 -d "${GPU_SRC:-$HOME/develop/projects/gpu-src}/drm-kmod" < "$p" >/dev/null 2>&1; done
+# Replay a validated ordered patch series; never suppress partial patch failures.
+python3 "$X/apply-patches.py" || exit 1
 
 # amdgpu_dm_crc.c: CRC capture is a debugfs feature (no debugfs on macOS; its header stubs the hooks to NULL)
 EXCLUDE="amdgpu_dm_crc.c drm_gem_ttm_helper.c drm_writeback.c drm_hdcp_helper.c sync_file.c dma-fence-unwrap.c dma-buf.c dma-buf-kmod.c linux_fb.c vt_drmfb.c drm_os_freebsd.c"
@@ -32,3 +33,7 @@ bad=$(ls logs/*.failed 2>/dev/null | wc -l | tr -d ' ')
 echo "sources: $n  compiled: $((n - bad))  failed: $bad"
 for f in logs/*.failed; do [ -e "$f" ] && cat "${f%.failed}.log"; done | grep -h "error:" | sed -E 's|^[^ ]*/([^/]+:[0-9]+):[0-9]+: error: |\1 |' | sed -E 's/^[^ ]+ //' \
     | sort | uniq -c | sort -rn | head -"${1:-40}"
+
+# A failed compile must never be linked with its previous object.
+[ "$bad" -eq 0 ] || exit 1
+rm -f .nmx-driver-build-incomplete
