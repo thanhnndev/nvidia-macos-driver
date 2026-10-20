@@ -730,7 +730,8 @@ public:
             auto root = IORegistryEntry::getRegistryRoot();
             auto build = root ? OSDynamicCast(OSString, root->getProperty("IOKitBuildVersion")) : nullptr;
             // This path uses reviewed private family offsets; no automatic OS migration.
-            if (fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && build &&
+            const bool displayEnabled = getProperty("NMXDisplayPipeEnabled") != kOSBooleanFalse;
+            if (displayEnabled && fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && build &&
                 build->isEqualTo("Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64")) {
                 fNmxArmCall = thread_call_allocate(&NVAccel::nmxArm, this);
                 if (fNmxArmCall) fbm = serviceMatching("NMXGPUFB");
