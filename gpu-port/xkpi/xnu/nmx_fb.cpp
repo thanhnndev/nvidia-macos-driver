@@ -34,6 +34,19 @@ class NMXGPUFB : public IOFramebuffer {
     uint64_t fVblNext = 0;
     volatile bool fStopping = false;
     bool fPowerRegistered = false;
+    bool fForeign = false;      // head 4 of NVAccel's display machine (the NV controller group)
+    bool fBeside = false;       // another framebuffer on this GPU's PCI device already drives the console
+    unsigned fTraceN = 0;
+
+    /* ga403wm b15: WindowServer only said "Failed to submit transaction: IOPRESENTMENT_METHOD_FAILURE:
+     * IOReturn 0x2d8" (kIOReturnNotReady) for the OLED, which names neither the call nor the stage. Say which of
+     * the framebuffer calls its display pipe makes, once each, in boot order. */
+    void trace(const char *what, unsigned long long a = 0, unsigned long long b = 0) {
+        if (fTraceN >= 40) return;
+        fTraceN++;
+        FBLOG("pipe: %s (foreign %d head %llu) 0x%llx 0x%llx", what, fForeign ? 1 : 0,
+              (unsigned long long)(fForeign ? 4 : 0), a, b);
+    }
 
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         NMXGPUFB *me = (NMXGPUFB *)p0;
@@ -63,9 +76,14 @@ public:
     }
 
     bool start(IOService *provider) override {
-        if (!IOFramebuffer::start(provider)) return false;
+        /* ga403wm b15: IOFramebuffer::start() makes the controller this framebuffer's display pipe lives on from a
+         * dependent ID that is ALREADY set (IOFBController::copyController(kDepIDCreate)). Written after start, the
+         * framebuffer still shows the group in the registry, but WindowServer's pipe for it never activates: every
+         * transaction came back kIOReturnNotReady ("Failed to submit transaction: IOPRESENTMENT_METHOD_FAILURE:
+         * IOReturn 0x2d8") and the panel kept the boot console. Set the group before start. */
         const bool foreign = fDisplay.internal && fInfo.width == 2880 && fInfo.height == 1800 &&
             provider->getProperty("NMXNvidiaDisplayBridge") == kOSBooleanTrue;
+        fForeign = foreign;
         setProperty("IOFBDependentIndex", foreign ? 4ULL : 0ULL, 32);
         if (foreign) {
             // Same controller group as upstream NVRMFB/NMIntelFB, separate head4.
@@ -85,6 +103,14 @@ public:
                 }
             }
         }
+        /* Another framebuffer on the same GPU (the firmware's) already drives the console: this one must not claim
+         * it, or the console never hands the panel to WindowServer (PhxFB/7c5c09a: "not the console beside IONDRV"). */
+        if (OSIterator *it = provider->getChildIterator(gIOServicePlane)) {
+            while (OSObject *o = it->getNextObject())
+                if (o != this && OSDynamicCast(IOFramebuffer, o)) fBeside = true;
+            it->release();
+        }
+        if (!IOFramebuffer::start(provider)) return false;
         setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
         if (fDisplay.edid_size) setProperty("NMXEDIDSource", "drm-connector");
@@ -120,6 +146,7 @@ public:
      */
     IOReturn open() override {
         IOReturn r = IOFramebuffer::open();
+        trace("open", (unsigned long long)r);
         if (r == kIOReturnSuccess && !fPowerRegistered) {
             fPowerRegistered = true;
             registerPowerDriver(this, kFbPowerStates, 2);
@@ -133,22 +160,26 @@ public:
                                   void *p1, void *p2, void *p3, void *p4) override {
         if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
             NVRMVramRequest *r = static_cast<NVRMVramRequest *>(p1);
-            if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+            if (!r || r->version != NVRM_VRAM_ABI_VERSION) { trace("scanout bad ABI"); return kIOReturnBadArgument; }
             if (fStopping || !fPowerRegistered || !fInfo.ok || !fInfo.kva || !fInfo.width || !fInfo.height ||
                 (uint64_t)fInfo.pitch < 4ULL * fInfo.width ||
-                (uint64_t)fInfo.pitch * fInfo.height > fInfo.size) return kIOReturnNotReady;
+                (uint64_t)fInfo.pitch * fInfo.height > fInfo.size) {
+                trace("scanout NOT READY", (unsigned long long)!fPowerRegistered, (unsigned long long)fInfo.ok);
+                return kIOReturnNotReady;
+            }
             r->kva = reinterpret_cast<void *>(fInfo.kva);
             r->phys = 0;
             r->handle = nullptr;
             r->actualSize = fInfo.size;
             r->width = fInfo.width; r->height = fInfo.height; r->pitch = fInfo.pitch;
+            trace("scanout ok", fInfo.width, fInfo.pitch);
             return kIOReturnSuccess;
         }
         return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
     }
 
-    IOReturn enableController() override { return kIOReturnSuccess; }
-    bool isConsoleDevice() override { return true; }
+    IOReturn enableController() override { trace("enableController"); return kIOReturnSuccess; }
+    bool isConsoleDevice() override { trace("isConsoleDevice", fBeside ? 0 : 1); return !fBeside; }
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
         if (aperture != kIOFBSystemAperture) return nullptr;
         return IODeviceMemory::withRange(fInfo.phys, (IOPhysicalLength)fInfo.pitch * fInfo.height);
@@ -212,6 +243,7 @@ public:
         return kIOReturnSuccess;
     }
     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override {
+        trace("setDisplayMode", mode, depth);
         return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported;
     }
     IOItemCount getConnectionCount() override { return 1; }
@@ -227,7 +259,7 @@ public:
     }
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
                                       void **iref) override {
-        if (type == kIOFBVBLInterruptType) { fVbl = { proc, target, ref }; if (iref) *iref = &fVbl; return kIOReturnSuccess; }
+        if (type == kIOFBVBLInterruptType) { trace("register VBL", (unsigned long long)(proc != nullptr)); fVbl = { proc, target, ref }; if (iref) *iref = &fVbl; return kIOReturnSuccess; }
         if (type == kIOFBConnectInterruptType) { fConnect = { proc, target, ref }; if (iref) *iref = &fConnect; return kIOReturnSuccess; }
         return kIOReturnUnsupported;
     }
@@ -244,7 +276,7 @@ public:
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
-        if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
+        if (attribute == kIOWindowServerActiveAttribute) { trace("setAttribute wsrv", value); return kIOReturnSuccess; }
         if (attribute == kIOPowerAttribute) {
             /* display sleep turns the outputs off; wake lights them again with the same buffer */
             if (fDev) nmx_fb_power(fDev, value != 0);
@@ -274,7 +306,7 @@ public:
         return kIOReturnSuccess;
     }
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
-        if (attribute == kIOWindowServerActiveAttribute) { if (value) *value = 1; return kIOReturnSuccess; }
+        if (attribute == kIOWindowServerActiveAttribute) { trace("getAttribute wsrv"); if (value) *value = 1; return kIOReturnSuccess; }
         return IOFramebuffer::getAttribute(attribute, value);
     }
     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
