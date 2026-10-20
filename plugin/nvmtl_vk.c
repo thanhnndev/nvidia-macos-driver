@@ -1412,7 +1412,7 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
         nvlog("vk: vkBindBufferMemory refused the imported allocation");
         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
         out->buf = NULL; out->mem = NULL; return -1; }
-    out->map = ptr; out->alloc = size; out->imported = 1;
+    out->map = ptr; out->alloc = size; out->imported = 1; out->htype = mt + 1;
     g_alloc_bytes += size; g_buf_made++;
     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
     return 0;
@@ -6903,7 +6903,9 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
     uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
     size_t at = b->moff + offset;
-    const char *why = (mr.memoryTypeBits & all) != all ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
+    // a buffer of unknown memory type must suit every type the image takes; a host import is of one known type
+    const uint32_t need = b->htype ? (1u << (b->htype - 1)) : all;
+    const char *why = (mr.memoryTypeBits & need) != need ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
     if (why) {
         nvlog("buffer texture: refused on %s - image types 0x%x of 0x%x, bind at %zu (buffer %zu + %zu) vs alignment %llu",
               why, mr.memoryTypeBits, all, at, b->moff, offset, (unsigned long long)mr.alignment);
