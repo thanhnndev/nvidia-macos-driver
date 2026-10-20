@@ -177,6 +177,8 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
         out->hsync_end = best->hsync_end;
         out->vsync_start = best->vsync_start;
         out->vsync_end = best->vsync_end;
+        fb->display.hsync_positive = !!(best->flags & DRM_MODE_FLAG_PHSYNC);
+        fb->display.vsync_positive = !!(best->flags & DRM_MODE_FLAG_PVSYNC);
         /* Same lock order as drm_client_modeset_probe: client then mode_config.
          * Copy the blob while protected; never retain a connector/blob pointer. */
         mutex_lock(&drm->mode_config.mutex);

@@ -31,6 +31,7 @@ int nmx_fb_open(void *dev, struct nmx_fb_info *out);
  * Separate from nmx_fb_info to preserve its existing layout. No synthesized EDID. */
 struct nmx_fb_display_info {
     uint32_t edid_size, internal, width_mm, height_mm;
+    uint32_t hsync_positive, vsync_positive;
     uint8_t edid[1024];
 };
 int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out);

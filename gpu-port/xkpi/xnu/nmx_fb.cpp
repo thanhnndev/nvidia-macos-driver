@@ -72,6 +72,18 @@ public:
             setProperty("IOFBDependentID", 0x4E56524D00000001ULL, 64);
             setProperty("NMXNvidiaDisplayBridge", kOSBooleanTrue);
             setProperty("built-in", kOSBooleanTrue);
+            // Frozen AGDC K5 timing wire format, actual selected DRM timing (Hz/milli-Hz).
+            // No synthetic timing or HDR capability. Consumers validate this tagged 13-word record.
+            if (fInfo.pclk_khz && fInfo.pclk_khz <= 0xffffffffU / 1000) {
+                UInt32 timing[13] = {0x4b350001U, fInfo.pclk_khz * 1000, fInfo.width,
+                    fInfo.hsync_start, fInfo.hsync_end, fInfo.htotal, fInfo.height,
+                    fInfo.vsync_start, fInfo.vsync_end, fInfo.vtotal,
+                    (UInt32)(((uint64_t)fRefresh16 * 1000) >> 16),
+                    fDisplay.hsync_positive, fDisplay.vsync_positive};
+                if (OSData *data = OSData::withBytes(timing, sizeof(timing))) {
+                    setProperty("NVRMTiming", data); data->release();
+                }
+            }
         }
         setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
