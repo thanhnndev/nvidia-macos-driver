@@ -105,6 +105,7 @@ public:
 OSDefineMetaClassAndStructors(NVEventMachine, IOAccelEventMachineFast2)
 static void (*gEnableAccel)(const char *why) = nullptr;
 static int gNvScanout = 0;
+static int gNvIop = 0;
 static int gNvAperture = 0;
 class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
     OSDeclareDefaultStructors(NVDisplayMachine)
@@ -207,7 +208,12 @@ public:
             ALOG("   cfg+0x%02x = 0x%016llx", i, *(const uint64_t *)(p + i));
 
         *(uint64_t *)(p + 0x00) = (uint64_t)(uintptr_t)"NVIDIAAccelerator";
+        #ifdef NMX_ACCEL
+        // UMA IOSurfaces use the family system-memory path (reviewed 25G241).
+        *(uint32_t *)(p + 0x08) = 0x30a44300u;
+#else
         *(uint32_t *)(p + 0x08) = 0x30844300u;
+#endif
         *(uint32_t *)(p + 0x0c) = 15u;
         *(uint32_t *)(p + 0x18) = 8u;
         *(uint32_t *)(p + 0x30) = 0x40004000u;
@@ -227,6 +233,64 @@ public:
     bool      configureDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE { ALOG("configureDevice(%p) %04x:%04x — RM owns the card (NVRM.kext); nothing to do here yet", pci, pci ? pci->configRead16(0) : 0, pci ? pci->configRead16(2) : 0); return true; }
     void      teardownDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE { ALOG("teardownDevice(%p)", pci); }
     OSObject *createKernelGPUTask() APPLE_KEXT_OVERRIDE { return newGPUTask("createKernelGPUTask"); }
+#ifdef NMX_ACCEL
+    unsigned long long resourceTypeForIOSurface(IOSurface *) APPLE_KEXT_OVERRIDE {
+        // Vulkan/RADV owns execution memory. Never ask NVIDIA RM for an AMD cache.
+        return 0x80;
+    }
+    thread_call_t fNmxArmCall = nullptr;
+    volatile UInt32 fNmxArmPending = 0;
+    bool fNmxStopping = false;
+    unsigned fNmxArmAttempts = 0;
+    static void nmxArm(void *p0, void *) {
+        NVAccel *me = static_cast<NVAccel *>(p0);
+        if (!me) return;
+        struct PendingReference {
+            NVAccel *me;
+            bool requeued = false;
+            ~PendingReference() {
+                IOLockUnlock(me->fRegLock);
+                if (!requeued) {
+                    OSCompareAndSwap(1, 0, &me->fNmxArmPending);
+                    me->release();
+                }
+            }
+        } held = { me };
+        IOLockLock(me->fRegLock);
+        if (me != gAccel || me->fNmxStopping || !me->fFB) return;
+        NVRMVramRequest q = {}; q.version = NVRM_VRAM_ABI_VERSION;
+        IOReturn query = me->askFramebufferForScanout(&q);
+        if (query == kIOReturnNotReady && ++me->fNmxArmAttempts < 150) {
+            // The IOFramebuffer controller is assigned by open(), not publish.
+            // Retry for at most 30 seconds without blocking driver matching.
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(200, 1000000, &deadline);
+            held.requeued = true;
+            thread_call_enter_delayed(me->fNmxArmCall, deadline);
+            return;
+        }
+        if (query != kIOReturnSuccess || !q.kva || q.phys) {
+            me->setProperty("NMXDisplayBindError", (unsigned long long)query, 32);
+            ALOG("NMX display bind refused: query 0x%x after %u attempts", query, me->fNmxArmAttempts);
+            return;
+        }
+        // A scanout description is ready; registration validates exact pipe ownership.
+        gNvScanout = 1; gNvIop = 1;
+        OSDictionary *caps = OSDictionary::withCapacity(2);
+        if (!caps) return;
+        caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
+        caps->setObject("TransactionsSupported", kOSBooleanTrue);
+        me->setProperty("IOAccelDisplayPipeCapabilities", caps); caps->release();
+        me->registerFramebufferLocked(1);
+        if ((gNvHeadsPiped & 1) && gNvAccelArmed) {
+            gNvHeadless = 0;
+            me->setProperty("NMXAccelHeadless", kOSBooleanFalse);
+            me->setProperty("NMXDisplayPipeArmed", kOSBooleanTrue);
+            me->setProperty("NMXPresentationPath", "RADV-IOSurface-copy-to-DCN35");
+            ALOG("NMX display pipe armed on owned native framebuffer; GPU renders through RADV, present copies IOSurface");
+        }
+    }
+#endif
     OSObject *newDisplayPipe() APPLE_KEXT_OVERRIDE {
         NVDisplayPipe *p = OSTypeAlloc(NVDisplayPipe);
         if (!p) { ALOG("newDisplayPipe: OSTypeAlloc FAILED - the family will store this NULL unchecked"); return NULL; }
@@ -258,6 +322,12 @@ public:
         (void)ref; (void)note;
         NVAccel *me = (NVAccel *)target;
         if (!me || !newService) return true;
+#ifdef NMX_ACCEL
+        // NMXGPUFB is a child of NMXGPU, itself on this exact PCI provider.
+        IOService *gpu = newService->getProvider();
+        if (!newService->metaCast("NMXGPUFB") || !gpu || gpu->getProvider() != me->fPCI ||
+            !newService->getProperty("NMXScanoutBridgeVersion")) return true;
+#endif
         unsigned idx = 0;
         OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex"));
         if (num) idx = num->unsigned32BitValue();
@@ -290,6 +360,12 @@ public:
                  "and WindowServer composites it only after a WindowServer restart", idx);
         else
             ALOG("  to register it:  sudo sysctl -w debug.nvaccelfb=1   (2 = re-run the family's own sweep)");
+#ifdef NMX_ACCEL
+        if (me->fNmxArmCall && OSCompareAndSwap(0, 1, &me->fNmxArmPending)) {
+            me->retain();
+            thread_call_enter(me->fNmxArmCall);
+        }
+#endif
         return true;
     }
     // Headless GPU (laptops whose panel and outputs are all on the Intel or AMD GPU: issues #76, #106). NVKMS finds no
@@ -377,13 +453,32 @@ public:
                 break;
             }
             if (fFBRegistered & (1u << i)) continue;
+#ifdef NMX_ACCEL
+            // The family's initial sweep may already have made the native pipe.
+            bool existing = false;
+            const unsigned count = fDM->getFramebufferCount();
+            if (count > kNvMaxFB) return added;
+            for (unsigned slot = 0; slot < count; ++slot) {
+                const uint8_t *dm = reinterpret_cast<const uint8_t *>(fDM);
+                const uint8_t *pipe = *reinterpret_cast<const uint8_t *const *>(dm + 0x88 + 8 * slot);
+                if (pipe && *reinterpret_cast<IOService *const *>(pipe + 0x98) == fb) existing = true;
+            }
+            if (existing) {
+                fFBRegistered |= 1u << i;
+                gNvHeadsRegistered = fFBRegistered;
+                gNvHeadsPiped |= 1u << i;
+                ++added; continue;
+            }
+#endif
             if (i == 4 && !gNvIgpu) break;   // the Intel panel waits for debug.nvaccel_igpu=1
             unsigned b = fDM->getFramebufferCount();
             ALOG("  %s: calling found_framebuffer(%s index %u) -- count before %u", why, fb->getName(), i, b);
             fDM->found_framebuffer((IOFramebuffer *)fb);
             unsigned c = fDM->getFramebufferCount();
+#ifndef NMX_ACCEL
             fFBRegistered |= 1u << i;
             gNvHeadsRegistered = fFBRegistered;
+#endif
             if (c != b + 1) {
                 ALOG("  %s: index %u -- count went %u -> %u; the family did not add it (already known, or the cap "
                      "accel+0xcb0 = %u refused it). Stopping here so no later head takes this one's pipe number.",
@@ -406,6 +501,10 @@ public:
                 break;
             }
             ALOG("  %s: index %u -> pipe %u (%p), count %u", why, i, b, pipe, c);
+#ifdef NMX_ACCEL
+            fFBRegistered |= 1u << i;
+            gNvHeadsRegistered = fFBRegistered;
+#endif
             gNvHeadsPiped |= 1u << i;
             added++;
         }
@@ -435,16 +534,21 @@ public:
         if (!fDM) { ALOG("registerFramebuffer(%d): no display machine", how); return false; }
         if (!fFB) { ALOG("registerFramebuffer(%d): no framebuffer has published yet", how); return false; }
         unsigned before = fDM->getFramebufferCount();
+        unsigned added = 0;
         ALOG("registerFramebuffer(%d): framebuffer count before = %u", how, before);
         if (how == 2) {
             if (before != 0) ALOG("  already %u -- refusing to re-run the family's sweep", before);
             else { ALOG("  re-running IOAccelDisplayMachine::start(pci) -- the family's own sweep"); fDM->start(fPCI); }
         } else {
-            registerPendingLocked("sysctl");
+            added = registerPendingLocked("sysctl");
         }
         unsigned after = fDM->getFramebufferCount();
         ALOG("  framebuffer count after = %u", after);
-        if (after > before) { onCountGrewLocked(); return true; }
+        if (after > before
+#ifdef NMX_ACCEL
+            || added
+#endif
+        ) { onCountGrewLocked(); return true; }
         return false;
     }
     const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
@@ -618,13 +722,20 @@ public:
             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
 #ifdef NMX_ACCEL
-            // AMD/Intel: the Metal device is for apps; WindowServer draws into NMXGPU's framebuffer, and the plugin copies
-            // finished frames into the IOSurfaces it reads (the headless path NVIDIA laptops use)
             nvaccelInstallSysctl();
             gNvHeadless = 1;
             setProperty("NMXAccelHeadless", kOSBooleanTrue);
-            ALOG("AMD/Intel accelerator up: Metal device for apps, frames copied to the framebuffer WindowServer draws");
+            setProperty("NMXDisplayPipeArmed", kOSBooleanFalse);
             OSDictionary *fbm = nullptr;
+            auto root = IORegistryEntry::getRegistryRoot();
+            auto build = root ? OSDynamicCast(OSString, root->getProperty("IOKitBuildVersion")) : nullptr;
+            // This path uses reviewed private family offsets; no automatic OS migration.
+            if (fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && build &&
+                build->isEqualTo("Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64")) {
+                fNmxArmCall = thread_call_allocate(&NVAccel::nmxArm, this);
+                if (fNmxArmCall) fbm = serviceMatching("NMXGPUFB");
+            }
+            ALOG("AMD display adapter: native framebuffer watch %s", fbm ? "enabled" : "not on reviewed kernel profile");
 #else
             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
 #endif
@@ -632,6 +743,7 @@ public:
                 fFBNote = addMatchingNotification(gIOFirstPublishNotification, fbm, &NVAccel::fbPublished, this, nullptr, 0);
                 fbm->release();
                 ALOG("watching for NVRMFramebuffer to publish -> notifier %p", fFBNote);
+#ifndef NMX_ACCEL
                 // a laptop whose built-in panel is on the Intel GPU: NMIntelFB publishes as head 4 of this accelerator
                 if (OSDictionary *im = serviceMatching("NMIntelFB")) {
                     fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
@@ -647,11 +759,27 @@ public:
                          "`sysctl -w debug.nvaccelfb=1` puts it back, and a reboot takes it away again");
                     armHeadlessCheck();
                 }
+#endif
             } else ALOG("serviceMatching(NVRMFramebuffer) returned NULL -- cannot watch for the framebuffer");
         }
         return r;
     }
-    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE { ALOG("stop"); IOGraphicsAccelerator2::stop(provider); }
+    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
+#ifdef NMX_ACCEL
+        if (fFBNote) { fFBNote->remove(); fFBNote = nullptr; }
+        if (fRegLock) IOLockLock(fRegLock);
+        fNmxStopping = true;
+        setProperty("NMXDisplayPipeArmed", kOSBooleanFalse);
+        if (gAccel == this) gAccel = nullptr;
+        if (fRegLock) IOLockUnlock(fRegLock);
+        if (fNmxArmCall) {
+            if (thread_call_cancel(fNmxArmCall) && OSCompareAndSwap(1, 0, &fNmxArmPending)) release();
+            if (thread_call_free(fNmxArmCall)) fNmxArmCall = nullptr;
+            else ALOG("display arm callback still returning; retain its call storage without a teardown wait");
+        }
+#endif
+        ALOG("stop"); IOGraphicsAccelerator2::stop(provider);
+    }
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
@@ -885,7 +1013,7 @@ public:
     OSObject  *getPlaneResource(unsigned int, unsigned int) const;
 };
 
-static int    gNvIop = 0;
+
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
 static SInt64 gCntIopOkHead[kNvMaxFB];
 #define NVIOP_LOG_MAX 40
@@ -978,15 +1106,19 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
+#ifndef NMX_ACCEL
     } else if (s && nvAccelIopFlip(fb, head, s, this)) {
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
+#endif
     } else if (s) {
         // A copied frame must come from the surface's newest pixels. Copying while they were still only in VRAM put a
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
+#ifndef NMX_ACCEL
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+#endif
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -1009,15 +1141,24 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
 
+#ifndef NMX_ACCEL
     nvAccelIopHome(fb, head);
+#endif
     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
     for (unsigned y = 0; y < h; y++) {
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
+#ifdef NMX_ACCEL
+        memcpy((void *)dp, (const void *)sp, (size_t)words * 4);
+#else
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+#endif
     }
+#ifdef NMX_ACCEL
+    __asm__ __volatile__("sfence" ::: "memory");
+#endif
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
@@ -1128,6 +1269,11 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gI
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
 NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
 NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight (never expected)");
+#ifdef NMX_ACCEL
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_armed, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvAccelArmed, 0, "native display pipe registered");
+NVACCEL_CNT(nmxaccel_iop_ok, gCntIopOk, "completed native display transactions");
+NVACCEL_CNT(nmxaccel_iop_fail, gCntIopFail, "failed native display transactions");
+#endif
 static int gCrcHead = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
 static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
@@ -1140,6 +1286,9 @@ static void nvaccelInstallSysctl(void)
 #ifdef NMX_ACCEL
     // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.nvaccel* names
     sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_armed);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_iop_ok);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_iop_fail);
     gSysctlInstalled = true;
 #else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);

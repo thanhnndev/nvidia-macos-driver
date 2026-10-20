@@ -115,7 +115,7 @@ public:
     virtual OSObject * newBlockFence();   /* slot 287 — factory — returns a pointer */
     virtual void scrubEvents();   /* slot 288 */
     virtual OSObject * createDrawable(IOAccelSurface*, IOAccelShared2*, bool);   /* slot 289 — factory — returns a pointer */
-    virtual void resourceTypeForIOSurface(IOSurface*);   /* slot 290 */
+    virtual unsigned long long resourceTypeForIOSurface(IOSurface*);   /* slot 290 */
     virtual OSObject * createDisplayPipe(IOFramebuffer*, unsigned int);   /* slot 291 — factory — returns a pointer */
     virtual OSObject * createMemoryDescriptorWithAddressRange(unsigned long long, unsigned long long, unsigned int, task*);   /* slot 292 — factory — returns a pointer */
     virtual OSObject * createMemoryDescriptorWithPersistentMemoryDescriptor(IOMemoryDescriptor*);   /* slot 293 — factory — returns a pointer */

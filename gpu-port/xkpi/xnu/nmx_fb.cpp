@@ -12,6 +12,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <kern/thread_call.h>
 #include "nmx_port.h"
+#include "../../../kexts/NVRM/nvrm_vram_abi.h"
 
 #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
 
@@ -61,6 +62,8 @@ public:
 
     bool start(IOService *provider) override {
         if (!IOFramebuffer::start(provider)) return false;
+        setProperty("IOFBDependentIndex", 0ULL, 32);
+        setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
         fVblTimer = thread_call_allocate(vblFire, this);
         if (fVblTimer) {
             uint64_t d;
@@ -98,6 +101,26 @@ public:
             registerPowerDriver(this, kFbPowerStates, 2);
         }
         return r;
+    }
+
+    /* Display-pipe adapter only. CPU physical addresses are not NVIDIA
+     * VRAM handles or RADV GPU virtual addresses: never export them as such. */
+    IOReturn callPlatformFunction(const OSSymbol *fn, bool wait,
+                                  void *p1, void *p2, void *p3, void *p4) override {
+        if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
+            NVRMVramRequest *r = static_cast<NVRMVramRequest *>(p1);
+            if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+            if (fStopping || !fPowerRegistered || !fInfo.ok || !fInfo.kva || !fInfo.width || !fInfo.height ||
+                (uint64_t)fInfo.pitch < 4ULL * fInfo.width ||
+                (uint64_t)fInfo.pitch * fInfo.height > fInfo.size) return kIOReturnNotReady;
+            r->kva = reinterpret_cast<void *>(fInfo.kva);
+            r->phys = 0;
+            r->handle = nullptr;
+            r->actualSize = fInfo.size;
+            r->width = fInfo.width; r->height = fInfo.height; r->pitch = fInfo.pitch;
+            return kIOReturnSuccess;
+        }
+        return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
     }
 
     IOReturn enableController() override { return kIOReturnSuccess; }
