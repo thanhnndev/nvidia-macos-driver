@@ -25,6 +25,7 @@ class NMXGPUFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMXGPUFB)
     void *fDev = nullptr;
     nmx_fb_info fInfo = {};
+    nmx_fb_display_info fDisplay = {};
     uint32_t fRefresh16 = 60 << 16;
     uint64_t fFrameNs = 16666667ull;
     struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
@@ -50,6 +51,7 @@ public:
         if (!init()) return false;
         fDev = dev;
         fInfo = info;
+        nmx_fb_get_display_info(dev, &fDisplay);
         if (info.pclk_khz && info.htotal && info.vtotal) {
             uint64_t mhz = (uint64_t)info.pclk_khz * 1000000ull / ((uint64_t)info.htotal * info.vtotal);   /* milli-Hz */
             if (mhz >= 20000 && mhz <= 500000) {
@@ -64,6 +66,8 @@ public:
         if (!IOFramebuffer::start(provider)) return false;
         setProperty("IOFBDependentIndex", 0ULL, 32);
         setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
+        setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
+        if (fDisplay.edid_size) setProperty("NMXEDIDSource", "drm-connector");
         fVblTimer = thread_call_allocate(vblFire, this);
         if (fVblTimer) {
             uint64_t d;
@@ -139,7 +143,10 @@ public:
         info->nominalWidth = fInfo.width;
         info->nominalHeight = fInfo.height;
         info->refreshRate = fRefresh16;
-        info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag |
+                      kDisplayModeValidForHiResFlag;
+        info->imageWidth = fDisplay.width_mm <= 65535 ? (UInt16)fDisplay.width_mm : 0;
+        info->imageHeight = fDisplay.height_mm <= 65535 ? (UInt16)fDisplay.height_mm : 0;
         return kIOReturnSuccess;
     }
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
@@ -188,6 +195,16 @@ public:
         return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported;
     }
     IOItemCount getConnectionCount() override { return 1; }
+    bool hasDDCConnect(IOIndex idx) override { return idx == 0 && fDisplay.edid_size >= 128; }
+    IOReturn getDDCBlock(IOIndex idx, UInt32 block, IOSelect type, IOOptionBits,
+                        UInt8 *data, IOByteCount *length) override {
+        if (idx || type != kIODDCBlockTypeEDID || !fDisplay.edid_size) return kIOReturnUnsupported;
+        if (!data || !length || !block || block > fDisplay.edid_size / 128) return kIOReturnBadArgument;
+        if (*length < 128) return kIOReturnNoSpace;
+        bcopy(fDisplay.edid + (block - 1) * 128, data, 128);
+        *length = 128;
+        return kIOReturnSuccess;
+    }
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
                                       void **iref) override {
         if (type == kIOFBVBLInterruptType) { fVbl = { proc, target, ref }; if (iref) *iref = &fVbl; return kIOReturnSuccess; }
@@ -233,7 +250,7 @@ public:
         }
     }
     IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
-        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag | kDisplayModeValidForHiResFlag;
         return kIOReturnSuccess;
     }
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
@@ -241,8 +258,14 @@ public:
         return IOFramebuffer::getAttribute(attribute, value);
     }
     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
-        if (idx != 0 || !value) return kIOReturnBadArgument;
+        if (idx != 0) return kIOReturnBadArgument;
+        // IODisplay probes this capability with a NULL output pointer.
+        if (attr == kConnectionSupportsHLDDCSense)
+            return fDisplay.edid_size ? kIOReturnSuccess : kIOReturnUnsupported;
+        if (!value) return kIOReturnBadArgument;
         switch (attr) {
+        case kConnectionFlags: *value = fDisplay.internal ? kIOConnectionBuiltIn : 0; return kIOReturnSuccess;
+        case kConnectionSupportsAppleSense: case kConnectionSupportsLLDDCSense: return kIOReturnUnsupported;
         case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
         case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
         case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:

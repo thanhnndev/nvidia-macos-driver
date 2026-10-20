@@ -20,6 +20,9 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_property.h>
+#include "nmx_fb_edid.h"
 
 #include <sys/bus.h>
 
@@ -32,6 +35,7 @@ struct nmx_fb {
     struct iosys_map map;
     int mapped;
     struct nmx_fb_info info;
+    struct nmx_fb_display_info display;
 };
 
 /* one bridge per PCI function the port drives */
@@ -132,6 +136,7 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
     struct drm_device *drm = drm_of(dev);
     struct drm_mode_set *ms;
     const struct drm_display_mode *best = NULL;
+    const struct drm_mode_set *best_ms = NULL;
     int slot = -1, err;
 
     memset(out, 0, sizeof(*out));
@@ -161,7 +166,7 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
     drm_client_for_each_modeset(ms, &fb->client)
         if (ms->mode != NULL && (best == NULL ||
             (u64)ms->mode->hdisplay * ms->mode->vdisplay > (u64)best->hdisplay * best->vdisplay))
-            best = ms->mode;
+            { best = ms->mode; best_ms = ms; }
     if (best != NULL) {
         out->width = best->hdisplay;
         out->height = best->vdisplay;
@@ -172,6 +177,22 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
         out->hsync_end = best->hsync_end;
         out->vsync_start = best->vsync_start;
         out->vsync_end = best->vsync_end;
+        /* Same lock order as drm_client_modeset_probe: client then mode_config.
+         * Copy the blob while protected; never retain a connector/blob pointer. */
+        mutex_lock(&drm->mode_config.mutex);
+        if (best_ms && best_ms->num_connectors) {
+            struct drm_connector *conn = best_ms->connectors[0];
+            struct drm_property_blob *blob = conn->edid_blob_ptr;
+            fb->display.internal = conn->connector_type == DRM_MODE_CONNECTOR_eDP ||
+                                   conn->connector_type == DRM_MODE_CONNECTOR_LVDS;
+            fb->display.width_mm = conn->display_info.width_mm;
+            fb->display.height_mm = conn->display_info.height_mm;
+            if (blob && nmx_fb_edid_valid(blob->data, blob->length, sizeof(fb->display.edid))) {
+                fb->display.edid_size = (uint32_t)blob->length;
+                memcpy(fb->display.edid, blob->data, blob->length);
+            }
+        }
+        mutex_unlock(&drm->mode_config.mutex);
     }
     mutex_unlock(&fb->client.modeset_mutex);
     if (best == NULL) {
@@ -268,6 +289,19 @@ int nmx_fb_power(void *dev, int on)
             printf("NullMoth display: power %s done err %d in %ld ms\n", on ? "on" : "off", err,
                    (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
             return err;
+        }
+    return ENODEV;
+}
+
+/* Called during IOFramebuffer construction, after open published the bridge. */
+int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out)
+{
+    if (!out) return EINVAL;
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < MAX_FB; i++)
+        if (fbs[i].dev == dev && fbs[i].fb) {
+            *out = fbs[i].fb->display;
+            return 0;
         }
     return ENODEV;
 }

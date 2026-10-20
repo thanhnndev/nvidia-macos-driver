@@ -27,6 +27,13 @@ struct nmx_fb_info {
 /* before the driver attaches: settings the bridge needs from the driver (scan-out buffers in contiguous VRAM) */
 void nmx_fb_before_attach(void);
 int nmx_fb_open(void *dev, struct nmx_fb_info *out);
+/* Immutable identity snapshot of the connector whose mode sized the scanout.
+ * Separate from nmx_fb_info to preserve its existing layout. No synthesized EDID. */
+struct nmx_fb_display_info {
+    uint32_t edid_size, internal, width_mm, height_mm;
+    uint8_t edid[1024];
+};
+int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out);
 void nmx_fb_close(void *dev);
 int nmx_fb_power(void *dev, int on);
 #ifdef __cplusplus
