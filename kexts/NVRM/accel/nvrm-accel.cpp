@@ -251,6 +251,50 @@ public:
     IOPCIDevice *fPCI = nullptr;
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
+    IONotifier *fForeignNote = nullptr;
+    thread_call_t fForeignArmCall = nullptr;
+    volatile UInt32 fForeignPending = 0;
+    bool fForeignStopping = false;
+    unsigned fForeignAttempts = 0;
+    static void foreignArm(void *p0, void *) {
+        NVAccel *me = static_cast<NVAccel *>(p0);
+        if (!me) return;
+        struct PendingReference {
+            NVAccel *me; bool requeued = false;
+            ~PendingReference() {
+                IOLockUnlock(me->fRegLock);
+                if (!requeued) { OSCompareAndSwap(1, 0, &me->fForeignPending); me->release(); }
+            }
+        } held = {me};
+        IOLockLock(me->fRegLock);
+        if (me != gAccel || me->fForeignStopping || !me->fFBs[4]) return;
+        NVRMVramRequest q = {}; q.version = NVRM_VRAM_ABI_VERSION;
+        IOReturn r = me->askFramebufferForScanout(&q, me->fFBs[4]);
+        if ((!gNvAccelArmed || r == kIOReturnNotReady) && ++me->fForeignAttempts < 300) {
+            uint64_t deadline = 0;
+            clock_interval_to_deadline(200, 1000000, &deadline);
+            held.requeued = true;
+            thread_call_enter_delayed(me->fForeignArmCall, deadline);
+            return;
+        }
+        // Cross-GPU scanout is CPU-only. Never treat AMD physical/GPU addresses as NVIDIA VRAM.
+        if (!gNvAccelArmed || r != kIOReturnSuccess || !q.kva || q.phys || q.handle ||
+            q.width != 2880 || q.height != 1800 || q.pitch < 4ULL*q.width ||
+            (uint64_t)q.pitch*q.height > q.actualSize) {
+            me->setProperty("NVAccelForeignDisplayError", (unsigned long long)r, 32);
+            ALOG("foreign OLED refused: query 0x%x, NVIDIA armed %d", r, gNvAccelArmed);
+            return;
+        }
+        // Only now allow the existing head4 path; an earlier NVIDIA arm must not register an unopened OLED.
+        gNvIgpu = 1;
+        me->registerFramebufferLocked(1);
+        if (gNvHeadsPiped & (1u << 4)) {
+            me->setProperty("NVAccelForeignDisplayArmed", kOSBooleanTrue);
+            me->setProperty("NVAccelForeignPresentation", "NVK-IOSurface-copy-to-AMD-DCN35");
+            ALOG("foreign OLED pipe armed: NVIDIA renders, CPU copy presents to AMD DCN35 head4");
+        }
+    }
+
     static NVAccel *gAccel;
     IOService *fFB = nullptr;
     IOService *volatile fFBs[kNvMaxFB] = {};
@@ -261,9 +305,13 @@ public:
         (void)ref; (void)note;
         NVAccel *me = (NVAccel *)target;
         if (!me || !newService) return true;
+        const bool foreign = newService->metaCast("NMXGPUFB") != nullptr;
+        if (foreign && (!me->fForeignArmCall ||
+            newService->getProperty("NMXNvidiaDisplayBridge") != kOSBooleanTrue)) return true;
         unsigned idx = 0;
         OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex"));
         if (num) idx = num->unsigned32BitValue();
+        if (foreign && idx != 4) return true;
         const char *what = "kept";
         if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
         else {
@@ -293,6 +341,10 @@ public:
                  "and WindowServer composites it only after a WindowServer restart", idx);
         else
             ALOG("  to register it:  sudo sysctl -w debug.nvaccelfb=1   (2 = re-run the family's own sweep)");
+        if (foreign && me->fFBs[4] == newService && OSCompareAndSwap(0, 1, &me->fForeignPending)) {
+            me->retain();
+            thread_call_enter(me->fForeignArmCall);
+        }
         return true;
     }
     // Headless GPU (laptops whose panel and outputs are all on the Intel or AMD GPU: issues #76, #106). NVKMS finds no
@@ -650,6 +702,19 @@ public:
                     fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
                     im->release();
                     ALOG("watching for an Intel built-in panel (NMIntelFB) -> notifier %p", fIntelNote);
+                }
+                // Scoped hybrid profile only: keep default Intel/NVIDIA behavior elsewhere.
+                auto root = IORegistryEntry::getRegistryRoot();
+                auto build = root ? OSDynamicCast(OSString, root->getProperty("IOKitBuildVersion")) : nullptr;
+                if (getProperty("NMXForeignDisplayEnabled") == kOSBooleanTrue && fRegLock && build &&
+                    build->isEqualTo("Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64")) {
+                    fForeignArmCall = thread_call_allocate(&NVAccel::foreignArm, this);
+                    if (fForeignArmCall) {
+                        if (OSDictionary *am = serviceMatching("NMXGPUFB")) {
+                            fForeignNote = addMatchingNotification(gIOFirstPublishNotification, am, &NVAccel::fbPublished, this, nullptr, 0);
+                            am->release();
+                        }
+                    }
                 }
                 nvaccelInstallSysctl();
                 if (getProperty("MetalPluginName")) {
