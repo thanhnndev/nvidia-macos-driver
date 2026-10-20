@@ -52,3 +52,28 @@ allocation and page flips: NVIDIA IOSurfaces are CPU-copied into DCN35 scanout.
 `NVAccelForeignDisplayArmed` and `debug.nvaccel_iop_ok_h4` must confirm runtime
 binding/presentation after reboot. No runtime success is claimed by a build.
 HDR correctness is still separate from this SDR presentation/identity fix.
+
+## AGDC association fix (Step54)
+
+Step53 created/armed the real OLED kernel pipe (heads_piped0x11), but it received
+zero frames and CoreDisplay still could not find it. A fresh entitled helper's
+IOPresentmentGetMap contained only HDMI. Stock NVRMAGDC scans only same-PCI
+NVRMNVDAFramebuffer services and reports one contiguous head; it cannot advertise
+our physical foreign head4. This is a separate requirement from pipe creation.
+
+The scoped `NMXForeignDisplayEnabled=true` NVDAGDCLoader personality now appends
+exactly one marked foreign NMXGPUFB at the compact AGDC index after native heads.
+It must name this NVIDIA rendering PCI registry ID, matching dependent group and
+head4, and have valid actual K5 timing. NVAccel declares rendering ownership at
+publication before open; once registered it also publishes the actual pipe index,
+which must match. Ambiguous foreign matches are refused. Real timing (including
+sync polarity) comes from DRM, not a synthesized EDID. The hybrid map is rescanned
+on each0x980 reply to avoid startup's one-second cache race. A table lock protects
+retained entries during rescan/reply/K5 reads. Default profiles keep old behavior.
+
+Before installing, a private helper-only interposer changed its own0x980 reply
+from one entry to two: actual IOPresentment produced HDMI index0 and AMD OLED
+index1 on the same nonzero NVAccel registry ID. No WindowServer injection or
+kernel reply modification was used. This proves the association format and
+cross-PCI mapping, not live presentation. New kernel runtime remains to be checked:
+AGDC fbmap/maxfb2, fresh IOPresentment map2, iop_ok_h4 increasing, OLED desktop.

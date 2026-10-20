@@ -289,6 +289,8 @@ public:
         gNvIgpu = 1;
         me->registerFramebufferLocked(1);
         if (gNvHeadsPiped & (1u << 4)) {
+            if (OSNumber *index = OSDynamicCast(OSNumber, me->fFBs[4]->getProperty("IOAccelIndex")))
+                me->fFBs[4]->setProperty("NMXNvidiaPipeIndex", index);
             me->setProperty("NVAccelForeignDisplayArmed", kOSBooleanTrue);
             me->setProperty("NVAccelForeignPresentation", "NVK-IOSurface-copy-to-AMD-DCN35");
             ALOG("foreign OLED pipe armed: NVIDIA renders, CPU copy presents to AMD DCN35 head4");
@@ -312,6 +314,9 @@ public:
         OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex"));
         if (num) idx = num->unsigned32BitValue();
         if (foreign && idx != 4) return true;
+        // Declare the rendering PCI owner before open()/IOPresentment's first map query.
+        if (foreign && me->fPCI)
+            newService->setProperty("NMXNvidiaRenderPCI", me->fPCI->getRegistryEntryID(), 64);
         const char *what = "kept";
         if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
         else {

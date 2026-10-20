@@ -49,7 +49,13 @@ static int    gAgdcLogged = 0;
 // Slot-table rescans done while answering 0x980 (see nvdaAgdcRescanForReply).
 static SInt64 gAgdcRescans = 0;
 
-enum { kAgdcMaxFB = 4 };
+enum { kAgdcMaxFB = 5 };
+static bool gAgdcForeign = false;
+static IOLock *gAgdcTableLock = nullptr;
+struct AgdcTableGuard {
+    AgdcTableGuard() { IOLockLock(gAgdcTableLock); }
+    ~AgdcTableGuard() { IOLockUnlock(gAgdcTableLock); }
+};
 static IOService *gAgdcFB[kAgdcMaxFB];
 static unsigned  gAgdcNFB = 0;
 enum { kAgdcFBMapBytes = 3 + kAgdcMaxFB * 25 + 52 + 1 };
@@ -108,7 +114,9 @@ static void nvdaAgdcRescanForReply(IOService *pci)
     static uint64_t last = 0;
     uint64_t now = 0; clock_get_uptime(&now);
     uint64_t per = 0; nanoseconds_to_absolutetime(1000000000ull, &per);
-    if (last && now - last < per) return;
+    // The foreign FB can publish/open within this second. Its first association
+    // query must not cache a one-head map for the rest of WindowServer's session.
+    if (!gAgdcForeign && last && now - last < per) return;
     last = now;
     const unsigned before = gAgdcNFB;
     nvdaAgdcScan(pci);
@@ -129,6 +137,7 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
     }
     if (cmd == 0x980) {
         if (!out || !outSize || *outSize != sizeof(NVAGDCGPUCapability)) return kIOReturnBadArgument;
+        AgdcTableGuard tableGuard;
         nvdaAgdcRescanForReply(fPci);   // a framebuffer that started after boot has to be in this reply
         NVAGDCGPUCapability *c = (NVAGDCGPUCapability *)out; bzero(c, sizeof *c);
         unsigned n = gAgdcNFB;
@@ -145,6 +154,7 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
         return kIOReturnSuccess;
     }
     if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {
+        AgdcTableGuard tableGuard;
         IOReturn k5 = nvdaK5Answer(fFB, cmd, in, inSize, out, outSize);
         if (k5 != kIOReturnUnsupported) return k5;
     }
@@ -162,7 +172,7 @@ static void nvdaAgdcDropTable(void)
     for (unsigned i = 0; i < kAgdcMaxFB; i++) { IOService *f = gAgdcFB[i]; gAgdcFB[i] = nullptr; if (f) f->release(); }
     if (n) snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "released (the last table had %u slot(s))", n);
 }
-static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdcFBRef = nullptr; } nvdaAgdcDropTable(); }
+static void nvdaAgdcDropFB(void) { AgdcTableGuard tableGuard; if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdcFBRef = nullptr; } nvdaAgdcDropTable(); }
 static void nvdaAgdcTargets(IOService **pci, IOService **fb)
 {
     *pci = nullptr; *fb = nullptr;
@@ -194,7 +204,7 @@ static void nvdaAgdcScan(IOService *pci)
         OSObject *io = f->copyProperty("IOFBDependentIndex"); OSNumber *num = OSDynamicCast(OSNumber, io);
         long long ix = num ? (long long)num->unsigned32BitValue() : -1; OSSafeReleaseNULL(io);
         if (ix < 0) { noidx++; SCANLOG("framebuffer id %#llx has no IOFBDependentIndex number: left out", rid); continue; }
-        if (ix >= kAgdcMaxFB) { range++; SCANLOG("framebuffer id %#llx IOFBDependentIndex %lld >= %d: left out", rid, ix, (int)kAgdcMaxFB); continue; }
+        if (ix >= 4) { range++; SCANLOG("framebuffer id %#llx IOFBDependentIndex %lld >= %d: left out", rid, ix, (int)kAgdcMaxFB); continue; }
         if (tab[ix]) { dup++; SCANLOG("IOFBDependentIndex %lld claimed twice: id %#llx kept, id %#llx left out", ix, (unsigned long long)tab[ix]->getRegistryEntryID(), rid); continue; }
         f->retain(); tab[ix] = f;
     }
@@ -203,6 +213,31 @@ static void nvdaAgdcScan(IOService *pci)
     for (unsigned i = n; i < kAgdcMaxFB; i++) if (tab[i]) {
         hole++; SCANLOG("slot %u (id %#llx) sits beyond a hole at slot %u: left out", i, (unsigned long long)tab[i]->getRegistryEntryID(), n);
         tab[i]->release(); tab[i] = nullptr;
+    }
+    // Physical head4 is a compact AGDC/IOAccel slot after the real NVIDIA heads.
+    // Only the explicit NVAccel rendering-PCI declaration may cross PCI ancestry.
+    if (gAgdcForeign && n > 0 && n < kAgdcMaxFB) {
+        OSDictionary *fm = IOService::serviceMatching("NMXGPUFB");
+        OSIterator *fit = fm ? IOService::getMatchingServices(fm) : nullptr; OSSafeReleaseNULL(fm);
+        IOService *foreign = nullptr; unsigned matches = 0;
+        while (fit && (o = fit->getNextObject())) {
+            IOService *f = OSDynamicCast(IOService, o); if (!f) continue;
+            auto renderer = OSDynamicCast(OSNumber, f->getProperty("NMXNvidiaRenderPCI"));
+            auto head = OSDynamicCast(OSNumber, f->getProperty("IOFBDependentIndex"));
+            auto group = OSDynamicCast(OSNumber, f->getProperty("IOFBDependentID"));
+            auto actual = OSDynamicCast(OSNumber, f->getProperty("NMXNvidiaPipeIndex"));
+            if (f->getProperty("NMXNvidiaDisplayBridge") != kOSBooleanTrue || !renderer ||
+                renderer->unsigned64BitValue() != pci->getRegistryEntryID() || !head || head->unsigned32BitValue() != 4 ||
+                !group || group->unsigned64BitValue() != 0x4E56524D00000001ULL ||
+                (actual && actual->unsigned32BitValue() != n)) continue;
+            OSObject *record = f->copyProperty("NVRMTiming"); auto data = OSDynamicCast(OSData, record);
+            bool valid = data && !nvk5_timing_bad((const uint32_t *)data->getBytesNoCopy(), data->getLength());
+            OSSafeReleaseNULL(record);
+            if (!valid) continue;
+            matches++; foreign = f;
+        }
+        if (matches == 1) { foreign->retain(); tab[n++] = foreign; }
+        OSSafeReleaseNULL(fit);
     }
     for (unsigned i = 0; i < n; i++) gAgdcFB[i] = tab[i];
     gAgdcNFB = n;
@@ -225,7 +260,7 @@ static void nvdaAgdcWorkBody(void)
     if (gAgdcWant == 1 && !gAgdc) {
         IOService *pci = nullptr, *fb = nullptr; nvdaAgdcTargets(&pci, &fb);
         if (!pci || !fb) { gAgdcState = -1; FBLOG("AGDC: no PCI device or no framebuffer yet (pci %p fb %p)", pci, fb); return; }
-        nvdaAgdcScan(pci);
+        { AgdcTableGuard tableGuard; nvdaAgdcScan(pci); }
         NVDADeviceControl *d = OSTypeAlloc(NVDADeviceControl);
         if (!d) { gAgdcState = -2; FBLOG("AGDC: alloc failed"); nvdaAgdcDropFB(); return; }
         if (!d->init(nullptr)) { gAgdcState = -3; FBLOG("AGDC: init failed"); d->release(); nvdaAgdcDropFB(); return; }
@@ -300,6 +335,13 @@ bool NVDAGDCLoader::start(IOService *provider)
 {
     { if (nvrm_driver_off()) return false; }
     if (!IOService::start(provider)) return false;
+    if (!gAgdcTableLock) gAgdcTableLock = IOLockAlloc();
+    if (!gAgdcTableLock) return false;
+    auto root = IORegistryEntry::getRegistryRoot();
+    auto build = root ? OSDynamicCast(OSString, root->getProperty("IOKitBuildVersion")) : nullptr;
+    gAgdcForeign = getProperty("NMXForeignDisplayEnabled") == kOSBooleanTrue && build &&
+        build->isEqualTo("Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64");
+    if (gAgdcForeign) gAgdcK5 = 1;
     nvdaAgdcInstallSysctl(); FBLOG("loaded; idle until `sysctl debug.nvrmfb_agdc=1`"); return true;
 }
 void NVDAGDCLoader::stop(IOService *provider)
