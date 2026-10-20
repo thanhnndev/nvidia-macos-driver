@@ -19,6 +19,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS;
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 #include "AppleGraphicsDeviceControl_re.h"
 #include "nvrm-agdc-k5.h"
+#include "nvrm-agdc-client.h"
 #pragma pack(push, 1)
 struct NVAGDCVendorInfo {
     uint32_t version;
@@ -40,6 +41,8 @@ struct NVAGDCGPUCapability {
 static_assert(sizeof(NVAGDCVendorInfo) == 0x2c, "AGDCVendorInfo_t is 0x2c");
 static_assert(sizeof(NVAGDCGPUCapability) == 0xdc, "AGDCGPUCapability_t is 0xdc");
 
+static SInt64 gAgdcClientSet = 0;
+static int gAgdcClientSetValue = 0;
 static int    gAgdcK5 = 0;
 static SInt64 gAgdcK5Link = 0, gAgdcK5Caps = 0;
 static int    gAgdcK5Why = 0;
@@ -133,6 +136,18 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
         if (!out || !outSize || *outSize != sizeof(NVAGDCVendorInfo)) return kIOReturnBadArgument;
         NVAGDCVendorInfo *v = (NVAGDCVendorInfo *)out; bzero(v, sizeof *v);
         v->version = 0x30000; strlcpy(v->vendor, "NVIDIA", sizeof v->vendor); v->vendorID = 0x10de; v->vendorClass = 2;
+        return kIOReturnSuccess;
+    }
+    if (gAgdcForeign && cmd == 0x2001) {
+        uint32_t value = 0;
+        if (!nvrm_agdc_decode_client_set(in, inSize, outSize ? *outSize : 0, &value))
+            return kIOReturnBadArgument;
+        // IOPresentment declares its client before obtaining AGDC information.
+        // This display companion has no client-specific hardware policy to apply.
+        // Record the declaration, as the existing Strix AGDC implementation does;
+        // no mode, memory mapping or rendering capability is being acknowledged.
+        gAgdcClientSetValue = (int)value;
+        OSAddAtomic64(1, &gAgdcClientSet);
         return kIOReturnSuccess;
     }
     if (cmd == 0x980) {
@@ -287,6 +302,8 @@ static int nvrmfb_agdc_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_agdc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, NULL, 0, nvrmfb_agdc_sysctl, "I",
             "write 1 = create our AppleGraphicsDeviceControl object, 0 = terminate it; reads the state (1 UP, <0 failed step)");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_client_set, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcClientSet, "valid IOPresentment client declarations acknowledged");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_agdc_client_set_value, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcClientSetValue, 0, "last passive client declaration");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_cmds,    CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcCmds,        "AGDC vendor calls received");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcUnsupported, "AGDC vendor calls answered Unsupported");
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_last_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcLastRefused, 0, "last AGDC command refused");
@@ -303,6 +320,8 @@ SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_caps_mask, CTLFLAG_RD | CTLFLAG_LOC
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_last_refused_idx, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5LastRefusedIdx, 0, "the index the last BADARG/NOTFOUND refusal named (-1 none); an Unsupported 0x711 type shows in k5_asked only");
 static void nvdaAgdcRemoveSysctl(void)
 {
+    sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_set);
+    sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_set_value);
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_cmds);
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_refused); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_last_refused);
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_link);
@@ -314,6 +333,8 @@ static void nvdaAgdcRemoveSysctl(void)
 }
 static void nvdaAgdcInstallSysctl(void)
 {
+    sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_set);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_set_value);
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_cmds);
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_refused); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_last_refused);
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_link);

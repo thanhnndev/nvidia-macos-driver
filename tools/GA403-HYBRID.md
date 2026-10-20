@@ -77,3 +77,22 @@ index1 on the same nonzero NVAccel registry ID. No WindowServer injection or
 kernel reply modification was used. This proves the association format and
 cross-PCI mapping, not live presentation. New kernel runtime remains to be checked:
 AGDC fbmap/maxfb2, fresh IOPresentment map2, iop_ok_h4 increasing, OLED desktop.
+
+## IOPresentment client declaration (Step55)
+
+Step54 runtime confirms both actual map entries and real timing queries, but WS
+still receives AGDC information error0x10000003 immediately after AGDC rejects
+0x2001 (4-byte client declaration). The earlier Strix AGDC already handled this
+passive declaration; the NVIDIA companion omitted it. The scoped hybrid profile
+now accepts exactly4 input bytes/no output, records the declaration and returns
+success. It does not acknowledge GPU execution, a modeset or HDR capability.
+Malformed sizes/pointers/output are rejected; unaligned input is handled safely.
+Read-only nvrmfb_agdc_client_set/value counters expose the declaration handling.
+Only NVRMAGDC needs replacing; existing association/timing/foreign-copy code stays.
+
+The malformed-payload boundary checks pass and the kext links into the full
+AuxKC. A separate IOPresentment construction helper reaches NVAccel's exclusive
+display-pipe-client guard because WS owns it, and cannot fully initialize beside
+WS. No control ownership was stolen or WS restarted to bypass that guard. Next
+boot must verify client-set acknowledged, no AGDC information error, increasing
+head4 frame counter and visible OLED; no runtime success claimed yet.
