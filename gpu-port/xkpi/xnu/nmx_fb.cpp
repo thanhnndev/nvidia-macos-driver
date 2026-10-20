@@ -64,7 +64,15 @@ public:
 
     bool start(IOService *provider) override {
         if (!IOFramebuffer::start(provider)) return false;
-        setProperty("IOFBDependentIndex", 0ULL, 32);
+        const bool foreign = fDisplay.internal && fInfo.width == 2880 && fInfo.height == 1800 &&
+            provider->getProperty("NMXNvidiaDisplayBridge") == kOSBooleanTrue;
+        setProperty("IOFBDependentIndex", foreign ? 4ULL : 0ULL, 32);
+        if (foreign) {
+            // Same controller group as upstream NVRMFB/NMIntelFB, separate head4.
+            setProperty("IOFBDependentID", 0x4E56524D00000001ULL, 64);
+            setProperty("NMXNvidiaDisplayBridge", kOSBooleanTrue);
+            setProperty("built-in", kOSBooleanTrue);
+        }
         setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
         if (fDisplay.edid_size) setProperty("NMXEDIDSource", "drm-connector");
