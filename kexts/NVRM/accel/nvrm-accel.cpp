@@ -982,6 +982,25 @@ static unsigned gIopLogs = 0;
 #define NVIOPLOG(fmt, ...) do { if (gIopLogs < NVIOP_LOG_MAX) { gIopLogs++; ALOG("iop: " fmt, ##__VA_ARGS__); } } while (0)
 #define NVIOP_FAIL(rc, fmt, ...) do { OSAddAtomic64(1, &gCntIopFail); NVIOPLOG(fmt, ##__VA_ARGS__); return (rc); } while (0)
 
+/*
+ * ga403wm b15: the display-pipe transaction boundary. WindowServer reported
+ *   "Failed to submit transaction: IOPRESENTMENT_METHOD_FAILURE: IOReturn: 0x2d8"  (kIOReturnNotReady)
+ * for the foreign OLED, while performTransaction never logged a K6 line and nvaccel_iop_fail stayed 0: whatever
+ * refused it, it was not the copy. Log the first three calls per head at each entry point, with the framebuffer the
+ * pipe resolves to, so the log says whether WindowServer's OLED transactions reach this pipe at all.
+ */
+static unsigned gTrxSeen[8][3];
+static unsigned gTrxTotal;
+static const unsigned kTrxLogMax = 120;
+static bool nvTrxWant(unsigned head, unsigned fn)
+{
+    if (head >= 8) head = 7;
+    if (gTrxSeen[head][fn] >= 3 || gTrxTotal >= kTrxLogMax) return false;
+    gTrxSeen[head][fn]++;
+    gTrxTotal++;
+    return true;
+}
+
 void NVDisplayPipe::iopDropSources()
 {
     for (unsigned i = 0; i < kIopSrcSlots; i++) {
@@ -1018,13 +1037,24 @@ const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, un
 
 IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 {
+    NVAccel *a = NVAccel::gAccel; unsigned head = 0;
+    IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
+    if (nvTrxWant(head, 0))
+        ALOG("trx: validateTransaction(pipe %p) -> fb %s head %u", this,
+             fb ? fb->getMetaClass()->getClassName() : "(none)", head);
     return kIOReturnSuccess;
 }
 
 static bool nvAccelIopAsyncBusy(const void *pipe);
 bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
-    return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
+    NVAccel *a = NVAccel::gAccel; unsigned head = 0;
+    IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
+    const bool done = gNvIop != 0 && !nvAccelIopAsyncBusy(this);
+    if (nvTrxWant(head, 1))
+        ALOG("trx: isTransactionComplete(pipe %p) -> fb %s head %u complete %d", this,
+             fb ? fb->getMetaClass()->getClassName() : "(none)", head, done ? 1 : 0);
+    return done;
 }
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
@@ -1039,6 +1069,10 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     NVAccel *a = NVAccel::gAccel;
     unsigned head = 0;
     IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
+    if (nvTrxWant(head, 2))
+        ALOG("trx: performTransaction(pipe %p) -> fb %s head %u surface %s resource %s", this,
+             fb ? fb->getMetaClass()->getClassName() : "(none)", head,
+             txn->getPlaneIOSurface(0, 0) ? "yes" : "no", txn->getPlaneResource(0, 0) ? "yes" : "no");
     if (!fb) NVIOP_FAIL(kIOReturnNotAttached, "no accelerator, or pipe %p drives a framebuffer that is none of ours", this);
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
