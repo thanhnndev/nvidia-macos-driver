@@ -64,7 +64,18 @@ static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
  * accelerator), RADV for AMD and ANV for Intel (NMXAccel, the accelerator for the GPUs NMXGPU drives).
  */
 #include <IOKit/IOKitLib.h>
+#include "NVMTLHybridPolicy.h"
 static uint16_t g_vendor;
+static bool nvmtl_hybrid_has_nvidia(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!s) return false;
+    IOObjectRelease(s); return true;
+}
+static uint16_t nvmtl_hybrid_policy(uint16_t candidate)
+{
+    return nvmtl_hybrid_vendor(getprogname(), getenv("NVMTL_TEST_GPU"), nvmtl_hybrid_has_nvidia(), candidate);
+}
 static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
 {
     io_registry_entry_t pci = 0; uint16_t v = 0;
@@ -83,13 +94,18 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
     uint16_t v = 0;
     if (accel && IOObjectConformsTo(accel, "NMXAccel")) { v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0; }
     else if (accel && IOObjectConformsTo(accel, "NVAccel")) v = 0x10de;
-    if (v && !g_vendor) g_vendor = v;
+    if (v && !g_vendor) {
+        g_vendor = nvmtl_hybrid_policy(v);
+        nvlog("hybrid process backend: %04x (candidate %04x, process %s)", g_vendor, v, getprogname());
+    }
     return v;
 }
 /* a process that starts Vulkan before Metal makes a device: NVIDIA when its accelerator runs, else the AMD/Intel one */
 uint16_t nvmtl_vk_vendor(void)
 {
     if (g_vendor) return g_vendor;
+    uint16_t policy = nvmtl_hybrid_policy(0);
+    if (policy) { g_vendor = policy; return g_vendor; }
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
     if (s) { IOObjectRelease(s); g_vendor = 0x10de; return g_vendor; }
     s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
