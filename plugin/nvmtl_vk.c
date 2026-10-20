@@ -2569,6 +2569,11 @@ static VkCommandPool g_keep_pool[NVMTL_KEEP]; static unsigned g_keep_npool;
 static nvmtl_address_page *g_keep_page[NVMTL_KEEP]; static unsigned g_keep_npage;
 static int nvmtl_keep_on(void)
 {
+    /* The host-polled completion witness has not passed on this AMD UMA path:
+     * the Vulkan fence signals, but its mapped witness remains stale. Keep the
+     * normal fence/error checks and destroy each completed pool instead of
+     * reusing pools/pages under an unverified host-coherency assumption. */
+    if (nvmtl_vk_vendor() != 0x10de) return 0;
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("NVMTL_POOL_REUSE");
