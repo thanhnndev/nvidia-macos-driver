@@ -1611,6 +1611,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)sd {
     if (nvmtl_vk_init()) return nil;
+    if (getenv("NVMTL_FORCE_LINEAR_DYN")) { sd = [sd copy]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; }   // diagnostic
     NVMTLSamplerState *s = [NVMTLSamplerState new];
     s->_label = [sd.label copy];
     if (!sd.normalizedCoordinates) {

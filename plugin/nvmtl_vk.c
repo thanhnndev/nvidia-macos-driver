@@ -1011,6 +1011,12 @@ static int nvmtl_vk_initialize(void)
         VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p3 };
         pvkGetPhysicalDeviceProperties2(g_pdev, &p2); g_topo_any = p3.dynamicPrimitiveTopologyUnrestricted ? 1 : 0;
     }
+    // RADV reports dynamicPrimitiveTopologyUnrestricted false, yet a pipeline whose topology is dynamic is compiled for an
+    // unknown primitive class (vertices-per-primitive 3, NGG culling switched off per draw for points and lines;
+    // radv_get_num_vertices_per_prim). Without this every point/line draw was dropped (WindowServer hairlines).
+    // NVMTL_TOPO_ANY=0 drops them again.
+    { const char *ta = getenv("NVMTL_TOPO_ANY");
+      if (!g_topo_any && nvmtl_vk_vendor() == 0x1002 && !(ta && ta[0] == '0')) { g_topo_any = 1; nvlog("vk: G14 points/lines drawn on the dynamic-topology pipeline (RADV compiles it for an unknown class)"); } }
     nvlog("vk: G14 primitive topology is dynamic; points/lines on a triangle-class pipeline: %s", g_topo_any ? "yes" : "NO");
     if (g_dyn3) {
         pvkCmdSetPolygonModeEXT = (PFN_vkCmdSetPolygonModeEXT)pvkGetDeviceProcAddr(g_dev, "vkCmdSetPolygonModeEXT");
