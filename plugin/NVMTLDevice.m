@@ -743,6 +743,32 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
+    // AMD APU (Radeon 780M): the GPU renders and samples the IOSurface's own pages, a linear image over the surface's
+    // allocation imported as host memory (VK_EXT_external_memory_host), so nothing is copied in or out. Without it
+    // WindowServer read each composited 2560x1600 frame back with memmove: ~12 ms and ~1.3 GB/s of its CPU, and the
+    // panel then copied the write-combined result again (2026-10-20). NVMTL_NO_SURFACE_HOST=1 keeps the copies.
+    static int hostOn = -1;
+    if (hostOn < 0) hostOn = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST");
+    if (hostOn && surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1) {
+        void *base = IOSurfaceGetBaseAddress(surf);
+        const size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
+        // the surface is mapped in whole pages: its allocation rounded up to the import alignment is still its own
+        const size_t alloc = IOSurfaceGetAllocSize(surf), span = al ? (alloc + al - 1) & ~(al - 1) : 0;
+        if (base && al && !((uintptr_t)base & (al - 1)) && alloc && (size_t)w * (bpp ? bpp : 4) <= row
+            && h <= sh && row % 32 == 0 && row * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
+            nvk_buffer hb;
+            if (!nvmtl_vk_buffer_import_host(base, span, &hb)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, 0, row, &t->_i)) {
+                    t->_hostBuf = hb; t->_hostOn = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+                    static unsigned long long nh; static unsigned said;
+                    if (said++ < 8 || ++nh % 2000 == 0)
+                        nvlog("surface %u %ux%u pitch %zu -> its own pages (host import, no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
+                    return 0;
+                }
+                nvmtl_vk_buffer_destroy(&hb);
+            }
+        }
+    }
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
@@ -821,7 +847,7 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage != 0;
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && !t->_vramOn) [cache setObject:t forKey:key];
+    if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
