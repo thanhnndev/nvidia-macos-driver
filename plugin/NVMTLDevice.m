@@ -174,8 +174,12 @@ static nvk_queue *nvmtl_device_queue(void) {
     if (!made) { if (nvmtl_vk_queue_create(&q)) { nvlog("device queue FAILED"); return NULL; } made = 1; }
     return &q;
 }
+#include "NVMTLDisplayGate.h"
+// Snapshot of the selected accelerator's own gate, not the NVIDIA sysctl.
+static bool gNVMTLNmxDisplayArmed;
 static bool nvmtl_accel_armed(void)
 {
+    if (nvmtl_vk_vendor() == 0x1002) return gNVMTLNmxDisplayArmed;
     int v = 0; size_t n = sizeof v;
     if (sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) != 0) return false;
     return v != 0;
@@ -491,8 +495,9 @@ static bool nvmtl_process_is_allowed(void)
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
     // WindowServer before its "!WindowServer" line is reached.
     { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
-                                          (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
+      if (!strcmp(me, "WindowServer") &&
+          !nvmtl_ws_display_gate(nvmtl_vk_vendor(), gNVMTLNmxDisplayArmed,
+                                 sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv)) {
           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("NVMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
@@ -563,6 +568,13 @@ static void nvmtl_install_hw_resource_pools(id dev)
         uint16_t mine = nvmtl_vk_set_accelerator(port), live = nvmtl_vk_vendor();
         if (mine && mine != live) { nvlog("  accelerator vendor %04x, but this process runs Metal on %04x: no second device", mine, live); return nil; }
         nvlog("  GPU vendor %04x (%s)", live, live == 0x1002 ? "AMD, RADV" : live == 0x8086 ? "Intel, ANV" : "NVIDIA, NVK");
+    }
+    if (nvmtl_vk_vendor() == 0x1002 && IOObjectConformsTo(port, "NMXAccel")) {
+        CFTypeRef armed = IORegistryEntryCreateCFProperty(port, CFSTR("NMXDisplayPipeArmed"), kCFAllocatorDefault, 0);
+        gNVMTLNmxDisplayArmed = armed && CFGetTypeID(armed) == CFBooleanGetTypeID() &&
+                                CFBooleanGetValue((CFBooleanRef)armed);
+        if (armed) CFRelease(armed);
+        nvlog("  AMD owned display pipe gate: %s", gNVMTLNmxDisplayArmed ? "armed" : "headless");
     }
     if (!nvmtl_process_is_allowed()) { nvlog("  not allow-listed: no device for %s", getprogname()); return nil; }
     nvlog("MTLIOAccelDevice's initWithAcceleratorPort: -> %p", (__bridge void *)self);
