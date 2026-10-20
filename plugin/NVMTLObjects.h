@@ -255,7 +255,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 @interface NVMTLCommandBuffer () { @public NSMutableSet *_stTwins; } @end
 @interface NVMTLTexture () { @public nvk_image _stTwin; BOOL _stTwinTried; } @end
 @interface NVMTLDepthStencilState () { @public NSString *_label; } @end
-@interface NVMTLSamplerState () { @public NSString *_label; } @end
+@interface NVMTLSamplerState () { @public NSString *_label; } - (const nvk_sampler *)nvmtlClampedLo:(float)lo hi:(float)hi; @end
 @interface NVMTLComputePipelineState () { @public NSString *_label; } @end
 @interface NVMTLComputePipelineState () { @public uint64_t _resid; NSUInteger _attrT, _askT; } @end
 // _sassKernel: machine code that runs before the Vulkan pipeline; _sassOnly: there is no Vulkan pipeline

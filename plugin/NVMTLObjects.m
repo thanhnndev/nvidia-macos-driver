@@ -3258,6 +3258,8 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
     [self setFragmentSamplerState:ss atIndex:i];
+    NVMTLSamplerState *ns = (NVMTLSamplerState *)ss;
+    if (ns && i < 16) { const nvk_sampler *v = [ns nvmtlClampedLo:lo hi:hi]; if (v != &ns->_s) nvmtl_vk_bind_sampler(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, v); }
     NSString *key=[@(i) stringValue];
     if(_fragmentSamplers[key]) {
         NSMutableDictionary *state=[_fragmentSamplers[key] mutableCopy];
@@ -3266,6 +3268,8 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
     [self setVertexSamplerState:ss atIndex:i];
+    NVMTLSamplerState *ns = (NVMTLSamplerState *)ss;
+    if (ns && i < 16) { const nvk_sampler *v = [ns nvmtlClampedLo:lo hi:hi]; if (v != &ns->_s) nvmtl_vk_bind_sampler(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, v); }
     NSString *key=[@(i) stringValue];
     if(_vertexSamplers[key]) {
         NSMutableDictionary *state=[_vertexSamplers[key] mutableCopy];
@@ -3704,12 +3708,33 @@ void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared) {
 - (BOOL)writesStencil { if (!_stencil) return NO; for (int k = 1; k <= 3; k++) if ((_sf[k] && _sf[5]) || (_sb[k] && _sb[5])) return YES; return NO; }
 @end
 
+// setXSamplerState:lodMinClamp:lodMaxClamp:atIndex: binds the sampler with those LOD clamps in place of its own. They
+// were ignored for every normalized sampler: CoreAnimation reads Liquid Glass backdrops through a sampler whose clamps
+// pick a reduced level, and without them the GPU took the magnification filter (nearest) - the glass showed its
+// backdrop in 4-pixel blocks (2026-10-20). Variants live as long as the sampler (command buffers retain it).
+@interface NVMTLSamplerState () { nvk_sampler _clamp[8]; unsigned _nclamp; os_unfair_lock _clampLock; } @end
 @implementation NVMTLSamplerState
+- (const nvk_sampler *)nvmtlClampedLo:(float)lo hi:(float)hi {
+    if (!_s.full_state || _pixelState) return &_s;
+    if (hi < lo) hi = lo;
+    if (lo == _s.desc.lod_min && hi == _s.desc.lod_max) return &_s;
+    const nvk_sampler *got = &_s;
+    os_unfair_lock_lock(&_clampLock);
+    unsigned k = 0;
+    while (k < _nclamp && !(_clamp[k].desc.lod_min == lo && _clamp[k].desc.lod_max == hi)) k++;
+    if (k < _nclamp) got = &_clamp[k];
+    else if (_nclamp < 8) {
+        nvmtl_sampler_desc d = _s.desc; d.lod_min = lo; d.lod_max = hi;
+        if (!nvmtl_vk_sampler_create_desc(&d, &_clamp[_nclamp])) got = &_clamp[_nclamp++];
+    } else { static int said; if (!said++) nvlog("sampler LOD clamps: a sampler used with more than 8 clamp pairs - the rest keep its own"); }
+    os_unfair_lock_unlock(&_clampLock);
+    return got;
+}
 - (MTLResourceID)gpuResourceID {
     @synchronized (self) { if (!_resid) _resid = nvmtl_resid_for_sampler(self); }
     MTLResourceID rid; rid._impl = _resid; return rid;
 }
-- (void)dealloc { nvmtl_vk_sampler_destroy(&_s); }
+- (void)dealloc { for (unsigned k = 0; k < _nclamp; k++) nvmtl_vk_sampler_destroy(&_clamp[k]); nvmtl_vk_sampler_destroy(&_s); }
 - (NSString *)label { return _label; }
 - (id<MTLDevice>)device { return (id<MTLDevice>)gNVMTLMainDevice; }
 @end
@@ -4368,6 +4393,8 @@ static void nvmtl_zprobe_drain(void) {
 }
 - (void)setSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
     [self setSamplerState:ss atIndex:i];
+    NVMTLSamplerState *ns = (NVMTLSamplerState *)ss;
+    if (ns && i < 16) { const nvk_sampler *v = [ns nvmtlClampedLo:lo hi:hi]; if (v != &ns->_s) nvmtl_vk_bind_sampler(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, v); }
 }
 - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger *)offs withRange:(NSRange)r {
     for (NSUInteger k = 0; k < r.length; k++) if (b[k]) [self setBuffer:b[k] offset:offs ? offs[k] : 0 atIndex:r.location + k];
