@@ -74,7 +74,6 @@ static id<MTLSamplerState> nvmtl_static_sampler_from(NSDictionary *st)
     MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
     d.minFilter = (MTLSamplerMinMagFilter)nvmtl_ss_enum(st, @"min_filter", filt, MTLSamplerMinMagFilterNearest, &bad);
     d.magFilter = (MTLSamplerMinMagFilter)nvmtl_ss_enum(st, @"mag_filter", filt, MTLSamplerMinMagFilterNearest, &bad);
-    if (getenv("NVMTL_FORCE_LINEAR_STATIC")) d.minFilter = d.magFilter = MTLSamplerMinMagFilterLinear;   // diagnostic
     d.mipFilter = (MTLSamplerMipFilter)nvmtl_ss_enum(st, @"mip_filter", mip, MTLSamplerMipFilterNotMipmapped, &bad);
     d.sAddressMode = (MTLSamplerAddressMode)nvmtl_ss_enum(st, @"address_mode_s", addr, MTLSamplerAddressModeClampToEdge, &bad);
     d.tAddressMode = (MTLSamplerAddressMode)nvmtl_ss_enum(st, @"address_mode_t", addr, MTLSamplerAddressModeClampToEdge, &bad);

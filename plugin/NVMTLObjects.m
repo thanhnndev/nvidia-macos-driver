@@ -2776,6 +2776,15 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
           }
           char st[600]; nvmtl_vk_pipeline_stats(p_->_p.pipe, st, sizeof st);
           nvtrace("PSO %p %s / %s vs %08x fs %08x | %s", (__bridge void *)ps, p_->_vname.UTF8String ?: "?", p_->_fname.UTF8String ?: "?", hv, hf, st);
+          { id f = p_->_descriptor.fragmentFunction;   // what the fragment function's own reflection expects (diagnostic)
+            if ([f isKindOfClass:[NVMTLFunction class]]) { NVMTLFunction *ff = (NVMTLFunction *)f;
+                NSArray *bs = nvmtl_function_reflection(ff)[@"bindings"]; NSMutableString *tx = [NSMutableString string];
+                for (NSDictionary *b in [bs isKindOfClass:[NSArray class]] ? bs : @[]) {
+                    NSString *k = b[@"kind"]; if (![k isKindOfClass:[NSString class]]) continue;
+                    if ([k isEqualToString:@"Texture"] || [k isEqualToString:@"Sampler"] || [k isEqualToString:@"StaticSampler"])
+                        [tx appendFormat:@" %@%@>%@", [k isEqualToString:@"Texture"] ? @"T" : [k isEqualToString:@"Sampler"] ? @"S" : @"C", b[@"metal_index"], b[@"descriptor"][@"binding"]]; }
+                nvtrace("  REFL fs %s fc %lu air %lu spv %lu:%s", ff->_fname.UTF8String, (unsigned long)ff->_fc.count, (unsigned long)ff->_air.length,
+                        (unsigned long)ff->_spirv.length, tx.UTF8String); } }
       } }
     NVMTLRenderPipelineState *p = (NVMTLRenderPipelineState *)ps;
     if (!p) { nvlog("encoder: nil render pipeline refused"); return; }

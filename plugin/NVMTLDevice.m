@@ -1611,7 +1611,18 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)sd {
     if (nvmtl_vk_init()) return nil;
-    if (getenv("NVMTL_FORCE_LINEAR_DYN")) { sd = [sd copy]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; }   // diagnostic
+    // WindowServer: every sampler filters linearly. Liquid Glass came out in 4-pixel blocks - its quarter-resolution
+    // backdrop reached the panel through a nearest sampler in CoreAnimation's fixed_frag_lpf_cpf (the uber shader reads
+    // its textures through the bindless heap; which binding goes wrong is not pinned down yet). For the compositor's
+    // 1:1 copies linear and nearest sample the same texel centres (menu text compared pixel for pixel), and scaled
+    // content (glass, Mission Control) comes out smooth as on Apple's GPUs. Apps keep nearest (pixel art).
+    // NVMTL_WS_NEAREST=1 keeps WindowServer's own filters; NVMTL_FORCE_LINEAR_DYN=1 forces linear in any process.
+    static int forceLinear = -1;
+    if (forceLinear < 0) { const char *me = getprogname();
+        forceLinear = getenv("NVMTL_FORCE_LINEAR_DYN") || (me && !strcmp(me, "WindowServer") && !getenv("NVMTL_WS_NEAREST"));
+        if (forceLinear) nvlog("samplers: nearest filters made linear in %s (compositor; NVMTL_WS_NEAREST=1 keeps them)", me ?: "?"); }
+    if (forceLinear && (sd.minFilter != MTLSamplerMinMagFilterLinear || sd.magFilter != MTLSamplerMinMagFilterLinear)) {
+        sd = [sd copy]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; }
     NVMTLSamplerState *s = [NVMTLSamplerState new];
     s->_label = [sd.label copy];
     if (!sd.normalizedCoordinates) {
