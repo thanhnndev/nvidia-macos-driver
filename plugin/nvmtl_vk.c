@@ -829,6 +829,14 @@ static int nvmtl_vk_initialize(void)
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
     static VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdf;
     if (g_mutable) { mdf = (VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT, v12.pNext, VK_TRUE }; v12.pNext = &mdf; }
+    // RADV exports a fragment shader's depth or stencil through an epilog whenever depth or stencil test enable is a
+    // dynamic state (ours are, Vulkan 1.3 core), but sets up its epilog cache only on a device with the extendedDynamicState
+    // feature (or EDS3 colour states, GPL, shader objects) enabled. Every such shader -- the OpenGL depth blit under
+    // glReadPixels (Chess), Metal's [[depth(any)]] -- dereferenced NULL in radv_shader_part_cache_get (2026-10-21), so the
+    // feature, core in 1.3, is enabled by name.
+    static VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds1;
+    eds1 = (VkPhysicalDeviceExtendedDynamicStateFeaturesEXT){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, v12.pNext, VK_TRUE };
+    v12.pNext = &eds1;
     static VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pef;
     if (g_pstat) { pef = (VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, v12.pNext, VK_TRUE }; v12.pNext = &pef; }
     VkPhysicalDeviceDepthClipEnableFeaturesEXT clipf = {
