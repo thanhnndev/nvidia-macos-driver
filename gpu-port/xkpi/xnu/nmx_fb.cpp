@@ -81,14 +81,27 @@ public:
          * framebuffer still shows the group in the registry, but WindowServer's pipe for it never activates: every
          * transaction came back kIOReturnNotReady ("Failed to submit transaction: IOPRESENTMENT_METHOD_FAILURE:
          * IOReturn 0x2d8") and the panel kept the boot console. Set the group before start. */
-        const bool foreign = fDisplay.internal && fInfo.width == 2880 && fInfo.height == 1800 &&
-            provider->getProperty("NMXNvidiaDisplayBridge") == kOSBooleanTrue;
+        /* Who serves this panel: the accelerator of the GPU that owns it. The hybrid bridge (NMXNvidiaDisplayBridge on
+         * the provider) hands it to the NVIDIA card as its foreign head 4; NMXOwnsDisplay keeps it on its own GPU as
+         * head 0, so the display pipe and the scan-out belong to the same accelerator. The bridge is the temporary
+         * hybrid: CoreDisplay refuses to present a GPU's panel through another GPU's pipe ("Fallback GPU Display Pipe
+         * transaction submission failed"), so the owned path is the one with a future. */
+        const bool internalPanel = fDisplay.internal && fInfo.width == 2880 && fInfo.height == 1800;
+        const bool foreign = internalPanel && provider->getProperty("NMXNvidiaDisplayBridge") == kOSBooleanTrue;
+        const bool owned = internalPanel && !foreign && provider->getProperty("NMXOwnsDisplay") == kOSBooleanTrue;
         fForeign = foreign;
         setProperty("IOFBDependentIndex", foreign ? 4ULL : 0ULL, 32);
         if (foreign) {
             // Same controller group as upstream NVRMFB/NMIntelFB, separate head4.
             setProperty("IOFBDependentID", 0x4E56524D00000001ULL, 64);
             setProperty("NMXNvidiaDisplayBridge", kOSBooleanTrue);
+        } else if (owned) {
+            // Own controller group: start() builds the framebuffer's controller from a dependent ID that already
+            // exists, and a lone framebuffer with no group leaves that controller NULL (power-change panic).
+            setProperty("IOFBDependentID", 0x4E4D584700000001ULL, 64);
+            setProperty("NMXOwnsDisplay", kOSBooleanTrue);
+        }
+        if (foreign || owned) {
             setProperty("built-in", kOSBooleanTrue);
             // Frozen AGDC K5 timing wire format, actual selected DRM timing (Hz/milli-Hz).
             // No synthetic timing or HDR capability. Consumers validate this tagged 13-word record.
