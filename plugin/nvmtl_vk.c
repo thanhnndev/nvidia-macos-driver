@@ -234,7 +234,7 @@ static int g_pstat;
 static PFN_vkGetPipelineExecutablePropertiesKHR p_pstat_props;
 static PFN_vkGetPipelineExecutableStatisticsKHR p_pstat_stats;
 static int g_mutable;
-static int g_mutable_layout;
+static int g_mutable_layout, g_mutable_stex;
 static PFN_vkCreateBufferView pvkCreateBufferView; static PFN_vkDestroyBufferView pvkDestroyBufferView;
 static void *g_dummyTexAlias, *g_dummyTexView;
 static void nvmtl_spirv_texel_mask(const void *p, size_t n, uint64_t out[4]);
@@ -1308,7 +1308,7 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
         VkResult r2 = r1 == VK_SUCCESS ? pvkMapMemory(g_dev, bm, 0, VK_WHOLE_SIZE, 0, &bp) : r1;
         VkResult r3 = r2 == VK_SUCCESS ? pvkBindBufferMemory(g_dev, out->buf, bm, 0) : r2;
         if (r3 == VK_SUCCESS) {
-            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++;
+            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; out->htype = bt + 1; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++;
             { static int said; if (!said++) nvlog("vk: shared buffer of %zu bytes placed in VRAM through BAR1 (type %d)", size, bt); }
             return 0; }
         if (bp) pvkUnmapMemory(g_dev, bm);
@@ -1338,7 +1338,7 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
             return -1;
         }
     } else VKCK(nvmtl_opaque_AllocateMemory(g_dev, &mai, NULL, &out->mem), "vkAllocateMemory(buffer)");
-    out->alloc = mr.size;
+    out->alloc = mr.size; out->htype = (int)mai.memoryTypeIndex + 1;
     if (!host_visible) nvmtl_vk_budget_charge(mr.size);
     VKCK(pvkBindBufferMemory(g_dev, out->buf, out->mem, 0), "vkBindBufferMemory");
     if (host_visible) { VkResult mr_ = pvkMapMemory(g_dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->map); if (mr_ != VK_SUCCESS) {
@@ -2220,7 +2220,8 @@ static int nvmtl_desc_pool_open(void)
                                               VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER };
     VkMutableDescriptorTypeListEXT plists[5] = { { 0, NULL }, { 0, NULL }, { 4, mut4 }, { 0, NULL }, { 4, mut4 } };
     VkMutableDescriptorTypeCreateInfoEXT pmi = { VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT, NULL, 5, plists };
-    if (g_mutable_layout) { sizes[2].type = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; sizes[4].type = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; pci.pNext = &pmi; }
+    if (g_mutable_layout) { sizes[2].type = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; pci.pNext = &pmi; }
+    if (g_mutable_stex) sizes[4].type = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; else plists[4] = (VkMutableDescriptorTypeListEXT){ 0, NULL };
     VKCK(pvkCreateDescriptorPool(g_dev, &pci, NULL, &g_descPools[g_ndescPools]), "vkCreateDescriptorPool");
     g_ndescPools++;
     if (g_ndescPools > 1)
@@ -2235,22 +2236,31 @@ static int ensure_descriptors_locked(void)
 {
     if (g_descriptor_state) return g_descriptor_state == 1 ? 0 : -1;
     g_descriptor_state = -1;
+    // In ascending binding numbers: the address table (internal slot 192, binding 640) goes after the storage textures
+    // (480-607). RADV sorts the bindings and then reads pMutableDescriptorTypeLists by the SORTED index, while the lists
+    // follow pBindings: with the table in the middle every storage binding got its neighbour's list, binding 480 an
+    // empty one (size 0), and the storage textures 0 and 1 shared one descriptor - a kernel wrote the next kernel's
+    // output instead of its own, and CoreImage's blurs and 5x5/7x7 convolutions came out transparent (2026-10-21).
     VkDescriptorSetLayoutBinding b[NVMTL_NBIND];
-    for (uint32_t i = 0; i < NVMTL_NBIND; i++) {
-        b[i].binding = NVMTL_BINDING_NUMBER(i); b[i].descriptorType = binding_type(i); b[i].descriptorCount = 1;
-        b[i].stageFlags = VK_SHADER_STAGE_ALL; b[i].pImmutableSamplers = NULL;
+    for (uint32_t k = 0, i; k < NVMTL_NBIND; k++) {
+        i = k < NVMTL_ADDRESS_BINDING ? k : k + 1 < NVMTL_NBIND ? k + 1 : NVMTL_ADDRESS_BINDING;
+        b[k].binding = NVMTL_BINDING_NUMBER(i); b[k].descriptorType = binding_type(i); b[k].descriptorCount = 1;
+        b[k].stageFlags = VK_SHADER_STAGE_ALL; b[k].pImmutableSamplers = NULL;
     }
+    for (uint32_t k = 1; k < NVMTL_NBIND; k++)
+        if (b[k].binding <= b[k - 1].binding) { nvlog("vk: set layout bindings out of order at %u (%u after %u)", k, b[k].binding, b[k - 1].binding); break; }
     VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, NVMTL_NBIND, b };
     static const VkDescriptorType texTypes[2] = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER };
     static const VkDescriptorType stexTypes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER };
     static VkMutableDescriptorTypeListEXT mlists[NVMTL_NBIND];
     VkMutableDescriptorTypeCreateInfoEXT mci = { VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT, NULL, NVMTL_NBIND, mlists };
     g_mutable_layout = g_mutable;
+    g_mutable_stex = g_mutable_layout && !getenv("NVMTL_MUT_NOSTEX");
     if (g_mutable_layout) {
         for (uint32_t i = 0; i < NVMTL_NBIND; i++) {
             mlists[i] = (VkMutableDescriptorTypeListEXT){ 0, NULL };
             if (b[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) { b[i].descriptorType = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; mlists[i] = (VkMutableDescriptorTypeListEXT){ 2, texTypes }; }
-            else if (b[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) { b[i].descriptorType = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; mlists[i] = (VkMutableDescriptorTypeListEXT){ 2, stexTypes }; }
+            else if (g_mutable_stex && b[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) { b[i].descriptorType = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; mlists[i] = (VkMutableDescriptorTypeListEXT){ 2, stexTypes }; }
         }
         lci.pNext = &mci;
     }
@@ -2791,7 +2801,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     for (uint32_t j = 0; j < stex_hi; j++) {
         uint32_t i = NVMTL_STEX_BASE + j;
         const nvmtl_slot *sl = t ? &t->s[which][i] : NULL;
-        if (tb && ((tb[2 + (j >> 6)] >> (j & 63)) & 1)) {
+        if (tb && g_mutable_stex && ((tb[2 + (j >> 6)] >> (j & 63)) & 1)) {
             tv[i] = (VkBufferView)(sl && sl->kind == NVMTL_SLOT_TEXBUF && sl->h ? sl->h : g_dummyTexView);
             w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, NVMTL_BINDING_NUMBER(i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, NULL, NULL, &tv[i] };
             continue;
@@ -6824,7 +6834,7 @@ int nvmtl_vk_buffer_create_placed(size_t size, nvk_heap *heap, size_t offset, nv
     if (pvkBindBufferMemory(g_dev, out->buf, (VkDeviceMemory)heap->mem, offset) != VK_SUCCESS) {
         pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL); memset(out, 0, sizeof *out); return -1;
     }
-    out->mem = heap->mem; out->placed = 1; out->alloc = 0;
+    out->mem = heap->mem; out->placed = 1; out->alloc = 0; out->htype = (int)heap->memtype + 1;
     out->moff = offset;
     out->map = heap->map ? (char *)heap->map + offset : NULL;
     g_buf_made++;
@@ -6909,7 +6919,9 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
     uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
     size_t at = b->moff + offset;
-    // a buffer of unknown memory type must suit every type the image takes; a host import is of one known type
+    // a buffer of unknown memory type must suit every type the image takes; pooled, placed and dedicated buffers and host
+    // imports record theirs (htype). Without it RADV's image types (not its 32-bit ones) refused every pooled buffer, and
+    // every buffer texture of RenderBox (Tahoe's layered icons drew as yellow squares) and CoreImage came back nil.
     const uint32_t need = b->htype ? (1u << (b->htype - 1)) : all;
     const char *why = (mr.memoryTypeBits & need) != need ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
     if (why) {

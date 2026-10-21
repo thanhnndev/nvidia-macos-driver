@@ -803,7 +803,21 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
 }
 
-static char nvmtl_surface_cache_key;
+static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
+// A private image stands for its surface for as long as the application keeps the surface, not just as long as one of
+// its wrappers lives: CoreImage makes a new MTLTexture for every pass over a pooled IOSurface and lets the previous one go
+// first, and with only the weak cache entry the next pass would get a fresh image uploaded from the surface's memory
+// rather than the image the previous pass wrote. Entries whose surface only the backing still holds are dropped at the
+// next insert. Called under @synchronized(device).
+static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
+    NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
+    if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    for (NSArray *k in keep.allKeys) {
+        NVMTLTexture *b = keep[k];
+        if (!b->_surf || CFGetRetainCount(b->_surf) <= 1) [keep removeObjectForKey:k];
+    }
+    keep[key] = t;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
         NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
@@ -848,6 +862,7 @@ static char nvmtl_surface_cache_key;
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
+    if (key && !t->_vramOn && !t->_hostOn) nvmtl_surface_keep(self, key, t);
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
