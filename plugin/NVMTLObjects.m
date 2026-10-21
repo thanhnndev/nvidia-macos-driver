@@ -770,8 +770,17 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     MTLTextureDescriptor *cd = [d copy]; cd.storageMode = MTLStorageModeShared;
     id<MTLTexture> c = [[self device] newTextureWithDescriptor:cd];
     if (c) [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
-    { static int said; if (!said++) nvlog("newTiledTextureWithDescriptor: linear view refused -> copied texture (%lux%lu bpr %lu; said once)",
-                                          (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr); }
+    // CoreAnimation asks for mipmapped images this way (54x54 with 6 levels, 256x256 with 9, for layers drawn smaller than
+    // their contents) and lays the smaller levels out for the GPU it knows; only level 0 is linear, so the rest are made
+    // from it here rather than left unwritten (2026-10-21)
+    if (c && d.mipmapLevelCount > 1) {
+        static id<MTLCommandQueue> q; static dispatch_once_t once;
+        dispatch_once(&once, ^{ q = [[self device] newCommandQueue]; });
+        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        [bl generateMipmapsForTexture:c]; [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    }
+    { static int said; if (!said++) nvlog("newTiledTextureWithDescriptor: linear view refused -> copied texture (%lux%lu bpr %lu mips %lu; said once)",
+                                          (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)d.mipmapLevelCount); }
     return c;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr {
