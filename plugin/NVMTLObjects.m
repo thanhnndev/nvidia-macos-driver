@@ -763,7 +763,12 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     id<MTLTexture> t = [self newTextureWithDescriptor:d offset:offset bytesPerRow:bpr];
     if (t || !d) return t;
     void *base = [self contents];
-    if (!base || d.textureType != MTLTextureType2D || offset + bpr * d.height > _b.size) {
+    // the last row ends after its own pixels, not a whole bytesPerRow on: CoreAnimation hands over 16x16 images at the
+    // end of 8 KB buffers whose padded last row would run 16 bytes past it (offset 2576, bytesPerRow 352, 2026-10-21)
+    extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
+    uint32_t vkf = 0, bpp = 0; int a8 = 0;
+    const size_t lastRow = (!nvmtl_pixfmt_public(d.pixelFormat, &vkf, &bpp, &a8) && bpp && !a8) ? (size_t)d.width * bpp : bpr;
+    if (!base || d.textureType != MTLTextureType2D || !d.height || offset + bpr * (d.height - 1) + lastRow > _b.size) {
         nvlog("newTiledTextureWithDescriptor: %lux%lu bpr %lu off %lu: no linear view and no CPU copy (buffer %lu B) -> nil",
               (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)offset, (unsigned long)_b.size);
         return nil; }
