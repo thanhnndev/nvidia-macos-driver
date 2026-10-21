@@ -804,11 +804,14 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
 }
 
 static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
-// A private image stands for its surface for as long as the application keeps the surface, not just as long as one of
-// its wrappers lives: CoreImage makes a new MTLTexture for every pass over a pooled IOSurface and lets the previous one go
-// first, and with only the weak cache entry the next pass would get a fresh image uploaded from the surface's memory
-// rather than the image the previous pass wrote. Entries whose surface only the backing still holds are dropped at the
-// next insert. Called under @synchronized(device).
+// A surface's backing (a private image, or the surface's own pages imported for the GPU) lives as long as the application
+// keeps the surface, not just as long as one of its wrappers: CoreImage makes a new MTLTexture for every pass over a
+// pooled IOSurface and lets the previous one go first, and with only the weak cache entry the next pass would get a fresh
+// image uploaded from the surface's memory rather than the image the previous pass wrote. CoreAnimation's flatten cache
+// does the same every frame, and each new wrapper imported 0.5-4 MB again (wired, GPU-mapped, unmapped, freed: ~2.5 per
+// frame, a sixth of WindowServer's frame time, 2026-10-21). The backing holds the surface, so its ID cannot be reused
+// while the entry stands; entries whose surface only the backing still holds are dropped at the next insert.
+// Called under @synchronized(device).
 static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
@@ -862,7 +865,7 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
-    if (key && !t->_vramOn && !t->_hostOn) nvmtl_surface_keep(self, key, t);
+    if (key && !t->_vramOn) nvmtl_surface_keep(self, key, t);
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
