@@ -1,0 +1,56 @@
+name: build-nmxaccel
+
+# Builds NMXAccel.kext (the AMD/Intel Metal accelerator, -DNMX_ACCEL) on a macOS runner.
+# The source build needs the NVIDIA open kernel module headers only; they are public, so CI can fetch them.
+on:
+  push:
+    branches: [ci/nmxaccel]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: NVIDIA open kernel modules 610.57.04 (headers the accelerator includes)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/ogkm.tar.gz \
+            https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/610.57.04.tar.gz
+          tar -xzf /tmp/ogkm.tar.gz -C "$HOME"
+          mv "$HOME/open-gpu-kernel-modules-610.57.04" "$HOME/ogkm610"
+          test -d "$HOME/ogkm610/src/nvidia/generated"
+          ls "$HOME/ogkm610/src/nvidia/generated" | wc -l
+
+      - name: build NMXAccel
+        env:
+          NM_TAHOE: "1"
+        run: |
+          set -euo pipefail
+          bash build/nmxaccel_build.sh kexts/NVRM out/nmxaccel
+          /usr/libexec/PlistBuddy -c 'Add :IOKitPersonalities:NVAccel:NMXDisplayPipeEnabled bool true' \
+            out/nmxaccel/NMXAccel.kext/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :IOKitPersonalities:NVAccel:NMXDisplayPipeEnabled' \
+            out/nmxaccel/NMXAccel.kext/Contents/Info.plist
+          shasum -a 256 out/nmxaccel/NMXAccel.kext/Contents/MacOS/NMXAccel
+          otool -l out/nmxaccel/NMXAccel.kext/Contents/MacOS/NMXAccel | grep -A1 LC_UUID
+
+      - name: compiler errors
+        if: failure()
+        run: |
+          for f in out/nmxaccel/nmxaccel.err out/nmxaccel/nmxaccelld.err; do
+            [ -f "$f" ] && { echo "== $f"; tail -60 "$f"; }
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: NMXAccel.kext
+          path: out/nmxaccel/NMXAccel.kext
+          if-no-files-found: error

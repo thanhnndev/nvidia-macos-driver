@@ -28,6 +28,9 @@ class NVMemoryMap;
 static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
                                            unsigned long long len, unsigned long long align);
 static void               nvAccelGpuVaFree(IOAccelMemoryMap *map);
+static void               nvAccelPrivateVaSet(IOAccelMemoryMap *map, unsigned long long addr, unsigned long long len);
+static bool               nvAccelPrivateVaTake(IOAccelMemoryMap *map, unsigned long long *len);
+static int                gNvPrivateVa = -1;   // -1 = read the boot argument on first use
 static bool               nvAccelFlipTo(IOAccelResource2 *res);
 static bool               nvAccelCopyToScanout(IOAccelResource2 *res);
 void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2);
@@ -127,16 +130,36 @@ class NVTask : public IOAccelTask {
 public:
     IORangeAllocator *fVa = nullptr;
     unsigned fAllocLogged = 0, fPrivate = 0;
+    unsigned fVarLogged = 0;
     unsigned long long allocate(const IOAccelMemoryMap *map) APPLE_KEXT_OVERRIDE {
         const unsigned long long len = map ? ((IOAccelMemoryMap *)map)->getLength() : 0;
         const unsigned long long align = map ? *(const volatile unsigned long long *)((const unsigned char *)map + 0x80) : 0;
         unsigned long long got = nvAccelGpuVaAlloc((IOAccelMemoryMap *)map, len, align);
-        if (!got && fAllocLogged < 12)
-            ALOG("NVTask::allocate: RM refused %llu bytes (align %llu) -- no GPU address", len, align);
+        if (!got && len) {
+            if (gNvPrivateVa < 0) { int v = 1;
+                PE_parse_boot_argn("nvaccelprivateva", &v, sizeof v);
+                gNvPrivateVa = v ? 1 : 0; }
+            if (gNvPrivateVa && fVa) {
+                IOByteCount addr = 0;
+                if (fVa->allocate(len, &addr, align ? (IOByteCount)align : 4096)) {
+                    got = addr;
+                    nvAccelPrivateVaSet((IOAccelMemoryMap *)map, got, len);
+                    if (fVarLogged < 12) { fVarLogged++;
+                        ALOG("NVTask::allocate: %llu bytes (align %llu) -> private VA 0x%llx (bookkeeping only: "
+                             "no NVIDIA page table, frames are copied)", len, align, got); }
+                }
+            }
+        }
+        if (!got && fAllocLogged < 12) { fAllocLogged++;
+            ALOG("NVTask::allocate: RM refused %llu bytes (align %llu) -- no GPU address", len, align); }
         return got;
     }
     void deallocate(const IOAccelMemoryMap *map, unsigned long long addr) APPLE_KEXT_OVERRIDE {
-        (void)addr;
+        unsigned long long len = 0;
+        if (nvAccelPrivateVaTake((IOAccelMemoryMap *)map, &len)) {
+            if (fVa && len) fVa->deallocate(addr, len);
+            return;
+        }
         nvAccelGpuVaFree((IOAccelMemoryMap *)map);
     }
 };
@@ -151,6 +174,7 @@ public:
     unsigned long long fGpuVa     = 0;
     unsigned long long fVaLen     = 0;
     bool               fMapped    = false;
+    bool               fPrivate   = false;   // fGpuVa came from the task's own range: nothing to map
     unsigned int fCommits = 0;
     bool init(IOGraphicsAccelerator2 *a, IOAccelTask *t, IOAccelMemory *m,
               unsigned int o) APPLE_KEXT_OVERRIDE {
@@ -168,6 +192,22 @@ public:
     bool updateGPUPageTable() APPLE_KEXT_OVERRIDE { return fMapped; }
 };
 OSDefineMetaClassAndStructors(NVMemoryMap, IOAccelMemoryMap)
+
+static void nvAccelPrivateVaSet(IOAccelMemoryMap *map, unsigned long long addr, unsigned long long len)
+{
+    NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
+    if (!mm) return;
+    mm->fPrivate = true; mm->fGpuVa = addr; mm->fVaLen = len;
+}
+
+static bool nvAccelPrivateVaTake(IOAccelMemoryMap *map, unsigned long long *len)
+{
+    NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
+    if (!mm || !mm->fPrivate) return false;
+    if (len) *len = mm->fVaLen;
+    mm->fPrivate = false; mm->fGpuVa = 0; mm->fVaLen = 0; mm->fMapped = false;
+    return true;
+}
 
 #define NV_CARRIERS 32
 class IOAccelNVRMCarrier : public IOService {
@@ -190,10 +230,13 @@ public:
     OSObject *newEventMachine() APPLE_KEXT_OVERRIDE { NVEventMachine *m = OSTypeAlloc(NVEventMachine); ALOG("newEventMachine -> %p (family inits it)", m); return m; }
     OSObject *newGPUTask(const char *who) {
         for (unsigned i = 0; i < 32; i++) if (!fRanges[i]) {
-            fRanges[i] = IORangeAllocator::withRange(1ULL << 40, 4096);
+            // One device-wide bookkeeping range shared by every task, locked: a user task and the kernel task
+            // allocate from it concurrently, and a GPU VA space is per device, not per task.
+            fRanges[i] = IORangeAllocator::withRange(1ULL << 40, 4096, 0x400, IORangeAllocator::kLocking);
             if (fRanges[i]) fRanges[i]->allocateRange(0, 0x100000);
         }
         NVTask *t = OSTypeAlloc(NVTask); bool ok = t && t->init(this, 1, fRanges);
+        if (t && ok && fRanges[0]) t->fVa = fRanges[0];
         ALOG("%s -> %p init=%d", who, t, ok); if (t && !ok) { t->release(); t = nullptr; } return t; }
     OSObject *createUserGPUTask() APPLE_KEXT_OVERRIDE { return newGPUTask("createUserGPUTask"); }
     void populateAccelConfig(IOAccelConfig *c) APPLE_KEXT_OVERRIDE {
@@ -1942,6 +1985,15 @@ static void nvAccelGpuVaFree(IOAccelMemoryMap *map)
 bool NVMemoryMap::commitIntoGPUPageTable()
 {
     if (fMapped) return true;
+    if (fPrivate) {
+        // Nothing to write: the address was handed out by the task's own range. The panel's pipe copies the surface
+        // into the DCN raster on the CPU and RADV never reads this address, so a page-table entry would be a lie
+        // only NVIDIA hardware would ever read.
+        fMapped = true;
+        if (fCommits < 8) { fCommits++;
+            ALOG("MM commit: private VA 0x%llx len %llu -- nothing to map", fGpuVa, fVaLen); }
+        return true;
+    }
     NVVidMemory *vm = OSDynamicCast(NVVidMemory, fMem);
     void *kapiMem = vm ? vm->fRmHandle : nullptr;
     unsigned long long len = fVaLen ? fVaLen : getLength();
