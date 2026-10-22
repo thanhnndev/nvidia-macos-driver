@@ -14,7 +14,10 @@ MALLOC_DEFINE(M_SYSCTLOID, "sysctloid", "sysctl dynamic nodes");
 struct sysctl_oid_list sysctl__children;
 struct sysctl_oid_list sysctl__hw_children;
 struct sysctl_oid_list sysctl__kern_children;
-struct sysctl_oid_list sysctl__debug_children;
+/* No sysctl__debug_children here: the port never adds a node under debug (checked), and defining it would make every
+ * NMXGPU SYSCTL_* entry in the kext attach to this private list instead of the kernel's debug list, which is why
+ * debug.nmx_trace stayed invisible. Left undefined, the kext binds the kernel's exported list at load, the same way
+ * NMXAccel does. */
 struct sysctl_oid_list sysctl__sys_children;
 struct sysctl_oid_list sysctl__compat_children;
 struct sysctl_oid_list sysctl__dev_children;

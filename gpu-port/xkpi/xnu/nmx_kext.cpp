@@ -33,6 +33,111 @@
 IOService *nmx_fb_publish(IOService *gpu, void *dev);
 void nmx_fb_unpublish(IOService *fb, IOService *gpu, void *dev);
 
+/* ---- M2 job trace ------------------------------------------------------------------------------------------------
+ * No kernel message from any kext reaches the system log on this machine (log show returns nothing for NMXGPU,
+ * NVAccel or kernel[0]), so a printf trace was unreadable. The first version of this trace was also wrong in two ways:
+ * it recorded only the gfx ring (RADV can dispatch on comp_*, so the failing job never appeared) and it kept only the
+ * last submission (a probe's upload/blit overwrote the dispatch it was meant to explain). debug.nmx_trace now keeps
+ * the last 16 submissions of every ring type, with the raw job->vm_needs_flush kept apart from the flush emitted.
+ * A timed-out job is recorded as ring "TIME" so it is never confused with a submission.
+ */
+#include <sys/sysctl.h>
+
+struct nmx_tr_rec {
+    unsigned long long seq, pd;
+    unsigned type, vmid, pasid, needs_flush, flush, pasid_map, pipe_sync, gpu_reset, gds;
+    char ring[12];
+};
+static nmx_tr_rec gTr[16];
+static unsigned gTrN;
+static unsigned long long gTrSeq;
+static volatile SInt64 gNmxJobs, gNmxJobsFlushed, gNmxJobsNoFlush, gNmxTimeouts;
+
+static void nmx_tr_ring(nmx_tr_rec *r, const char *name)
+{
+    unsigned i = 0;
+    if (name) while (name[i] && i + 1 < sizeof r->ring) { r->ring[i] = name[i]; i++; }
+    r->ring[i] = 0;
+}
+
+extern "C" void nmx_vm_trace(const char *ring, unsigned type, unsigned vmid, unsigned pasid,
+                             unsigned long long pd, unsigned needs_flush, unsigned flags)
+{
+    nmx_tr_rec *r = &gTr[gTrN % 16];
+    r->seq = ++gTrSeq;
+    r->pd = pd;
+    r->type = type;
+    r->vmid = vmid;
+    r->pasid = pasid;
+    r->needs_flush = needs_flush ? 1u : 0u;
+    r->flush = (flags & 1) ? 1u : 0u;
+    r->pasid_map = (flags & 2) ? 1u : 0u;
+    r->pipe_sync = (flags & 4) ? 1u : 0u;
+    r->gpu_reset = (flags & 8) ? 1u : 0u;
+    r->gds = (flags & 16) ? 1u : 0u;
+    nmx_tr_ring(r, ring);
+    gTrN++;
+    gNmxJobs = gNmxJobs + 1;
+    if (flags & 1) gNmxJobsFlushed = gNmxJobsFlushed + 1;
+    else gNmxJobsNoFlush = gNmxJobsNoFlush + 1;
+}
+
+extern "C" void nmx_job_timeout(unsigned vmid)
+{
+    nmx_tr_rec *r = &gTr[gTrN % 16];
+    r->seq = ++gTrSeq;
+    r->pd = 0;
+    r->type = 0xff;
+    r->vmid = vmid;
+    r->pasid = 0;
+    r->needs_flush = r->flush = r->pasid_map = r->pipe_sync = r->gpu_reset = r->gds = 0;
+    nmx_tr_ring(r, "TIME");
+    gTrN++;
+    gNmxTimeouts = gNmxTimeouts + 1;
+}
+
+static int nmx_trace_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[2048];
+    int n = snprintf(buf, sizeof buf, "seq ring type vmid pasid pd needs_flush flush pasid_map pipe_sync gpu_reset gds\n");
+    unsigned count = gTrN < 16 ? gTrN : 16;
+    for (unsigned k = 0; k < count && n > 0 && (size_t)n < sizeof buf - 1; k++) {
+        const nmx_tr_rec *r = &gTr[(gTrN - count + k) % 16];
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu %s %u %u %u %llx %u %u %u %u %u %u\n",
+                      r->seq, r->ring, r->type, r->vmid, r->pasid, r->pd,
+                      r->needs_flush, r->flush, r->pasid_map, r->pipe_sync, r->gpu_reset, r->gds);
+        if ((size_t)n >= sizeof buf) { n = (int)sizeof buf - 1; break; }
+    }
+    if (n < 0) n = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, nmx_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_trace_sysctl, "A",
+            "last 16 AMD submissions: ring, VMID, page directory, job->vm_needs_flush and the flush actually emitted");
+
+#define NMX_CNT(nm, var, desc) \
+    SYSCTL_QUAD(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (SInt64 *)&var, desc)
+NMX_CNT(nmx_jobs, gNmxJobs, "AMD submissions whose VM/flush decision was recorded");
+NMX_CNT(nmx_jobs_flushed, gNmxJobsFlushed, "of those, submissions that emitted a VM flush");
+NMX_CNT(nmx_jobs_no_flush, gNmxJobsNoFlush, "of those, submissions with no VM flush");
+NMX_CNT(nmx_timeouts, gNmxTimeouts, "AMD submissions the scheduler reported as timed out");
+
+/* A kext's SYSCTL_* entries are not registered automatically: sys/sysctl.h says so plainly ("UNLESS they are defined in
+ * I/O-Kit. In this case, you have to call sysctl_register_oid() manually - just like in a KEXT"). NMXAccel did that and
+ * its debug.* entries work; NMXGPU did not, so every debug.nmx_* was an unknown oid even though the kext carried it. */
+static void nmx_sysctl_install(void)
+{
+    static bool installed = false;
+    if (installed) return;
+    sysctl_register_oid(&sysctl__debug_nmx_trace);
+    sysctl_register_oid(&sysctl__debug_nmx_jobs);
+    sysctl_register_oid(&sysctl__debug_nmx_jobs_flushed);
+    sysctl_register_oid(&sysctl__debug_nmx_jobs_no_flush);
+    sysctl_register_oid(&sysctl__debug_nmx_timeouts);
+    installed = true;
+}
+
 class NMXGPU : public IOService {
     OSDeclareDefaultStructors(NMXGPU)
     void *dev_;
@@ -87,6 +192,7 @@ bool NMXGPU::start(IOService *provider)
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (pci == nullptr || g_lock == nullptr || !IOService::start(provider))
         return false;
+    nmx_sysctl_install();
     IOLockLock(g_lock);
     if (!g_started) {
         int err = nmx_port_start();
