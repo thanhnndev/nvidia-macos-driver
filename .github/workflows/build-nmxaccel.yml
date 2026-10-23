@@ -55,6 +55,29 @@ jobs:
           path: out/nmxaccel/NMXAccel.kext
           if-no-files-found: error
 
+  # NMXAGDC: AppleGraphicsDeviceControl service for the 890M. Without it IOPresentment's map has no AMD pipe.
+  agdc:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: build NMXAGDC
+        run: |
+          set -euo pipefail
+          bash build/nmxagdc_build.sh kexts/NMXAGDC out/nmxagdc
+          shasum -a 256 out/nmxagdc/NMXAGDC.kext/Contents/MacOS/NMXAGDC
+      - name: compiler errors
+        if: failure()
+        run: |
+          for f in out/nmxagdc/nmxagdc.err out/nmxagdc/nmxagdcld.err; do [ -f "$f" ] && { echo "== $f"; tail -60 "$f"; }; done
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: NMXAGDC.kext
+          path: out/nmxagdc/NMXAGDC.kext
+          if-no-files-found: error
+
   # NVMTLDriver: the Metal-over-Vulkan plugin the accelerators point MetalPluginName at. One translation unit
   # (plugin/NVMTLDevice.m #includes plugin/nvmtl_vk.c), Vulkan headers only, no private SDK. Ad-hoc signed here so the
   # artifact can be dropped into /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS from another OS.
