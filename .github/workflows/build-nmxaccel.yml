@@ -79,7 +79,7 @@ jobs:
           xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 -Wno-protocol -Wno-incomplete-implementation \
             -I/tmp/vk/include -o out/plugin/NVMTLDriver plugin/NVMTLDevice.m \
             -framework Foundation -framework Metal -framework IOSurface 2>out/plugin/NVMTLDriver.err \
-            || { echo '== compiler errors'; grep -A3 ': error:' out/plugin/NVMTLDriver.err | head -40; exit 1; }
+            || { echo '== compiler errors'; grep -n 'error:' out/plugin/NVMTLDriver.err | head -20; echo '== tail'; tail -40 out/plugin/NVMTLDriver.err; exit 1; }
           codesign --force --sign - --timestamp=none out/plugin/NVMTLDriver
           codesign -dv out/plugin/NVMTLDriver 2>&1 | head -5
           shasum -a 256 out/plugin/NVMTLDriver
