@@ -57,6 +57,7 @@ void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64
 }
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
+static SInt64 gCntIopInitFramebuffer, gCntIopValidate, gCntIopComplete, gCntIopPerform;
 static void nvaccelInstallSysctl(void);
 static int gNvAccelArmed = 0;
 // 1 once the headless check restored the plugin name without arming (no NVIDIA display head). The Metal plugin reads it:
@@ -831,6 +832,9 @@ NVAccel *NVAccel::gAccel = nullptr;
 
 IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
 {
+    const SInt64 trace = OSAddAtomic64(1, &gCntIopInitFramebuffer);
+    if (trace <= 8) ALOG("iop: TRACE initFramebufferResource entry [%lld/8] pipe %p index %u res %p gate %d",
+                         (long long)trace, this, index, res, gNvScanout);
     if (!gNvScanout) {
         ALOG("NVDisplayPipe::initFramebufferResource(index %u): scanout gate CLOSED -- returning NULL, "
              "which is the family's own default (sysctl debug.nvaccelfb=3 opens it)", index);
@@ -1101,13 +1105,20 @@ const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, un
 
 IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 {
+    const SInt64 trace = OSAddAtomic64(1, &gCntIopValidate);
+    if (trace <= 8) ALOG("iop: TRACE validateTransaction entry [%lld/8] pipe %p gate %d",
+                         (long long)trace, this, gNvIop);
     return kIOReturnSuccess;
 }
 
 static bool nvAccelIopAsyncBusy(const void *pipe);
 bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
-    return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
+    const SInt64 trace = OSAddAtomic64(1, &gCntIopComplete);
+    const bool busy = gNvIop != 0 && nvAccelIopAsyncBusy(this);
+    if (trace <= 8) ALOG("iop: TRACE isTransactionComplete entry [%lld/8] pipe %p gate %d busy %d",
+                         (long long)trace, this, gNvIop, busy ? 1 : 0);
+    return gNvIop != 0 && !busy;
 }
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
@@ -1116,6 +1127,9 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
 static void nvAccelIopHome(IOService *fb, unsigned head);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
+    const SInt64 trace = OSAddAtomic64(1, &gCntIopPerform);
+    if (trace <= 8) ALOG("iop: TRACE performTransaction entry [%lld/8] pipe %p txn %p gate %d",
+                         (long long)trace, this, txn, gNvIop);
     if (!gNvIop) return (IOReturn)0xe00002c7;
     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
     NVAccel *a = NVAccel::gAccel;
@@ -1317,6 +1331,10 @@ NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped beca
 SYSCTL_INT(_debug, OID_AUTO, nmxaccel_armed, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvAccelArmed, 0, "native display pipe registered");
 NVACCEL_CNT(nmxaccel_iop_ok, gCntIopOk, "completed native display transactions");
 NVACCEL_CNT(nmxaccel_iop_fail, gCntIopFail, "failed native display transactions");
+NVACCEL_CNT(nmxaccel_pipe_initfb, gCntIopInitFramebuffer, "display-pipe initFramebufferResource entries");
+NVACCEL_CNT(nmxaccel_pipe_validate, gCntIopValidate, "display-pipe validateTransaction entries");
+NVACCEL_CNT(nmxaccel_pipe_complete, gCntIopComplete, "display-pipe isTransactionComplete entries");
+NVACCEL_CNT(nmxaccel_pipe_perform, gCntIopPerform, "display-pipe performTransaction entries");
 #endif
 static int gCrcHead = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
@@ -1333,6 +1351,10 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_armed);
     sysctl_register_oid(&sysctl__debug_nmxaccel_iop_ok);
     sysctl_register_oid(&sysctl__debug_nmxaccel_iop_fail);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_initfb);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_validate);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_complete);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_perform);
     gSysctlInstalled = true;
 #else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);

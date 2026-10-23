@@ -19,6 +19,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS;
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 #include "AppleGraphicsDeviceControl_re.h"
 #include "nvrm-agdc-k5.h"
+#include "nmx-agdc-client.h"
 #pragma pack(push, 1)
 struct NMXAGDCVendorInfo {
     uint32_t version;
@@ -46,6 +47,8 @@ static int    gAgdcK5Why = 0;
 static SInt64 gAgdcCmds = 0, gAgdcUnsupported = 0;
 static int    gAgdcLastRefused = 0;
 static int    gAgdcLogged = 0;
+static SInt64 gAgdcClientSet = 0;
+static int    gAgdcClientSetValue = 0;
 // Slot-table rescans done while answering 0x980 (see nmxAgdcRescanForReply).
 static SInt64 gAgdcRescans = 0;
 
@@ -142,6 +145,18 @@ IOReturn NMXDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
             c->maxFramebuffers = n; c->pciDevice = fPci;
         }
         gAgdcMaxFBOut = (int)c->maxFramebuffers;
+        return kIOReturnSuccess;
+    }
+    if (cmd == 0x2001) {
+        uint32_t value = 0;
+        if (!nmx_agdc_decode_client_set(in, inSize, outSize ? *outSize : 0, &value))
+            return kIOReturnBadArgument;
+        // IOPresentment declares its client before it starts using the display pipe.
+        // NMXAGDC has no client-specific hardware policy to apply; acknowledge the
+        // exact passive declaration and record it for post-boot verification.
+        gAgdcClientSetValue = (int)value;
+        const SInt64 n = OSAddAtomic64(1, &gAgdcClientSet);
+        if (n <= 8) FBLOG("AGDC: command 0x2001 value %#x accepted [%lld/8]", value, (long long)n);
         return kIOReturnSuccess;
     }
     if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {
@@ -264,6 +279,8 @@ SYSCTL_PROC(_debug, OID_AUTO, nmxagdc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED
 SYSCTL_QUAD(_debug, OID_AUTO, nmxagdc_cmds,    CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcCmds,        "AGDC vendor calls received");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxagdc_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcUnsupported, "AGDC vendor calls answered Unsupported");
 SYSCTL_INT (_debug, OID_AUTO, nmxagdc_last_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcLastRefused, 0, "last AGDC command refused");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxagdc_client_set, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcClientSet, "valid IOPresentment 0x2001 client declarations acknowledged");
+SYSCTL_INT (_debug, OID_AUTO, nmxagdc_client_set_value, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcClientSetValue, 0, "last passive 0x2001 client declaration value");
 SYSCTL_INT (_debug, OID_AUTO, nmxagdc_k5,      CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gAgdcK5,     0, "K5: 1 = answer kAGDCLinkConfig + plane-scaler capabilities (default 1: the panel needs it)");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxagdc_k5_link, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Link,    "K5: kAGDCLinkConfig queries answered");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxagdc_k5_caps, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Caps,    "K5: plane-scaler capability queries answered");
@@ -279,6 +296,7 @@ static void nmxAgdcRemoveSysctl(void)
 {
     sysctl_unregister_oid(&sysctl__debug_nmxagdc); sysctl_unregister_oid(&sysctl__debug_nmxagdc_cmds);
     sysctl_unregister_oid(&sysctl__debug_nmxagdc_refused); sysctl_unregister_oid(&sysctl__debug_nmxagdc_last_refused);
+    sysctl_unregister_oid(&sysctl__debug_nmxagdc_client_set); sysctl_unregister_oid(&sysctl__debug_nmxagdc_client_set_value);
     sysctl_unregister_oid(&sysctl__debug_nmxagdc_k5); sysctl_unregister_oid(&sysctl__debug_nmxagdc_k5_link);
     sysctl_unregister_oid(&sysctl__debug_nmxagdc_k5_caps); sysctl_unregister_oid(&sysctl__debug_nmxagdc_k5_why);
     sysctl_unregister_oid(&sysctl__debug_nmxagdc_fbmap); sysctl_unregister_oid(&sysctl__debug_nmxagdc_maxfb);
@@ -290,6 +308,7 @@ static void nmxAgdcInstallSysctl(void)
 {
     sysctl_register_oid(&sysctl__debug_nmxagdc); sysctl_register_oid(&sysctl__debug_nmxagdc_cmds);
     sysctl_register_oid(&sysctl__debug_nmxagdc_refused); sysctl_register_oid(&sysctl__debug_nmxagdc_last_refused);
+    sysctl_register_oid(&sysctl__debug_nmxagdc_client_set); sysctl_register_oid(&sysctl__debug_nmxagdc_client_set_value);
     sysctl_register_oid(&sysctl__debug_nmxagdc_k5); sysctl_register_oid(&sysctl__debug_nmxagdc_k5_link);
     sysctl_register_oid(&sysctl__debug_nmxagdc_k5_caps); sysctl_register_oid(&sysctl__debug_nmxagdc_k5_why);
     sysctl_register_oid(&sysctl__debug_nmxagdc_fbmap); sysctl_register_oid(&sysctl__debug_nmxagdc_maxfb);
