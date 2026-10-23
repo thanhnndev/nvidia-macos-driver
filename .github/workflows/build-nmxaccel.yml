@@ -59,7 +59,9 @@ jobs:
   # (plugin/NVMTLDevice.m #includes plugin/nvmtl_vk.c), Vulkan headers only, no private SDK. Ad-hoc signed here so the
   # artifact can be dropped into /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS from another OS.
   plugin:
-    runs-on: macos-14
+    # The plugin calls Metal APIs that only exist in the macOS 26 SDK (MTLResidencySet, MTLShaderValidation); the
+    # macos-14 image ships Xcode 15.4 and its SDK stops at macOS 14.
+    runs-on: macos-26-intel
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
