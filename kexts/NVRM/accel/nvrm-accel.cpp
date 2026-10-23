@@ -304,11 +304,15 @@ public:
         if (me != gAccel || me->fNmxStopping || !me->fFB) return;
         NVRMVramRequest q = {}; q.version = NVRM_VRAM_ABI_VERSION;
         IOReturn query = me->askFramebufferForScanout(&q);
-        if (query == kIOReturnNotReady && ++me->fNmxArmAttempts < 150) {
-            // The IOFramebuffer controller is assigned by open(), not publish.
-            // Retry for at most 30 seconds without blocking driver matching.
+        // The IOFramebuffer controller is assigned by open(), and on this machine WindowServer is the one that opens
+        // the panel: it came up at 44-45 s while the old 150 x 200 ms (30 s) window closed at 41 s, so the pipe was
+        // never armed ("NMX display bind refused ... after 150 attempts"), CoreDisplay found no display pipe and
+        // WindowServer fell back to a CPU readback of every frame (unusable lag). Keep watching: every 200 ms for the
+        // first 30 s, then once a second for 15 more minutes. A poll that finds the framebuffer not open is one
+        // callPlatformFunction on a lock we hold; it costs nothing, and the retry never blocks driver matching.
+        if (query == kIOReturnNotReady && ++me->fNmxArmAttempts < 1050) {
             uint64_t deadline = 0;
-            clock_interval_to_deadline(200, 1000000, &deadline);
+            clock_interval_to_deadline(me->fNmxArmAttempts < 150 ? 200 : 1000, 1000000, &deadline);
             held.requeued = true;
             thread_call_enter_delayed(me->fNmxArmCall, deadline);
             return;
@@ -319,6 +323,7 @@ public:
             return;
         }
         // A scanout description is ready; registration validates exact pipe ownership.
+        ALOG("NMX display bind: scanout ready after %u attempt(s) (%ux%u pitch %u)", me->fNmxArmAttempts, q.width, q.height, q.pitch);
         gNvScanout = 1; gNvIop = 1;
         OSDictionary *caps = OSDictionary::withCapacity(2);
         if (!caps) return;
