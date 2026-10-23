@@ -54,3 +54,39 @@ jobs:
           name: NMXAccel.kext
           path: out/nmxaccel/NMXAccel.kext
           if-no-files-found: error
+
+  # NVMTLDriver: the Metal-over-Vulkan plugin the accelerators point MetalPluginName at. One translation unit
+  # (plugin/NVMTLDevice.m #includes plugin/nvmtl_vk.c), Vulkan headers only, no private SDK. Ad-hoc signed here so the
+  # artifact can be dropped into /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS from another OS.
+  plugin:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vulkan headers
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers /tmp/vk
+          test -f /tmp/vk/include/vulkan/vulkan.h
+
+      - name: build NVMTLDriver
+        run: |
+          set -euo pipefail
+          mkdir -p out/plugin
+          xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 -Wno-protocol -Wno-incomplete-implementation \
+            -I/tmp/vk/include -o out/plugin/NVMTLDriver plugin/NVMTLDevice.m \
+            -framework Foundation -framework Metal -framework IOSurface 2>out/plugin/NVMTLDriver.err \
+            || { echo '== compiler errors'; grep -A3 ': error:' out/plugin/NVMTLDriver.err | head -40; exit 1; }
+          codesign --force --sign - --timestamp=none out/plugin/NVMTLDriver
+          codesign -dv out/plugin/NVMTLDriver 2>&1 | head -5
+          shasum -a 256 out/plugin/NVMTLDriver
+          otool -l out/plugin/NVMTLDriver | grep -A1 LC_UUID
+          strings -a out/plugin/NVMTLDriver | grep -c 'does not claim this process'
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: NVMTLDriver
+          path: out/plugin/NVMTLDriver
+          if-no-files-found: error
