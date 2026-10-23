@@ -37,6 +37,7 @@ class NMXGPUFB : public IOFramebuffer {
     bool fForeign = false;      // head 4 of NVAccel's display machine (the NV controller group)
     bool fBeside = false;       // another framebuffer on this GPU's PCI device already drives the console
     unsigned fTraceN = 0;
+    unsigned fNotReadyN = 0;    // 'scanout NOT READY' repeats every poll: counted apart so it cannot eat the trace cap
 
     /* ga403wm b15: WindowServer only said "Failed to submit transaction: IOPRESENTMENT_METHOD_FAILURE:
      * IOReturn 0x2d8" (kIOReturnNotReady) for the OLED, which names neither the call nor the stage. Say which of
@@ -174,10 +175,11 @@ public:
         if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
             NVRMVramRequest *r = static_cast<NVRMVramRequest *>(p1);
             if (!r || r->version != NVRM_VRAM_ABI_VERSION) { trace("scanout bad ABI"); return kIOReturnBadArgument; }
-            if (fStopping || !fPowerRegistered || !fInfo.ok || !fInfo.kva || !fInfo.width || !fInfo.height ||
+            if (fStopping || !fInfo.ok || !fInfo.kva || !fInfo.width || !fInfo.height ||
                 (uint64_t)fInfo.pitch < 4ULL * fInfo.width ||
                 (uint64_t)fInfo.pitch * fInfo.height > fInfo.size) {
-                trace("scanout NOT READY", (unsigned long long)!fPowerRegistered, (unsigned long long)fInfo.ok);
+                if (fNotReadyN++ < 3 || (fNotReadyN % 100) == 0)
+                    FBLOG("pipe: scanout NOT READY #%u (power %d ok %d)", fNotReadyN, fPowerRegistered ? 1 : 0, fInfo.ok ? 1 : 0);
                 return kIOReturnNotReady;
             }
             r->kva = reinterpret_cast<void *>(fInfo.kva);
