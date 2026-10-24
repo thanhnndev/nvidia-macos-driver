@@ -319,10 +319,18 @@ static bool nvmtl_process_is_allowed(void)
     // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
     // WindowServer before its "!WindowServer" line is reached.
-    { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
+    // The exception is the AMD/Intel GPU that owns the display itself: once NMXAccel has armed its display pipe
+    // (debug.nmxaccel_armed 1, debug.nmxaccel_headless 0) CoreDisplay builds a Metal device for that pipe's accelerator and
+    // asserts "Failed to create MetalDevice (non-null)" when WindowServer has none, which kills WindowServer on every start
+    // (2026-10-24 boot: pipe armed at 12 s, WindowServer aborted at 46.04 s and was not respawned: no desktop).
+    { int hv = 0, armed = 0; size_t hn = sizeof hv, an = sizeof armed;
+      bool ownsDisplay = sysctlbyname("debug.nmxaccel_headless", &hv, &hn, NULL, 0) == 0 && hv == 0 &&
+                         sysctlbyname("debug.nmxaccel_armed", &armed, &an, NULL, 0) == 0 && armed;
+      hv = 0; hn = sizeof hv;
+      if (!strcmp(me, "WindowServer") && !ownsDisplay && (nvmtl_vk_vendor() != 0x10de ||
                                           (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
-          nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
+          nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; }
+      if (!strcmp(me, "WindowServer") && ownsDisplay) nvlog("  WindowServer: this GPU owns the display (NMX pipe armed) -- Metal device on it"); }
     if (getenv("NVMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
     FILE *f = fopen("/Library/GPUBundles/nvmtl-allow.txt", "r");
