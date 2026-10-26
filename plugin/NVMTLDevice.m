@@ -174,9 +174,14 @@ static nvk_queue *nvmtl_device_queue(void) {
 }
 static bool nvmtl_accel_armed(void)
 {
+    // NMXAccel (AMD/Intel) does not register debug.nvaccelfb: beside NVIDIA's NVAccel that name is the NVIDIA one, which
+    // reads 0 on a headless dGPU. Its own flag is debug.nmxaccel_armed (2026-10-25 boot: pipe armed at 10 s, "!WindowServer"
+    // refused on debug.nvaccelfb 0 and CoreDisplay aborted WindowServer on every start).
+    // Either armed pipe counts; the headless check above already keeps WindowServer off a GPU without a display.
     int v = 0; size_t n = sizeof v;
-    if (sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) != 0) return false;
-    return v != 0;
+    if (sysctlbyname("debug.nmxaccel_armed", &v, &n, NULL, 0) == 0 && v) return true;
+    v = 0; n = sizeof v;
+    return sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) == 0 && v != 0;
 }
 #include <dlfcn.h>
 #include <libgen.h>
@@ -346,7 +351,7 @@ static bool nvmtl_process_is_allowed(void)
         if (*p == '!') { armedOnly = true; p++; while (*p == ' ' || *p == '\t') p++; }
         if (strcmp(p, "*") && strcmp(p, me)) continue;
         if (armedOnly && !nvmtl_accel_armed()) {
-            nvlog("  '%s' is armed-only and debug.nvaccelfb reads 0 -- no device (arm it with sysctl -w debug.nvaccelfb=1)", me);
+            nvlog("  '%s' is armed-only and no display pipe is armed (debug.nmxaccel_armed / debug.nvaccelfb read 0) -- no device", me);
             break;
         }
         ok = true; break;
