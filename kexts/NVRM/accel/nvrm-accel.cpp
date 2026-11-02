@@ -317,7 +317,9 @@ public:
             thread_call_enter_delayed(me->fNmxArmCall, deadline);
             return;
         }
-        if (query != kIOReturnSuccess || !q.kva || q.phys) {
+        // The panel's framebuffer now reports its scanout's physical address too (initFramebufferResource needs it for
+        // the pipe to go active), so a non-zero phys is no longer a reason to refuse.
+        if (query != kIOReturnSuccess || !q.kva) {
             me->setProperty("NMXDisplayBindError", (unsigned long long)query, 32);
             ALOG("NMX display bind refused: query 0x%x after %u attempts", query, me->fNmxArmAttempts);
             return;
@@ -1146,7 +1148,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     OSObject  *ro = txn->getPlaneResource(0, 0);
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
 
-    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
+    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false, l10r = false;
     NVResource *res = OSDynamicCast(NVResource, ro);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     static SInt32 gIopK6Logs;
@@ -1183,7 +1185,10 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
 #endif
         const unsigned fmt = s->getPixelFormat();
-        if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
+        // WindowServer moves the display surface to 10-bit 'l10r' (ARGB2101010) once colour management is up; the panel
+        // is 8-bit XRGB, so those frames are narrowed while copied (the 780M's fix, nullarc 676445d)
+        l10r = fmt == 0x6C313072u;
+        if (fmt != 0x42475241u && !l10r) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA or l10r", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
         if (!W || !H || P < 4 || W > 16384 || H > 16384 || P > 16384ull * 8) NVIOP_FAIL(kIOReturnBadArgument, "surface geometry %llux%llu pitch %llu", W, H, P);
         if (P < 4 * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under 4*W or not word-aligned", W, H, P);
@@ -1213,6 +1218,13 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     for (unsigned y = 0; y < h; y++) {
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
+        if (l10r) {
+            for (unsigned x = 0; x < words; x++) {
+                const unsigned v = sp[x];
+                dp[x] = 0xff000000u | ((v >> 6) & 0xff0000u) | ((v >> 4) & 0xff00u) | ((v >> 2) & 0xffu);
+            }
+            continue;
+        }
 #ifdef NMX_ACCEL
         memcpy((void *)dp, (const void *)sp, (size_t)words * 4);
 #else

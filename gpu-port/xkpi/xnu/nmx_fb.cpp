@@ -171,7 +171,13 @@ public:
     }
 
     /* Display-pipe adapter only. CPU physical addresses are not NVIDIA
-     * VRAM handles or RADV GPU virtual addresses: never export them as such. */
+     * VRAM handles or RADV GPU virtual addresses: never export them as such.
+     * The scanout's physical address (in the 890M's BAR) is still reported: with
+     * phys 0 the accelerator made no framebuffer resource, IOAcceleratorFamily
+     * never marked the display pipe active, and every WindowServer transaction
+     * ended "Fallback GPU Display Pipe transaction submission failed" before
+     * performTransaction ran; the login window never reached the panel
+     * (2026-11-02, same fix as the 780M's PhxAMDFB). */
     IOReturn callPlatformFunction(const OSSymbol *fn, bool wait,
                                   void *p1, void *p2, void *p3, void *p4) override {
         if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
@@ -184,7 +190,7 @@ public:
                 return kIOReturnNotReady;
             }
             r->kva = reinterpret_cast<void *>(fInfo.kva);
-            r->phys = 0;
+            r->phys = fInfo.phys;
             r->handle = nullptr;
             r->actualSize = fInfo.size;
             r->width = fInfo.width; r->height = fInfo.height; r->pitch = fInfo.pitch;
