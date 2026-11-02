@@ -372,9 +372,9 @@ public:
         NVAccel *me = (NVAccel *)target;
         if (!me || !newService) return true;
 #ifdef NMX_ACCEL
-        // NMXGPUFB is a child of NMXGPU, itself on this exact PCI provider.
+        // NMXAMDFB is a child of NMXGPU, itself on this exact PCI provider.
         IOService *gpu = newService->getProvider();
-        if (!newService->metaCast("NMXGPUFB") || !gpu || gpu->getProvider() != me->fPCI ||
+        if (!newService->metaCast("NMXAMDFB") || !gpu || gpu->getProvider() != me->fPCI ||
             !newService->getProperty("NMXScanoutBridgeVersion")) return true;
 #endif
         unsigned idx = 0;
@@ -783,7 +783,7 @@ public:
             if (displayEnabled && fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && build &&
                 build->isEqualTo("Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64")) {
                 fNmxArmCall = thread_call_allocate(&NVAccel::nmxArm, this);
-                if (fNmxArmCall) fbm = serviceMatching("NMXGPUFB");
+                if (fNmxArmCall) fbm = serviceMatching("NMXAMDFB");
             }
             ALOG("AMD display adapter: native framebuffer watch %s", fbm ? "enabled" : "not on reviewed kernel profile");
 #else
