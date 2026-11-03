@@ -1062,6 +1062,7 @@ public:
     unsigned long long  getBytesPerRow() const;
     unsigned int        getPixelFormat() const;
     unsigned int        getSurfaceID() const;
+    OSObject           *copyValue(const char *key, unsigned int *err) const;   // IOSurfaceSetValue's store (kernel side)
 };
 class IOAccelDisplayPipeTransaction2 {
 public:
@@ -1187,6 +1188,55 @@ static bool nmxScanFind(IOPCIDevice *pci, unsigned h, NmxScan *sc)
 }
 static inline UInt32 nmxScanLine(const NmxScan &sc) { return nmxReg(kDcn35Seg2 + sc.otg * kOtgStride + kOtgStatusPosition) & 0x7fff; }
 #endif
+#ifdef NMX_ACCEL
+// Fence-ordered swap. WindowServer used to block in commitAndWaitUntilSubmitted until its composite had finished on the GPU
+// (~4.6 ms per frame on the 890M), because nothing here waited before copying the surface out. NVMTL (in WindowServer, when
+// debug.nmxaccel_fence_wait is 1) now marks every IOSurface a command buffer writes: IOSurfaceSetValue("NMXFencePending", n)
+// at commit, ("NMXFenceDone", n) once the work completed and its pixels are in the surface. The transaction waits here,
+// sleeping, until done >= pending; WindowServer returns as soon as its work is submitted. A surface with no
+// NMXFencePending (another client, an older plugin) is copied at once, as before. 0 = no wait (NVMTL then waits itself).
+static int gNmxFenceWait = 1;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_fence_wait, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFenceWait, 0,
+           "1 = the K6 copy waits for the surface's NMXFenceDone (NVMTL then returns from commitAndWaitUntilSubmitted early)");
+static SInt64 gCntFenceFrames, gCntFenceWaited, gCntFenceWaitUs, gCntFenceTimeouts;
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_frames, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceFrames, "frames whose surface carried an NVMTL fence");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_waited, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceWaited, "frames that had to wait for their GPU work");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceWaitUs, "microseconds spent waiting for GPU work");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceTimeouts, "waits given up after 100 ms (the frame is copied anyway)");
+static unsigned long long nmxSurfValue(IOSurface *s, const char *key)
+{
+    unsigned int err = 0;
+    OSObject *o = s->copyValue(key, &err);
+    OSNumber *n = OSDynamicCast(OSNumber, o);
+    const unsigned long long v = n ? n->unsigned64BitValue() : 0;
+    if (o) o->release();
+    return v;
+}
+static void nmxFenceWait(IOSurface *s)
+{
+    if (!gNmxFenceWait || !s) return;
+    const unsigned long long want = nmxSurfValue(s, "NMXFencePending");
+    if (!want) return;
+    OSAddAtomic64(1, &gCntFenceFrames);
+    if (nmxSurfValue(s, "NMXFenceDone") >= want) return;
+    const uint64_t t0 = mach_absolute_time();
+    uint64_t ns = 0;
+    bool done = false;
+    while (!done) {
+        IODelay(100);   // long enough that xnu blocks the thread instead of spinning
+        done = nmxSurfValue(s, "NMXFenceDone") >= want;
+        absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+        if (!done && ns > 100000000ull) break;
+    }
+    OSAddAtomic64(1, &gCntFenceWaited);
+    OSAddAtomic64((SInt64)(ns / 1000), &gCntFenceWaitUs);
+    if (!done) {
+        const SInt64 n = OSAddAtomic64(1, &gCntFenceTimeouts);
+        if (n < 8) ALOG("iop: fence: surface 0x%x pending %llu, done %llu after 100 ms - copied anyway", s->getSurfaceID(), want,
+                        nmxSurfValue(s, "NMXFenceDone"));
+    }
+}
+#endif
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const SInt64 trace = OSAddAtomic64(1, &gCntIopPerform);
@@ -1238,6 +1288,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // Such a frame now keeps the previous picture on the panel instead.
 #ifndef NMX_ACCEL
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+#else
+        nmxFenceWait(s);
 #endif
         const unsigned fmt = s->getPixelFormat();
         // WindowServer moves the display surface to 10-bit 'l10r' (ARGB2101010) once colour management is up; the panel
@@ -1529,6 +1581,11 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_beam_off);
     sysctl_register_oid(&sysctl__debug_nmxaccel_beam_wait_us);
     sysctl_register_oid(&sysctl__debug_nmxaccel_beam_copy_us);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_wait);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_frames);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_waited);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_wait_us);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_timeouts);
     gSysctlInstalled = true;
 #else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);
