@@ -412,7 +412,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
     part->copyInputsPrepared = YES;
 }
 - (BOOL)nvmtlSubmitAhead {
-    if (_executionDone || _cbError || !_committed) return NO;
+    if (_executionDone || _cbError || !_committed || _syncHold) return NO;
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
     while (_nextSubmit < _parts.count) {
         if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
@@ -482,7 +482,22 @@ static void nvmtl_gsub_ahead_pass1(void) {
         }
     }
 }
+// The commit thread may now run the ahead pass while the worker is inside nvmtlAdvancePart. A part the worker submits
+// itself (not submitted ahead) is held: the ahead pass must neither submit it twice nor submit a later part before it.
 - (BOOL)nvmtlAdvancePart {
+    BOOL hold = NO;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        if (!_executionDone && !_cbError && _nextPart < _parts.count) {
+            NVMTLSubmissionPart *p = _parts[_nextPart];
+            if ([p isKindOfClass:[NVMTLSubmissionPart class]] && !p->inflight && !p->aheadFailed && !p->aheadEmpty && !p->waitFolded)
+                hold = _syncHold = YES;
+        }
+    }
+    const BOOL r = [self nvmtlAdvancePart0];
+    if (hold) @synchronized ([NVMTLCommandBuffer class]) { _syncHold = NO; }
+    return r;
+}
+- (BOOL)nvmtlAdvancePart0 {
     if (_executionDone) return NO;
     if (_cbError) { [self nvmtlFinishExecution:_cbError]; return YES; }
     if (_nextPart >= _parts.count) { [self nvmtlFinishExecution:nil]; return YES; }
@@ -594,6 +609,12 @@ static void nvmtl_pump_buffers_sync(void) {
 }
 
 static uint64_t nvmtl_pump_generation;
+static int nvmtl_commit_ahead_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_COMMIT_AHEAD"); on = !(e && e[0] == '0');
+        nvlog("commit: submit-ahead on the committing thread %s (NVMTL_COMMIT_AHEAD=%s)", on ? "ON" : "off", e ? e : "unset"); }
+    return on;
+}
 static void nvmtl_pump_buffers(void) {
     static dispatch_once_t once; static dispatch_queue_t worker;
     const BOOL async = nvmtl_async_commit_on();
@@ -602,6 +623,10 @@ static void nvmtl_pump_buffers(void) {
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_pending_buffers.count) return;
         ++nvmtl_pump_generation;
+        // Submit (and mark scheduled) on the committing thread. WAS: only the worker ran the ahead pass, between its
+        // blocking fence waits, so a buffer committed while the worker waited for the previous one was scheduled only
+        // when that one completed: CoreDisplay's waitUntilScheduled was a wait for the previous composite (Step96 trace).
+        if (nvmtl_commit_ahead_on() && nvmtl_gsub_ahead_on()) nvmtl_gsub_ahead_pass();
         if (nvmtl_pumping) return;
         nvmtl_pumping = YES;
         dispatch_async(worker, ^{

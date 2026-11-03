@@ -128,6 +128,7 @@ extern id gNVMTLMainDevice;
   NSMutableArray *_parts, *_scheduledHandlers;
   NSUInteger _nextPart;
   NSUInteger _nextSubmit;
+  BOOL _syncHold; // the execution worker is submitting _parts[_nextPart] itself: the commit-thread ahead pass leaves this buffer alone
   id _reservation;
   NSCondition *_completionCondition;
   dispatch_group_t _callbackGroup, _scheduledGroup;
