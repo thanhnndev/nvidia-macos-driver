@@ -1306,35 +1306,49 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
             return base + (long)v - (long)sc.vbe;
         };
         bool lapped = false, gaveUp = false;
+        // Waits used to spin with pause, about 3.4 ms of CPU per frame (debug.nmxaccel_beam_wait_us / frames). Now the
+        // wait sleeps until ~kWakeEarlyNs before the scan should reach the line, then spins the rest. The line period
+        // comes from earlier copies (scan lines over wall time); until it is known, waits spin as before.
+        static uint64_t gBeamNsPerLine;   // 0 = not measured yet
+        enum : uint64_t { kWakeEarlyNs = 150000, kMinSleepNs = 300000 };
+        auto waitLine = [&](long target) -> long {
+            long L = line();
+            if (L >= target || gaveUp) return L;
+            const uint64_t w0 = mach_absolute_time();
+            if (gBeamNsPerLine) {
+                const uint64_t ns = (uint64_t)(target - L) * gBeamNsPerLine;
+                // line() only sees a wrap if it reads the counter once per refresh: never sleep across one
+                const uint64_t maxNs = (uint64_t)(sc.vtotal > 64 ? sc.vtotal - 64 : 0) * gBeamNsPerLine;
+                if (ns > kMinSleepNs && ns < maxNs) IODelay((unsigned)((ns - kWakeEarlyNs) / 1000));
+            }
+            while ((L = line()) < target) {
+                __builtin_ia32_pause();
+                absolutetime_to_nanoseconds(mach_absolute_time() - w0, &toNs);
+                if (toNs > 40000000ull) { gaveUp = true; break; }   // 40 ms: the counter is not moving
+            }
+            waitAbs += mach_absolute_time() - w0;
+            return L;
+        };
         // Too late in this refresh for the copy to finish ahead of the next one: trail the next refresh instead
         static unsigned gBeamCopyLines;   // the last copies' length in scan lines, waits excluded; 0 = not measured yet
         const long est = gBeamCopyLines ? (long)gBeamCopyLines + 32 : (long)h;
         long Ls = line();
         if (Ls + est > (long)sc.vtotal + (long)h - (long)kMargin) {
-            const uint64_t w0 = mach_absolute_time();
-            while (line() < (long)sc.vtotal) {
-                __builtin_ia32_pause();
-                absolutetime_to_nanoseconds(mach_absolute_time() - w0, &toNs);
-                if (toNs > 40000000ull) { gaveUp = true; break; }
-            }
-            waitAbs += mach_absolute_time() - w0;
+            waitLine((long)sc.vtotal);
             if (!gaveUp) base -= (long)sc.vtotal;
             Ls = line();
+        }
+        // The copy outruns the scan, so every band would wait a little. Start it late enough that the last band only
+        // has to wait for the scan to pass h + kMargin: one sleep instead of ~h/kBand short spins.
+        if (gBeamCopyLines && !gaveUp) {
+            const long start = (long)h + (long)kMargin + 16 - (long)gBeamCopyLines;
+            if (start > Ls) Ls = waitLine(start);
         }
         const uint64_t tS = mach_absolute_time();
         for (unsigned y0 = 0; y0 < h; y0 += kBand) {
             const unsigned y1 = (y0 + kBand < h) ? y0 + kBand : h;
             const long need = (y1 + kMargin >= h) ? (long)h : (long)(y1 + kMargin);
-            long L = line();
-            if (L < need && !gaveUp) {
-                const uint64_t w0 = mach_absolute_time();
-                while ((L = line()) < need) {
-                    __builtin_ia32_pause();
-                    absolutetime_to_nanoseconds(mach_absolute_time() - w0, &toNs);
-                    if (toNs > 40000000ull) { gaveUp = true; break; }   // 40 ms: the counter is not moving
-                }
-                waitAbs += mach_absolute_time() - w0;
-            }
+            const long L = waitLine(need);
             if (L > (long)sc.vtotal + (long)y0) lapped = true;   // the next refresh already scanned past this band
             copyRows(y0, y1);
         }
@@ -1349,6 +1363,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
             // the scan's lines per ns over this copy, times the time spent copying
             const unsigned cl = (unsigned)((unsigned long long)(Le - Ls) * (allNs - waitNs) / spanNs);
             gBeamCopyLines = (cl > gBeamCopyLines) ? cl : gBeamCopyLines - gBeamCopyLines / 8 + cl / 8;
+            // the scan is constant-rate, so the whole span (waits included) over the lines it covered is the period
+            if (Le - Ls >= 64) gBeamNsPerLine = spanNs / (uint64_t)(Le - Ls);
         }
         OSAddAtomic64(1, (lapped || gaveUp) ? &gCntBeamLapped : &gCntBeamOk);
         OSAddAtomic64((SInt64)(waitNs / 1000), &gCntBeamWaitUs);
@@ -1357,8 +1373,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         const SInt64 nb = gCntBeamOk + gCntBeamLapped;
         if ((nb <= 3 || nb == 600 || nb == 6000) && gBeamLogs < 8) {
             OSIncrementAtomic(&gBeamLogs);
-            ALOG("iop: beam: OTG%u vtotal %u active %u-%u: copy %llu us, waited %llu us, copy ~%u lines%s%s (ok %lld lapped %lld)",
-                 sc.otg, sc.vtotal, sc.vbe, sc.vbs, allNs / 1000, waitNs / 1000, gBeamCopyLines, lapped ? ", LAPPED" : "",
+            ALOG("iop: beam: OTG%u vtotal %u active %u-%u: copy %llu us, waited %llu us, copy ~%u lines, %llu ns/line%s%s (ok %lld lapped %lld)",
+                 sc.otg, sc.vtotal, sc.vbe, sc.vbs, allNs / 1000, waitNs / 1000, gBeamCopyLines, gBeamNsPerLine, lapped ? ", LAPPED" : "",
                  gaveUp ? ", scan counter stuck" : "", (long long)gCntBeamOk, (long long)gCntBeamLapped);
         }
     } else {
