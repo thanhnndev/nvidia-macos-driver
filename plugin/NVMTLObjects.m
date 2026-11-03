@@ -4850,11 +4850,13 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 // cannot order that swap after an NVK fence, so wait for the pixels to finish
 // before allowing the surface to become scanout. Other applications keep the
 // normal submission-only contract.
+// On the 890M NMXAccel orders the swap after the GPU work instead (NVMTLEventSync.m, NMXFencePending/Done): a command
+// buffer whose written surfaces all carry a fence only waits until it is submitted.
 - (BOOL)commitAndWaitUntilSubmitted {
     static int ws = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
     [self commit];
-    if (ws) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    if (ws && !_nmxFenced) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
 - (void)commit { [self nvmtlSubmitWithEvents]; }

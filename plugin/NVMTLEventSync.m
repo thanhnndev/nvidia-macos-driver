@@ -86,6 +86,61 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     }
 }
 
+
+// Fence-ordered swap (NMXAccel debug.nmxaccel_fence_wait). In WindowServer every IOSurface a command buffer writes gets
+// IOSurfaceSetValue("NMXFencePending", n) at commit and ("NMXFenceDone", n) once its work completed and its pixels are in
+// the surface. NMXAccel's display pipe waits for done >= pending before it copies the surface to the panel, so
+// commitAndWaitUntilSubmitted no longer has to wait for completion. NVMTL_NMX_FENCE=0 turns it off here.
+#include <sys/sysctl.h>
+static BOOL nvmtl_nmx_fence_on(void) {
+    static int ws = -1;
+    if (ws < 0) {
+        const char *e = getenv("NVMTL_NMX_FENCE");
+        ws = (getprogname() && !strcmp(getprogname(), "WindowServer") && !(e && e[0] == '0')) ? 1 : 0;
+        if (e && e[0] == '2') ws = 2;   // test: mark surfaces in any process, whatever the sysctl says
+    }
+    if (!ws) return NO;
+    if (ws == 2) return YES;
+    int v = 0; size_t n = sizeof v;
+    const BOOL on = sysctlbyname("debug.nmxaccel_fence_wait", &v, &n, NULL, 0) == 0 && v == 1;
+    static int said = -1;
+    if (said != on) { said = on;
+        nvlog("commit: fence-ordered swap %s (debug.nmxaccel_fence_wait %s, NVMTL_NMX_FENCE=%s)",
+              on ? "ON - WindowServer returns once submitted, NMXAccel waits for NMXFenceDone" : "off - WindowServer waits for completion",
+              on ? "1" : "not 1", getenv("NVMTL_NMX_FENCE") ?: "unset"); }
+    return on;
+}
+static _Atomic unsigned long long gNmxFenceSeq;
+static NSMapTable *nvmtl_nmx_fence_done;   // IOSurface (weak) -> NSNumber: the highest NMXFenceDone written
+static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
+    cb->_nmxFence = nil; cb->_nmxFenced = NO;
+    if (!nvmtl_nmx_fence_on()) return;
+    NSMutableSet *seen = [NSMutableSet new];
+    for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
+        if (!t->_surf || [seen containsObject:(__bridge id)t->_surf]) continue;
+        [seen addObject:(__bridge id)t->_surf];
+        const unsigned long long n = atomic_fetch_add(&gNmxFenceSeq, 1) + 1;
+        IOSurfaceSetValue(t->_surf, CFSTR("NMXFencePending"), (__bridge CFTypeRef)@(n));
+        if (!cb->_nmxFence) cb->_nmxFence = [NSMutableArray new];
+        [cb->_nmxFence addObject:@[(__bridge id)t->_surf, @(n)]];
+    }
+    cb->_nmxFenced = cb->_nmxFence.count != 0;
+}
+static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb) {
+    NSArray *marks = cb->_nmxFence; cb->_nmxFence = nil;
+    if (!marks.count) return;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        if (!nvmtl_nmx_fence_done) nvmtl_nmx_fence_done = [NSMapTable weakToStrongObjectsMapTable];
+        for (NSArray *m in marks) {
+            id surf = m[0]; NSNumber *n = m[1];
+            NSNumber *was = [nvmtl_nmx_fence_done objectForKey:surf];
+            if (was && was.unsignedLongLongValue >= n.unsignedLongLongValue) continue;
+            [nvmtl_nmx_fence_done setObject:n forKey:surf];
+            IOSurfaceSetValue((__bridge IOSurfaceRef)surf, CFSTR("NMXFenceDone"), (__bridge CFTypeRef)n);
+        }
+    }
+}
+
 @implementation NVMTLSubmissionPart
 - (void)dealloc {
     if (inflight) {
@@ -256,6 +311,7 @@ static int nvmtl_skip_empty_on(void) {
     if (!error && _gpuTimingSeen && !_gpuTimingInvalid)
         (void)nvmtl_vk_interval_seconds(&_gpuTiming, &deviceStart, &deviceEnd);
     nvmtl_surface_finish_writes(self);
+    nvmtl_nmx_fence_done_all(self);   // after the surfaces hold the pixels (host import, or nvmtlSurfaceOut above)
     [_completionCondition lock];
     _gpuStart = deviceStart; _gpuEnd = deviceEnd;
     _legacyKernelEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
@@ -505,6 +561,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         [_completionCondition lock]; _cbstatus = MTLCommandBufferStatusCommitted; [_completionCondition unlock];
         [self nvmtlSealPartWithSignal:nil value:0 restart:NO];
         nvmtl_surface_register_writes(self);
+        nvmtl_nmx_fence_mark(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
         nvmtl_pump_buffers();
