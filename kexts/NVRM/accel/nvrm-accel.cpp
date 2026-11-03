@@ -54,6 +54,7 @@ extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family head
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
 void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
+void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 }
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
@@ -1132,6 +1133,60 @@ static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static void nvAccelIopHome(IOService *fb, unsigned head);
+#ifdef NMX_ACCEL
+// The K6 copy writes the frame into the buffer the display is scanning out. Copied with no regard for the scan, the panel
+// shows the top of one frame over the bottom of the last: the tearing on the 890M. The copy now trails the scan: a band of
+// rows is written only after the scan has passed it in this refresh, and has to be written before the scan comes back to it
+// in the next one. Every refresh then shows one whole frame. The scan position is the DCN timing generator's vertical
+// counter (OTG_STATUS_POSITION) read over the register BAR; DCN 3.5 offsets (Strix 890M/880M), checked against the live
+// timing so anything else falls back to the unpaced copy.
+static int gNmxBeam = 1;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_beam, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBeam, 0, "1 = pace the K6 copy behind the display scan (no tearing)");
+static SInt64 gCntBeamOk, gCntBeamLapped, gCntBeamOff, gCntBeamWaitUs, gCntBeamCopyUs;
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_ok, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamOk, "K6 copies paced behind the scan");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_lapped, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamLapped, "paced copies the scan caught up with (that refresh tore)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_off, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamOff, "K6 copies not paced (no timing generator, or debug.nmxaccel_beam=0)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamWaitUs, "microseconds paced copies spent waiting for the scan");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamCopyUs, "microseconds paced copies took in all");
+
+static IOMemoryMap *gNmxMmioMap;
+static volatile UInt32 *gNmxMmio;
+static bool gNmxMmioTried;
+enum : UInt32 {
+    kDcn35Seg2      = 0x34C0,   // DCN 3.5 register base, segment 2 (IP discovery: 0x12 0xC0 0x34C0 0x9000)
+    kOtgStride      = 0x80,
+    kOtgVTotal      = 0x1b2f, kOtgVBlankStartEnd = 0x1b38, kOtgControl = 0x1b43, kOtgStatusPosition = 0x1b4a,
+};
+static inline UInt32 nmxReg(UInt32 dw) { return gNmxMmio[dw]; }
+
+struct NmxScan { UInt32 otg, vtotal, vbs, vbe; };
+// The timing generator that is scanning out h active rows, or false
+static bool nmxScanFind(IOPCIDevice *pci, unsigned h, NmxScan *sc)
+{
+    if (!gNmxMmioTried) {
+        gNmxMmioTried = true;
+        if (pci && pci->configRead16(0) == 0x1002) {
+            gNmxMmioMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5, kIOMapInhibitCache);
+            if (gNmxMmioMap && gNmxMmioMap->getLength() >= 0x80000) gNmxMmio = (volatile UInt32 *)gNmxMmioMap->getVirtualAddress();
+        }
+        ALOG("iop: beam: register BAR5 %s (%llu bytes)", gNmxMmio ? "mapped" : "NOT mapped",
+             gNmxMmioMap ? (unsigned long long)gNmxMmioMap->getLength() : 0ull);
+    }
+    if (!gNmxMmio) return false;
+    for (UInt32 i = 0; i < 4; i++) {
+        const UInt32 b = kDcn35Seg2 + i * kOtgStride;
+        const UInt32 ctl = nmxReg(b + kOtgControl);
+        if (ctl == 0xffffffffu || !(ctl & 1)) continue;
+        const UInt32 vt = (nmxReg(b + kOtgVTotal) & 0x7fff) + 1, se = nmxReg(b + kOtgVBlankStartEnd);
+        const UInt32 vbs = se & 0x7fff, vbe = (se >> 16) & 0x7fff;
+        if (vbs <= vbe || vbs - vbe != h || vbs > vt || vt > 2 * h + 64) continue;
+        sc->otg = i; sc->vtotal = vt; sc->vbs = vbs; sc->vbe = vbe;
+        return true;
+    }
+    return false;
+}
+static inline UInt32 nmxScanLine(const NmxScan &sc) { return nmxReg(kDcn35Seg2 + sc.otg * kOtgStride + kOtgStatusPosition) & 0x7fff; }
+#endif
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const SInt64 trace = OSAddAtomic64(1, &gCntIopPerform);
@@ -1215,24 +1270,104 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
-    for (unsigned y = 0; y < h; y++) {
-        const volatile unsigned int *sp = src + (unsigned long)y * spr;
-        volatile unsigned int *dp = d + (unsigned long)y * dpr;
-        if (l10r) {
-            for (unsigned x = 0; x < words; x++) {
-                const unsigned v = sp[x];
-                dp[x] = 0xff000000u | ((v >> 6) & 0xff0000u) | ((v >> 4) & 0xff00u) | ((v >> 2) & 0xffu);
+    auto copyRows = [&](unsigned y0, unsigned y1) {
+        for (unsigned y = y0; y < y1; y++) {
+            const volatile unsigned int *sp = src + (unsigned long)y * spr;
+            volatile unsigned int *dp = d + (unsigned long)y * dpr;
+            if (l10r) {
+                for (unsigned x = 0; x < words; x++) {
+                    const unsigned v = sp[x];
+                    dp[x] = 0xff000000u | ((v >> 6) & 0xff0000u) | ((v >> 4) & 0xff00u) | ((v >> 2) & 0xffu);
+                }
+                continue;
             }
-            continue;
-        }
 #ifdef NMX_ACCEL
-        memcpy((void *)dp, (const void *)sp, (size_t)words * 4);
+            memcpy((void *)dp, (const void *)sp, (size_t)words * 4);
 #else
-        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+            for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
 #endif
-    }
+        }
+    };
 #ifdef NMX_ACCEL
-    __asm__ __volatile__("sfence" ::: "memory");
+    NmxScan sc;
+    if (gNmxBeam && nmxScanFind(a->fPCI, h, &sc)) {
+        // Lines are counted from row 0 of the refresh being scanned now (pass 0); row r of the next refresh is line
+        // vtotal + r. A line in the top blank belongs to the next refresh. Band [y0, y1) is written once the scan is past
+        // y1 + M in pass 0, and must be done before the scan reaches y0 - M of pass 1.
+        enum : unsigned { kBand = 48, kMargin = 8 };
+        const uint64_t t0 = mach_absolute_time();
+        uint64_t waitAbs = 0, toNs = 0;
+        UInt32 prev = nmxScanLine(sc);
+        long base = (prev < sc.vbe) ? (long)sc.vtotal : 0;
+        auto line = [&]() -> long {
+            const UInt32 v = nmxScanLine(sc);
+            if (v < prev) base += sc.vtotal;
+            prev = v;
+            return base + (long)v - (long)sc.vbe;
+        };
+        bool lapped = false, gaveUp = false;
+        // Too late in this refresh for the copy to finish ahead of the next one: trail the next refresh instead
+        static unsigned gBeamCopyLines;   // the last copies' length in scan lines, waits excluded; 0 = not measured yet
+        const long est = gBeamCopyLines ? (long)gBeamCopyLines + 32 : (long)h;
+        long Ls = line();
+        if (Ls + est > (long)sc.vtotal + (long)h - (long)kMargin) {
+            const uint64_t w0 = mach_absolute_time();
+            while (line() < (long)sc.vtotal) {
+                __builtin_ia32_pause();
+                absolutetime_to_nanoseconds(mach_absolute_time() - w0, &toNs);
+                if (toNs > 40000000ull) { gaveUp = true; break; }
+            }
+            waitAbs += mach_absolute_time() - w0;
+            if (!gaveUp) base -= (long)sc.vtotal;
+            Ls = line();
+        }
+        const uint64_t tS = mach_absolute_time();
+        for (unsigned y0 = 0; y0 < h; y0 += kBand) {
+            const unsigned y1 = (y0 + kBand < h) ? y0 + kBand : h;
+            const long need = (y1 + kMargin >= h) ? (long)h : (long)(y1 + kMargin);
+            long L = line();
+            if (L < need && !gaveUp) {
+                const uint64_t w0 = mach_absolute_time();
+                while ((L = line()) < need) {
+                    __builtin_ia32_pause();
+                    absolutetime_to_nanoseconds(mach_absolute_time() - w0, &toNs);
+                    if (toNs > 40000000ull) { gaveUp = true; break; }   // 40 ms: the counter is not moving
+                }
+                waitAbs += mach_absolute_time() - w0;
+            }
+            if (L > (long)sc.vtotal + (long)y0) lapped = true;   // the next refresh already scanned past this band
+            copyRows(y0, y1);
+        }
+        __asm__ __volatile__("sfence" ::: "memory");
+        uint64_t allNs = 0, waitNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - t0, &allNs);
+        absolutetime_to_nanoseconds(waitAbs, &waitNs);
+        const long Le = line();
+        uint64_t spanNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - tS, &spanNs);
+        if (!gaveUp && allNs > waitNs && spanNs >= allNs - waitNs && Le > Ls) {
+            // the scan's lines per ns over this copy, times the time spent copying
+            const unsigned cl = (unsigned)((unsigned long long)(Le - Ls) * (allNs - waitNs) / spanNs);
+            gBeamCopyLines = (cl > gBeamCopyLines) ? cl : gBeamCopyLines - gBeamCopyLines / 8 + cl / 8;
+        }
+        OSAddAtomic64(1, (lapped || gaveUp) ? &gCntBeamLapped : &gCntBeamOk);
+        OSAddAtomic64((SInt64)(waitNs / 1000), &gCntBeamWaitUs);
+        OSAddAtomic64((SInt64)(allNs / 1000), &gCntBeamCopyUs);
+        static SInt32 gBeamLogs;
+        const SInt64 nb = gCntBeamOk + gCntBeamLapped;
+        if ((nb <= 3 || nb == 600 || nb == 6000) && gBeamLogs < 8) {
+            OSIncrementAtomic(&gBeamLogs);
+            ALOG("iop: beam: OTG%u vtotal %u active %u-%u: copy %llu us, waited %llu us, copy ~%u lines%s%s (ok %lld lapped %lld)",
+                 sc.otg, sc.vtotal, sc.vbe, sc.vbs, allNs / 1000, waitNs / 1000, gBeamCopyLines, lapped ? ", LAPPED" : "",
+                 gaveUp ? ", scan counter stuck" : "", (long long)gCntBeamOk, (long long)gCntBeamLapped);
+        }
+    } else {
+        OSAddAtomic64(1, &gCntBeamOff);
+        copyRows(0, h);
+        __asm__ __volatile__("sfence" ::: "memory");
+    }
+#else
+    copyRows(0, h);
 #endif
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
@@ -1372,6 +1507,12 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_validate);
     sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_complete);
     sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_perform);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_ok);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_lapped);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_off);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_wait_us);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_copy_us);
     gSysctlInstalled = true;
 #else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);
