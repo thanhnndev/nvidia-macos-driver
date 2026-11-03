@@ -1083,6 +1083,17 @@ void nvmtl_vk_pubcaps(uint32_t *color_samples, uint32_t *depth_samples, uint64_t
 
 static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
 {
+    // 890M (APU, GTT cached + snooped since NMXGPU Step88): host-visible memory prefers a CACHED type. RADV lists its
+    // write-combined GTT type first, and every CPU read of it (getBytes, readbacks) ran at uncached speed: 20 MB in
+    // 190 ms instead of 1.9 ms (docs/890M-TRACE.md Step91). NVMTL_HOST_WC=1 keeps the first match.
+    static int wc = -1;
+    if (wc < 0) { const char *e = getenv("NVMTL_HOST_WC"); wc = e && e[0] == '1'; }
+    if (!wc && (want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !(want & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        for (uint32_t i = 0; i < g_memp.memoryTypeCount; i++) {
+            const VkMemoryPropertyFlags f = g_memp.memoryTypes[i].propertyFlags;
+            if ((bits & (1u << i)) && (f & (want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+                && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return (int)i;
+        }
     if (want & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
         for (uint32_t i = 0; i < g_memp.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (g_memp.memoryTypes[i].propertyFlags & want) == want

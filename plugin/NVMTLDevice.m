@@ -812,14 +812,43 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // frame, a sixth of WindowServer's frame time, 2026-10-21). The backing holds the surface, so its ID cannot be reused
 // while the entry stands; entries whose surface only the backing still holds are dropped at the next insert.
 // Called under @synchronized(device).
+//
+// A host-imported backing (the surface's own pages, pinned and GPU-mapped by the kernel) is also kept for a while after
+// the application lets the surface go. Clients render into a pool of 2-3 IOSurfaces and WindowServer only holds the
+// one on screen, so dropping an entry as soon as its surface is unheld re-imported a 2880x1800 surface (5085 pages
+// pinned, then put) every frame: ~20% of WindowServer's main thread on the 890M (docs/890M-TRACE.md Step93). Unheld
+// host entries stay for NVMTL_KEEP_MS (default 3000) and at most NVMTL_KEEP_IDLE (default 48) of them; the backing
+// still holds the surface, so its memory and ID stay valid meanwhile.
+static char nvmtl_surface_used_key;
+static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull; }
+static void nvmtl_surface_touch(id dev, NSArray *key) {
+    NSMutableDictionary *used = objc_getAssociatedObject(dev, &nvmtl_surface_used_key);
+    if (!used) { used = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_used_key, used, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    used[key] = @(nvmtl_keep_now_ms());
+}
 static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
+    static long keepMs = -1, keepIdle = -1;
+    if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 3000;
+                      e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48; }
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    NSMutableDictionary *used = objc_getAssociatedObject(dev, &nvmtl_surface_used_key);
+    const uint64_t now = nvmtl_keep_now_ms();
+    NSMutableArray *idle = [NSMutableArray new];
     for (NSArray *k in keep.allKeys) {
         NVMTLTexture *b = keep[k];
-        if (!b->_surf || CFGetRetainCount(b->_surf) <= 1) [keep removeObjectForKey:k];
+        if (b->_surf && CFGetRetainCount(b->_surf) > 1) continue;
+        const uint64_t last = [used[k] unsignedLongLongValue];
+        if (b->_surf && b->_hostOn && now - last < (uint64_t)keepMs) { [idle addObject:k]; continue; }
+        [keep removeObjectForKey:k]; [used removeObjectForKey:k];
+    }
+    if ((long)idle.count > keepIdle) {
+        [idle sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+            return [used[a] unsignedLongLongValue] < [used[b] unsignedLongLongValue] ? NSOrderedAscending : NSOrderedDescending; }];
+        for (NSUInteger i = 0; i + keepIdle < idle.count; i++) { [keep removeObjectForKey:idle[i]]; [used removeObjectForKey:idle[i]]; }
     }
     keep[key] = t;
+    nvmtl_surface_touch(dev, key);
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
@@ -850,6 +879,9 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     if (backing && !backing->_vramOn) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
+            nvmtl_surface_touch(self, key);
+            { static unsigned long long hits; if (++hits <= 4 || hits % 20000 == 0) nvlog("surface keep: hit #%llu (surface %u, %s)", hits,
+                  (unsigned)IOSurfaceGetID(surf), backing->_hostOn ? "own pages" : "private image"); }
             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
             nvmtl_texture_desc_swizzle(alias, d);
             return alias;
