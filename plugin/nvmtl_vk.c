@@ -330,6 +330,7 @@ static int nvmtl_rebind_import(const void *inside, const char *symbol, void *rep
     return changed;
 }
 
+#include "nvmtl_drm_xnu.h"   /* needs nvmtl_rebind_import */
 INSTANCE_FNS(DECL) DEVICE_FNS(DECL)
 #undef DECL
 #define LOAD_I(f) do { p##f = (PFN_##f)pvkGetInstanceProcAddr(g_inst, #f); if (!p##f) { nvlog("vk: missing %s", #f); return -1; } } while (0);
@@ -721,6 +722,7 @@ static int nvmtl_vk_initialize(void)
             nvlog("vk: driver opened directly: %s (image %s)", NVMTL_ICD_LIB, nvmtl_image_ident((const void *)pvkGetInstanceProcAddr, vid, sizeof vid));
             { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_sysconf", (void *)nvmtl_sysconf);
               if (rb <= 0) nvlog("vk: memory-size fallback missing: _sysconf not rebound in %s (%d) -- sandboxed apps may have no device", NVMTL_ICD_LIB, rb); }
+            if (nvmtl_vk_vendor() == 0x1002 || nvmtl_vk_vendor() == 0x8086) nvmtl_drmx_install((const void *)pvkGetInstanceProcAddr);
             if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
               if (rb <= 0) nvlog("vk: owned handle fallback missing: _open not rebound in %s (%d)", NVMTL_ICD_LIB, rb); }
             pnvk_stage_import = (void (*)(const nvmtl_vram_rec *))dlsym(g_lib, "nvmtl_nvk_stage_import");
