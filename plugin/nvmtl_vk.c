@@ -129,7 +129,10 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
                 }
             }
         } else {
+            /* apps: NVMTL_GPU picks; without it the low-power GPU NMXGPU drives (the 890M) is the default, as on a
+               two-GPU Mac; the RTX is opt-in (NVMTL_GPU=nvidia) until per-app automatic choice exists */
             uint16_t want = nvmtl_gpu_choice();
+            if (!want) want = nvmtl_nmx_vendor();
             if (want && want != v) { nvlog("  NVMTL_GPU asks for %04x: the %04x accelerator does not claim this process", want, v); return v; }
         }
         g_vendor = v;
@@ -146,7 +149,8 @@ uint16_t nvmtl_vk_vendor(void)
     }
     { uint16_t want = nvmtl_gpu_choice();
       if (want == 0x10de) { g_vendor = want; return g_vendor; }
-      if (want) { uint16_t v = nvmtl_nmx_vendor(); if (v == want) { g_vendor = v; return g_vendor; } } }
+      uint16_t v = nvmtl_nmx_vendor();
+      if (v && (!want || v == want)) { g_vendor = v; return g_vendor; } }   /* default: the low-power NMX GPU */
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
     if (s) { IOObjectRelease(s); g_vendor = 0x10de; return g_vendor; }
     s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
