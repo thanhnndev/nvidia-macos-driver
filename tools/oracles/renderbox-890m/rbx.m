@@ -141,15 +141,21 @@ static int runFetch(NSString **why) {
     *why = [NSString stringWithFormat:@"%d/4096, px0 = %u,%u,%u,%u (want 20,50,100,128)", good, p[0], p[1], p[2], p[3]]; return good;
 }
 
-// a w x h buffer texture with row pitch `pitch`, read by a kernel and sampled by a draw
+// a w x h buffer texture with row pitch `pitch`, read back texel by texel by a kernel. RGBA16Float is the format
+// RenderBox makes its buffer textures in (render target + shader write, as it uses them).
+static float texel(int x, int y, int c) { return (float)((x * 7 + y * 13 + c * 3 + 1) & 255) / 255.0f; }
 static int runBT(MTLPixelFormat pf, int w, int h, int pitch, NSString **why) {
-    const int bpp = pf == MTLPixelFormatR8Unorm ? 1 : 4;
+    const BOOL half = pf == MTLPixelFormatRGBA16Float;
+    const int ch = pf == MTLPixelFormatR8Unorm ? 1 : 4, bpp = half ? 8 : ch;
     NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
     id<MTLBuffer> b = [dev newBufferWithLength:align + pitch * h options:MTLResourceStorageModeShared];
     uint8_t *m = (uint8_t *)b.contents + align;
-    for (int y = 0; y < h; y++) for (int x = 0; x < w * bpp; x++) m[y * pitch + x] = (uint8_t)(x * 7 + y * 13 + 1);
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) for (int c = 0; c < ch; c++) {
+        if (half) ((__fp16 *)(m + y * pitch))[x * 4 + c] = (__fp16)texel(x, y, c);
+        else m[y * pitch + x * ch + c] = (uint8_t)lroundf(texel(x, y, c) * 255); }
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
-    td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageShaderRead | (half ? MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite : 0);
     id<MTLTexture> t = [b newTextureWithDescriptor:td offset:align bytesPerRow:pitch];
     if (!t) { *why = @"newTextureWithDescriptor:offset:bytesPerRow: returned nil"; return -1; }
     NSError *e = nil;
@@ -163,10 +169,10 @@ static int runBT(MTLPixelFormat pf, int w, int h, int pitch, NSString **why) {
     const float *f = o.contents; int good = 0;
     for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
         BOOL ok = YES;
-        for (int c = 0; c < bpp; c++) ok &= near((int)lroundf(f[(y * w + x) * 4 + c] * 255), m[y * pitch + x * bpp + c]);
+        for (int c = 0; c < ch; c++) ok &= fabsf(f[(y * w + x) * 4 + c] - texel(x, y, c)) < 0.004f;
         good += ok;
     }
-    *why = [NSString stringWithFormat:@"%d/%d texels, (1,0).r = %.3f want %.3f", good, w * h, f[4], m[bpp] / 255.0]; return good == w * h ? 1 : 0;
+    *why = [NSString stringWithFormat:@"%d/%d texels, (1,0).r = %.3f want %.3f", good, w * h, f[4], texel(1, 0, 0)]; return good == w * h ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
@@ -191,6 +197,9 @@ int main(int argc, char **argv) {
         g = runBT(MTLPixelFormatRGBA8Unorm, 100, 8, 448, &why);  arm("3c buffer texture RGBA8 100x8 pitch 448", g == 1, why);
         g = runBT(MTLPixelFormatR8Unorm, 256, 1, 256, &why);     arm("3d buffer texture R8 256x1 pitch 256", g == 1, why);
         g = runBT(MTLPixelFormatR8Unorm, 40, 4, 64, &why);       arm("3e buffer texture R8 40x4 pitch 64", g == 1, why);
+        g = runBT(MTLPixelFormatRGBA16Float, 131, 131, 1280, &why); arm("3f buffer texture RGBA16F 131x131 pitch 1280", g == 1, why);
+        g = runBT(MTLPixelFormatRGBA16Float, 131, 131, 1048, &why); arm("3g buffer texture RGBA16F 131x131 pitch 1048", g == 1, why);
+        g = runBT(MTLPixelFormatRGBA16Float, 141, 141, 1136, &why); arm("3h buffer texture RGBA16F 141x141 pitch 1136", g == 1, why);
         printf("%s\n", fails ? "FAILED" : "PASS");
         return fails != 0;
     }
