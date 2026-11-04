@@ -41,14 +41,17 @@ static PFN_vkDestroyImageView  g_dc_real_dv;  static PFN_vkDestroyImage  g_dc_re
 static PFN_vkDestroySampler    g_dc_real_ds;  static PFN_vkDestroyBufferView g_dc_real_dbv;
 static PFN_vkDestroyBuffer     g_dc_real_db;  static PFN_vkFreeMemory    g_dc_real_fm;
 #define NVMTL_DC_BUMP(e) __atomic_add_fetch(&(e), 1, __ATOMIC_SEQ_CST)
+/* which destroy moved the image epoch (Step101b trace): image view, image, sampler, buffer view */
+static uint64_t g_dc_by_dv, g_dc_by_di, g_dc_by_ds, g_dc_by_dbv;
+#define NVMTL_DC_BY(c) __atomic_add_fetch(&(c), 1, __ATOMIC_RELAXED)
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_dv(VkDevice d, VkImageView v, const VkAllocationCallbacks *a)
-{ if (v) NVMTL_DC_BUMP(g_dc_epoch_img); g_dc_real_dv(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_dv); } g_dc_real_dv(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_di(VkDevice d, VkImage v, const VkAllocationCallbacks *a)
-{ if (v) NVMTL_DC_BUMP(g_dc_epoch_img); g_dc_real_di(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_di); } g_dc_real_di(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_ds(VkDevice d, VkSampler v, const VkAllocationCallbacks *a)
-{ if (v) NVMTL_DC_BUMP(g_dc_epoch_img); g_dc_real_ds(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_ds); } g_dc_real_ds(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_dbv(VkDevice d, VkBufferView v, const VkAllocationCallbacks *a)
-{ if (v) NVMTL_DC_BUMP(g_dc_epoch_img); g_dc_real_dbv(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_dbv); } g_dc_real_dbv(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_db(VkDevice d, VkBuffer v, const VkAllocationCallbacks *a)
 { if (v) NVMTL_DC_BUMP(g_dc_epoch_buf); g_dc_real_db(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_fm(VkDevice d, VkDeviceMemory v, const VkAllocationCallbacks *a)
@@ -66,11 +69,13 @@ void nvmtl_dc_hook_destroy(void)
 
 static void nvmtl_dc_stats(const char *why)
 {
-    nvlog("desc-cache %s: hit %llu miss %llu (stale %llu, page %llu, long %llu, full %llu) inserted %llu, epochs img %u buf %u",
+    nvlog("desc-cache %s: hit %llu miss %llu (stale %llu, page %llu, long %llu, full %llu) inserted %llu, epochs img %u buf %u"
+          " (img by view %llu image %llu sampler %llu bufview %llu)",
           why, (unsigned long long)g_dc_hit, (unsigned long long)g_dc_miss, (unsigned long long)g_dc_stale,
           (unsigned long long)g_dc_page, (unsigned long long)g_dc_long, (unsigned long long)g_dc_full,
           (unsigned long long)g_dc_ins, __atomic_load_n(&g_dc_epoch_img, __ATOMIC_RELAXED),
-          __atomic_load_n(&g_dc_epoch_buf, __ATOMIC_RELAXED));
+          __atomic_load_n(&g_dc_epoch_buf, __ATOMIC_RELAXED),
+          (unsigned long long)g_dc_by_dv, (unsigned long long)g_dc_by_di, (unsigned long long)g_dc_by_ds, (unsigned long long)g_dc_by_dbv);
 }
 static int nvmtl_dc_on(void)
 {

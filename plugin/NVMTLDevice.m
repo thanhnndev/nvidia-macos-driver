@@ -1,3 +1,4 @@
+#include <os/lock.h>
 /*
  * NullMoth NVIDIA driver for macOS
  * Copyright (c) 2026 NullMoth Systems.
@@ -1665,7 +1666,35 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
           s->_sb[0], s->_sb[1], s->_sb[2], s->_sb[3], s->_sb[4], s->_sb[5]);
     return s; }
 
+/* Sampler-state cache (Step101b). WindowServer asks for new sampler states every frame (equal descriptors); each was a
+   new VkSampler, and its destroy bumped the desc-cache image epoch (retiring every cached set holding an image) and
+   gave the sampler-variant fast path a new pointer to miss on. A sampler state is immutable: equal unlabelled
+   descriptors now get the same object. Held for the process lifetime, at most 1024. Off: NVMTL_NO_SAMPCACHE=1. */
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)sd {
+    static int off = -1; if (off < 0) off = getenv("NVMTL_NO_SAMPCACHE") != NULL;
+    if (off || !sd || sd.label.length) return [self nvmtlNewSamplerStateUncached:sd];
+    struct { uint32_t f[12]; float lo, hi, bias; } k;
+    memset(&k, 0, sizeof k);
+    k.f[0] = (uint32_t)sd.minFilter; k.f[1] = (uint32_t)sd.magFilter; k.f[2] = (uint32_t)sd.mipFilter; k.f[3] = (uint32_t)sd.maxAnisotropy;
+    k.f[4] = (uint32_t)sd.sAddressMode; k.f[5] = (uint32_t)sd.tAddressMode; k.f[6] = (uint32_t)sd.rAddressMode; k.f[7] = (uint32_t)sd.borderColor;
+    k.f[8] = (uint32_t)sd.reductionMode; k.f[9] = (uint32_t)sd.normalizedCoordinates | (uint32_t)sd.lodAverage << 1 | (uint32_t)sd.supportArgumentBuffers << 2;
+    k.f[10] = (uint32_t)sd.compareFunction; k.lo = sd.lodMinClamp; k.hi = sd.lodMaxClamp; k.bias = sd.lodBias;
+    NSData *kd = [NSData dataWithBytes:&k length:sizeof k];
+    static NSMutableDictionary *cache; static os_unfair_lock cl = OS_UNFAIR_LOCK_INIT; static _Atomic uint64_t hit, made;
+    os_unfair_lock_lock(&cl); id<MTLSamplerState> got = cache[kd]; os_unfair_lock_unlock(&cl);
+    if (got) { const uint64_t h = atomic_fetch_add(&hit, 1) + 1;
+        if (!(h & (h - 1))) nvlog("sampler cache: hit %llu, %llu made", (unsigned long long)h, (unsigned long long)atomic_load(&made));
+        return got; }
+    got = [self nvmtlNewSamplerStateUncached:sd];
+    if (!got) return nil;
+    os_unfair_lock_lock(&cl);
+    if (!cache) cache = [NSMutableDictionary new];
+    id<MTLSamplerState> raced = cache[kd];
+    if (raced) got = raced; else if (cache.count < 1024) { cache[kd] = got; atomic_fetch_add(&made, 1); }
+    os_unfair_lock_unlock(&cl);
+    return got;
+}
+- (id<MTLSamplerState>)nvmtlNewSamplerStateUncached:(MTLSamplerDescriptor *)sd {
     if (nvmtl_vk_init()) return nil;
     // WindowServer: every sampler filters linearly. Liquid Glass came out in 4-pixel blocks - its quarter-resolution
     // backdrop reached the panel through a nearest sampler in CoreAnimation's fixed_frag_lpf_cpf (the uber shader reads
@@ -1693,7 +1722,20 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
             @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
             @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN((NSUInteger)sd.borderColor,2u)],
             @"reduction":@"WeightedAverage",@"lod_bias":@0};
-        nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
+        /* Intern (Step101b): WindowServer makes new sampler states every frame; equal descriptors now share one
+           _pixelState object, so the sampler-variant fast path (keyed by these pointers) hits across frames. */
+        { struct { uint32_t f[8]; float lo, hi; } k = { { (uint32_t)sd.minFilter, (uint32_t)sd.magFilter, (uint32_t)sd.mipFilter,
+              (uint32_t)sd.sAddressMode, (uint32_t)sd.tAddressMode, (uint32_t)sd.rAddressMode, (uint32_t)sd.compareFunction,
+              (uint32_t)sd.maxAnisotropy | (uint32_t)sd.borderColor << 16 }, sd.lodMinClamp, sd.lodMaxClamp };
+          static NSMutableDictionary *intern; static os_unfair_lock il = OS_UNFAIR_LOCK_INIT;
+          NSData *kd = [NSData dataWithBytes:&k length:sizeof k]; NSDictionary *was = nil; BOOL fresh = NO;
+          os_unfair_lock_lock(&il);
+          if (!intern) intern = [NSMutableDictionary new];
+          was = intern[kd];
+          if (!was && intern.count < 4096) { intern[kd] = s->_pixelState; fresh = YES; }
+          os_unfair_lock_unlock(&il);
+          if (was) s->_pixelState = was;
+          else if (fresh) nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String); }
     }
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);
