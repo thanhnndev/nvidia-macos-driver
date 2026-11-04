@@ -39,7 +39,8 @@ static NSString *const kSrc = @
 "               uint2 g [[thread_position_in_grid]]) {\n"
 "  if (g.x < t.get_width() && g.y < t.get_height()) o[g.y * t.get_width() + g.x] = t.read(g); }\n"
 "fragment float4 bts(V in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
-"  constexpr sampler s(filter::nearest); return t.sample(s, in.uv); }\n";
+"  constexpr sampler s(filter::nearest); return t.sample(s, in.uv); }\n"
+"fragment float4 wr(V in [[stage_in]]) { return float4(floor(in.pos.x) / 256.0, floor(in.pos.y) / 256.0, 0.25, 1.0); }\n";
 
 static NSString *const kVis = @
 "#include <metal_stdlib>\n"
@@ -175,6 +176,39 @@ static int runBT(MTLPixelFormat pf, int w, int h, int pitch, NSString **why) {
     *why = [NSString stringWithFormat:@"%d/%d texels, (1,0).r = %.3f want %.3f", good, w * h, f[4], texel(1, 0, 0)]; return good == w * h ? 1 : 0;
 }
 
+// render into a w x h RGBA16Float buffer texture at row pitch `pitch` and read the app's buffer back on the CPU: the
+// texels must hold the pass's output and the bytes past each row's end (pitch padding) must be left alone.
+static int runBW(int w, int h, int pitch, NSString **why) {
+    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatRGBA16Float];
+    id<MTLBuffer> b = [dev newBufferWithLength:align + pitch * h options:MTLResourceStorageModeShared];
+    memset(b.contents, 0xA5, b.length);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:w height:h mipmapped:NO];
+    td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite;
+    id<MTLTexture> t = [b newTextureWithDescriptor:td offset:align bytesPerRow:pitch];
+    if (!t) { *why = @"newTextureWithDescriptor:offset:bytesPerRow: returned nil"; return -1; }
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"vs"]; d.fragmentFunction = [lib newFunctionWithName:@"wr"];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    NSError *e = nil; id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:d error:&e];
+    if (!ps) { *why = [NSString stringWithFormat:@"pipeline refused (%@)", e.localizedDescription]; return -1; }
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];
+    if (!done(cb, why)) return -1;
+    const uint8_t *m = (const uint8_t *)b.contents + align; int good = 0, pad = 0;
+    for (int y = 0; y < h; y++) {
+        const __fp16 *r = (const __fp16 *)(m + y * pitch);
+        for (int x = 0; x < w; x++)
+            good += fabsf((float)r[x * 4] - x / 256.0f) < 0.004f && fabsf((float)r[x * 4 + 1] - y / 256.0f) < 0.004f
+                 && fabsf((float)r[x * 4 + 2] - 0.25f) < 0.004f && fabsf((float)r[x * 4 + 3] - 1.0f) < 0.004f;
+        if (y + 1 < h) for (int k = w * 8; k < pitch; k++) pad += m[y * pitch + k] != 0xA5;
+    }
+    const __fp16 *r1 = (const __fp16 *)(m + pitch);
+    *why = [NSString stringWithFormat:@"%d/%d texels, %d padding bytes changed, (3,1) = %.3f,%.3f", good, w * h, pad, (float)r1[12], (float)r1[13]];
+    return good == w * h && !pad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     // "nofetch" skips arm 2: on a driver without framebuffer fetch the live read can take the process down
     const BOOL nofetch = argc > 1 && !strcmp(argv[1], "nofetch");
@@ -200,6 +234,9 @@ int main(int argc, char **argv) {
         g = runBT(MTLPixelFormatRGBA16Float, 131, 131, 1280, &why); arm("3f buffer texture RGBA16F 131x131 pitch 1280", g == 1, why);
         g = runBT(MTLPixelFormatRGBA16Float, 131, 131, 1048, &why); arm("3g buffer texture RGBA16F 131x131 pitch 1048", g == 1, why);
         g = runBT(MTLPixelFormatRGBA16Float, 141, 141, 1136, &why); arm("3h buffer texture RGBA16F 141x141 pitch 1136", g == 1, why);
+        g = runBW(131, 131, 1280, &why); arm("4a render into buffer texture RGBA16F 131x131 pitch 1280", g == 1, why);
+        g = runBW(131, 131, 1048, &why); arm("4b render into buffer texture RGBA16F 131x131 pitch 1048", g == 1, why);
+        g = runBW(141, 97, 1136, &why);  arm("4c render into buffer texture RGBA16F 141x97 pitch 1136", g == 1, why);
         printf("%s\n", fails ? "FAILED" : "PASS");
         return fails != 0;
     }
