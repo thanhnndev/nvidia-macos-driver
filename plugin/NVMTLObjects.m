@@ -965,10 +965,11 @@ static void nvmtl_storage_twins_out(NVMTLCommandBuffer *cb) {
 static int g_trace_lines;
 static int g_trace_bigonly, g_trace_mute;
 static int nvmtl_trace_on(void) {
-    static uint64_t next; static int on;
-    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    static uint64_t next; static int on; static unsigned calls;
     static int cap = 2500;
-    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-trace-request", F_OK) == 0;
+    /* the clock is read every 64th call, not on every draw (Step101: 41 samples in 5 s of WindowServer) */
+    if ((calls++ & 63) == 0 && clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) >= next) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW); next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-trace-request", F_OK) == 0;
         g_trace_bigonly = on && access("/tmp/nvmtl-trace-big", F_OK) == 0; if (!g_trace_bigonly) g_trace_mute = 0;
         if (on && !was) { g_trace_lines = 0; cap = access("/tmp/nvmtl-trace-long", F_OK) == 0 ? 20000 : 2500; } }
     return on && !g_trace_mute && g_trace_lines < cap;
@@ -1160,6 +1161,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (_swzView) nvmtl_vk_image_view_destroy(_swzView);
     if (!_parent && _parkable && _subHeap && _i.img) nvmtl_heap_park(_subHeap, &_i, _pkey, _heapOffset, _pkLen);
     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
+    if (!_parent && _dparkable && !_surf && !_subHeap && !_backBuf && _i.img) nvmtl_vk_image_park(&_i, _pkey);
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
@@ -2593,9 +2595,27 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
     if (!_ps) return NO;
     NVMTLRenderPipelineState *selected=_ps;
     if(_vertexSamplers.count || _fragmentSamplers.count) {
+        /* Fast path (Step101): the variant for this exact set of bound sampler-state objects. The JSON key below
+           cost two dictionary copies and a serialization on every draw. The entry holds the state objects
+           strongly, so a pointer in the key cannot be reused while the entry exists. */
+        uintptr_t fk[64]; unsigned nf = 0; NSMutableArray *keep = nil;
+        for (int st = 0; st < 2; st++) { NSDictionary *m = st ? _vertexSamplers : _fragmentSamplers; id slot[16] = { nil };
+            for (NSString *k in m) { int ix = k.intValue; if (ix >= 0 && ix < 16) slot[ix] = m[k]; }
+            for (int ix = 0; ix < 16; ix++) if (slot[ix]) { fk[nf++] = (uintptr_t)(st << 8 | ix); fk[nf++] = (uintptr_t)(__bridge void *)slot[ix]; } }
+        NSData *fast = [NSData dataWithBytes:fk length:nf * sizeof fk[0]];
+        @synchronized(_ps) {
+            NSArray *e = _ps->_samplerFast[fast];
+            if (e) { id sel = e[0]; if (sel == [NSNull null]) return NO; selected = sel; goto bind; }
+        }
+        keep = [NSMutableArray arrayWithCapacity:nf / 2];
+        for (unsigned q = 1; q < nf; q += 2) [keep addObject:(__bridge id)(void *)fk[q]];
         NSDictionary *vS=nvmtl_pixel_sampler_norm(_vertexSamplers),*fS=nvmtl_pixel_sampler_norm(_fragmentSamplers);
         NSData *key=[NSJSONSerialization dataWithJSONObject:@[vS,fS] options:NSJSONWritingSortedKeys error:NULL];
         @synchronized(_ps) {
+            id slowHit=_ps->_samplerVariants[key];
+            if(slowHit) { if(!_ps->_samplerFast) _ps->_samplerFast=[NSMutableDictionary new];
+                if(_ps->_samplerFast.count >= 256) [_ps->_samplerFast removeAllObjects];
+                _ps->_samplerFast[fast]=@[slowHit, keep]; }
             if(!_ps->_samplerVariants) _ps->_samplerVariants=[NSMutableDictionary new];
             id cached=_ps->_samplerVariants[key];
             if(cached==[NSNull null]) return NO;
@@ -2620,6 +2640,7 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
             }
         }
     }
+bind:
     if(!_cb->_resources)_cb->_resources=[NVMTLResSet new];[_cb->_resources addObject:selected];
     nvmtl_vk_cmd_bind_pipeline(&_cb->_c,&selected->_p);
     nvmtl_bind_embedded(_cb, NVMTL_SET_VERTEX,   (NVMTLFunction *)_ps->_descriptor.vertexFunction,   _vbufAt);

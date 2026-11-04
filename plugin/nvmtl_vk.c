@@ -1760,6 +1760,7 @@ static VkResult nvmtl_alloc_opaque_image_mem(const VkMemoryRequirements *mr, voi
 {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkResult result = nvmtl_vk_alloc_image_mem(mr, &memory, sysmem, what);
+    if (result != VK_SUCCESS && nvmtl_vk_image_park_drain()) { *sysmem = 0; result = nvmtl_vk_alloc_image_mem(mr, &memory, sysmem, what); }
     if (result == VK_SUCCESS) {
         *out = memory;
         if (!*sysmem) nvmtl_vk_budget_charge(mr->size);
@@ -5449,6 +5450,74 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b)
     if (nev) atomic_fetch_add(&g_bpark_evicted, nev);
     atomic_fetch_add(&g_bpark_parked, 1); bpark_census("park");
     nvmtl_perf_note(NVP_BUFDEL, t0, n);
+}
+
+/* Image park (Step101). WindowServer's CA makes and frees its blur mip surfaces every frame: each one was a BO alloc,
+ * VA map, unmap and free (ioctls) plus a desc-cache image epoch bump that retired every cached set holding an image.
+ * A freed plain texture now waits here, still allocated and still counted in the VRAM totals, and the next texture
+ * with the same creation key takes it. Same lifetime rule as destroy: NVMTLTexture dealloc runs once no command
+ * buffer holds the texture. Bounded by count and bytes; the oldest entry is destroyed first; an allocation that
+ * fails drains the park and tries again. Contents of a reused texture are undefined, as Metal allows. */
+#define NVMTL_IPARK_N 48
+#define NVMTL_IPARK_BYTES (160ull << 20)
+typedef struct { uint32_t key[NVMTL_IPARK_KEYN]; nvk_image img; } nvmtl_ipark_t;
+static nvmtl_ipark_t g_ipark[NVMTL_IPARK_N];
+static unsigned g_ipark_n; static uint64_t g_ipark_bytes;
+static pthread_mutex_t g_ipark_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_ipark_hit, g_ipark_miss, g_ipark_put, g_ipark_evict;
+static void nvmtl_ipark_census(const char *what)
+{
+    const uint64_t n = atomic_load(&g_ipark_hit) + atomic_load(&g_ipark_miss);
+    if (n & (n - 1)) return;
+    nvlog("image park (%s): hit %llu miss %llu parked %llu evicted %llu, holding %u (%llu MB)", what,
+          (unsigned long long)atomic_load(&g_ipark_hit), (unsigned long long)atomic_load(&g_ipark_miss),
+          (unsigned long long)atomic_load(&g_ipark_put), (unsigned long long)atomic_load(&g_ipark_evict),
+          g_ipark_n, (unsigned long long)(g_ipark_bytes >> 20));
+}
+int nvmtl_vk_image_unpark(const uint32_t key[NVMTL_IPARK_KEYN], nvk_image *out)
+{
+    static int off = -1; if (off < 0) off = getenv("NVMTL_NO_IPARK") != NULL;
+    if (off || g_state != 1) return -1;
+    int got = -1;
+    pthread_mutex_lock(&g_ipark_lock);
+    for (unsigned k = g_ipark_n; k-- > 0; ) {
+        if (memcmp(g_ipark[k].key, key, sizeof g_ipark[k].key)) continue;
+        *out = g_ipark[k].img; g_ipark_bytes -= out->alloc;
+        memmove(&g_ipark[k], &g_ipark[k + 1], (g_ipark_n - k - 1) * sizeof g_ipark[0]); g_ipark_n--; got = 0; break;
+    }
+    pthread_mutex_unlock(&g_ipark_lock);
+    atomic_fetch_add(got ? &g_ipark_miss : &g_ipark_hit, 1);
+    nvmtl_ipark_census(got ? "miss" : "hit");
+    return got;
+}
+void nvmtl_vk_image_park(nvk_image *i, const uint32_t key[NVMTL_IPARK_KEYN])
+{
+    if (g_state != 1 || !i || !i->img) return;
+    if (i->placed || !i->mem || i->vpair || i->alloc > NVMTL_IPARK_BYTES / 4 || getenv("NVMTL_NO_IPARK")) { nvmtl_vk_image_destroy(i); return; }
+    nvmtl_vk_image_upload_barrier(i);
+    nvk_image ev[NVMTL_IPARK_N]; unsigned nev = 0;
+    pthread_mutex_lock(&g_ipark_lock);
+    while (g_ipark_n && (g_ipark_n >= NVMTL_IPARK_N || g_ipark_bytes + i->alloc > NVMTL_IPARK_BYTES)) {
+        ev[nev++] = g_ipark[0].img; g_ipark_bytes -= g_ipark[0].img.alloc;
+        memmove(&g_ipark[0], &g_ipark[1], (g_ipark_n - 1) * sizeof g_ipark[0]); g_ipark_n--; }
+    memcpy(g_ipark[g_ipark_n].key, key, sizeof g_ipark[0].key); g_ipark[g_ipark_n].img = *i; g_ipark_n++;
+    g_ipark_bytes += i->alloc;
+    pthread_mutex_unlock(&g_ipark_lock);
+    memset(i, 0, sizeof *i);
+    atomic_fetch_add(&g_ipark_put, 1);
+    for (unsigned k = 0; k < nev; k++) nvmtl_vk_image_destroy(&ev[k]);
+    if (nev) atomic_fetch_add(&g_ipark_evict, nev);
+}
+unsigned nvmtl_vk_image_park_drain(void)
+{
+    nvk_image ev[NVMTL_IPARK_N]; unsigned nev;
+    pthread_mutex_lock(&g_ipark_lock);
+    for (nev = 0; nev < g_ipark_n; nev++) ev[nev] = g_ipark[nev].img;
+    g_ipark_n = 0; g_ipark_bytes = 0;
+    pthread_mutex_unlock(&g_ipark_lock);
+    for (unsigned k = 0; k < nev; k++) nvmtl_vk_image_destroy(&ev[k]);
+    if (nev) { atomic_fetch_add(&g_ipark_evict, nev); nvlog("image park: drained %u image(s) for an allocation that failed", nev); }
+    return nev;
 }
 
 void nvmtl_vk_image_destroy(nvk_image *i)

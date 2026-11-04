@@ -281,6 +281,12 @@ void nvmtl_vk_cmd_dispatch_indirect(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffer *
 void nvmtl_vk_cmd_barrier(nvk_cmdbuf *c);
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);
 void nvmtl_vk_image_destroy(nvk_image *i);
+/* Plain device textures recycled by creation key instead of freed and reallocated (CA's per-frame blur surfaces).
+   park takes ownership (destroys on refusal or eviction); unpark returns 0 and fills *out on a hit. */
+#define NVMTL_IPARK_KEYN 10
+void nvmtl_vk_image_park(nvk_image *i, const uint32_t key[NVMTL_IPARK_KEYN]);
+int nvmtl_vk_image_unpark(const uint32_t key[NVMTL_IPARK_KEYN], nvk_image *out);
+unsigned nvmtl_vk_image_park_drain(void);
 // Finish any in-flight asynchronous texture upload to this image (NVMTL_ASYNC_TEX_UPLOAD) before its memory
 // is read back, migrated or freed. A no-op when none is pending, which is always the case with the flag off.
 void nvmtl_vk_image_upload_barrier(nvk_image *img);
