@@ -24,6 +24,7 @@ SASS dispatch on NVK (sasspipe)|nvmtl_nvk_dispatch_sass_v1
 vendor variant (Apple MTLCompiler handshake)|vendor variant
 bindless-all heap slots|bindless-all - textures reach shaders
 dirty-only bindings|NVMTL_NO_DIRTYONLY
+desc-cache (descriptor-set cache)|NVMTL_NO_DESCCACHE
 fullclear (Apple whole-attachment clear)|begin_render: fullclear
 per-stage binding mask (gfx-bmask)|gmask
 fps file|nvmtl-fps-

@@ -1038,6 +1038,7 @@ static int nvmtl_vk_initialize(void)
     pvkCreateRenderPass2 = (PFN_vkCreateRenderPass2)pvkGetDeviceProcAddr(g_dev, "vkCreateRenderPass2");
     pvkCreateBufferView = (PFN_vkCreateBufferView)pvkGetDeviceProcAddr(g_dev, "vkCreateBufferView");
     pvkDestroyBufferView = (PFN_vkDestroyBufferView)pvkGetDeviceProcAddr(g_dev, "vkDestroyBufferView");
+    { extern void nvmtl_dc_hook_destroy(void); nvmtl_dc_hook_destroy(); }
     { VkPhysicalDeviceDepthStencilResolveProperties dsp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES };
       VkPhysicalDeviceProperties2 pp2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dsp };
       pvkGetPhysicalDeviceProperties2(g_pdev, &pp2);
@@ -2039,7 +2040,10 @@ static int nvmtl_dirty_only_on(void)
 typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
                  uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
-                 uint64_t emb_key[2][NVMTL_EMB_KEYMAX]; } nvmtl_bindtable;
+                 uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
+                 uint32_t dyn[2];  /* dynamic offset of binding 640 that goes with last[] (desc-cache reuse moves it) */
+                 uint32_t last_ie[2], last_be[2]; uint8_t last_dep[2];   /* desc-cache: handle epochs last[] was built at */
+                 void *dc; } nvmtl_bindtable;
 
 static VkDescriptorSetLayout g_setLayout;
 #define NVMTL_MAX_POOLS 64
@@ -2837,20 +2841,31 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     pvkUpdateDescriptorSets(g_dev, nw, w, ncp, cp);
     return set;
 }
-static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p)
+#include "nvmtl_desc_cache.h"
+/* *dyn gets the dynamic offset of binding 640 that goes with the returned set (0 unless the desc-cache reused a set
+   and moved its address table to a newer slot of the same page). */
+static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p, uint32_t *dyn)
 {
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
+    *dyn = 0;
     if (!t || which > 1 || !nvmtl_enc78_on(NVMTL_E78_H3) || p->tbany) return nvmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
     const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
     uint32_t hi = p->stex_hi[which];
+    const int dcon = nvmtl_dc_on();
+    /* With the desc-cache on, last[] also stops being live once a handle class it holds was destroyed (the value may
+       now name another object). Off, this is exactly the old test. */
     int live = t->last[which] && !t->dirty[which] && t->last_idx[which] < c->nsets
-               && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
+               && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which]
+               && (!dcon || nvmtl_dc_last_ok(t, which));
     if (live && hi <= t->last_hi[which]) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
-        if (covered) { nvmtl_enc78_count(E78C_SETREUSE, 1); return t->last[which]; }
+        if (covered) { nvmtl_enc78_count(E78C_SETREUSE, 1); *dyn = t->dyn[which]; return t->last[which]; }
     }
+    nvmtl_dc_probe pr;
+    { VkDescriptorSet hit = nvmtl_dc_lookup(c, t, which, pm, hi > NVMTL_NSTEX ? NVMTL_NSTEX : hi, dcon, dyn, &pr);
+      if (hit) { nvmtl_enc78_count(E78C_SETREUSE, 1); return hit; } }
     uint64_t m[4];
     for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
     if (live && t->last_hi[which] > hi) hi = t->last_hi[which];
@@ -2866,6 +2881,9 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     }
     VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, NULL, from, from ? cm : NULL);
     if (!s) return s;
+    nvmtl_dc_insert(c, &pr, s, p->stex_hi[which] > NVMTL_NSTEX ? NVMTL_NSTEX : p->stex_hi[which], NVMTL_E78_HAS(pm, NVMTL_ADDRESS_BINDING));
+    t->dyn[which] = 0;
+    t->last_dep[which] = (uint8_t)(pr.dep | (live ? t->last_dep[which] : 0)); t->last_ie[which] = pr.ie; t->last_be[which] = pr.be;
     t->last[which] = s; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = hi; t->dirty[which] = 0;
     memset(t->chg[which], 0, sizeof t->chg[which]);
     memcpy(t->lastw[which], m, sizeof m);
@@ -2932,13 +2950,13 @@ static VkSampleLocationsInfoEXT nvmtl_sample_info(const nvmtl_sample_pattern *p,
 
 void nvmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p)
 {
-    VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p), nvmtl_snapshot_set_c(c, 1, p), g_heapSet };
+    uint32_t dyn[2]; VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p, &dyn[0]), nvmtl_snapshot_set_c(c, 1, p, &dyn[1]), g_heapSet };
     if (!s[0] || !s[1]) { c->nobind = 1; return; }
     c->nobind = 0;
     if (g_sample_locations && c->sample_pattern.count)
         pvkCmdPushConstants(c->cb, (VkPipelineLayout)p->layout, VK_SHADER_STAGE_FRAGMENT_BIT, NVMTL_SAMPLE_POSITION_OFFSET,
                            NVMTL_SAMPLE_POSITION_BYTES, c->sample_pattern.position);
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, g_dyn_zero);
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, dyn);
 }
 
 #define NVMTL_DEPTH_USAGE (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | \
@@ -4106,7 +4124,7 @@ void nvmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_
     uint32_t tg[3], groups[3];
     for (int d = 0; d < 3; d++) { if (!tgIn[d] || !threads[d]) return; tg[d] = tgIn[d]; groups[d] = (threads[d] + tg[d] - 1) / tg[d]; }
     if (!(p = nvmtl_align_guard_pick(c, p))) { c->skipped++; return; }
-    VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p), nvmtl_snapshot_set_c(c, 1, p), g_heapSet };
+    uint32_t dyn[2]; VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p, &dyn[0]), nvmtl_snapshot_set_c(c, 1, p, &dyn[1]), g_heapSet };
     if (!s[0] || !s[1]) { c->nobind = 1; return; }
     c->nobind = 0;
     int bound = 0;
@@ -4124,7 +4142,7 @@ void nvmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_
         VkPipeline vp = nvmtl_compute_variant(p, local);
         if (!vp) { c->skipped++; continue; }
         pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-        if (!bound) { pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, g_dyn_zero); bound = 1; }
+        if (!bound) { pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, dyn); bound = 1; }
         // Metal allows any group count per axis; Vulkan caps it (NVK: 0x7fffffff x 65535 x 65535, the width of the QMD
         // grid fields). Geekbench's OpenCL Face Detection dispatched past 65535 on y and NAK's nak_fill_qmd aborted the
         // process. Split into chunks and advance thread_base/threadgroup_base, which the translated kernel adds to
@@ -4156,13 +4174,13 @@ void nvmtl_vk_cmd_dispatch_indirect_tg(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffe
     if (!(p = nvmtl_align_guard_pick(c, p))) { c->skipped++; return; }
     VkPipeline vp = nvmtl_compute_variant(p, tg);
     if (!vp) { c->skipped++; return; }
-    VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p), nvmtl_snapshot_set_c(c, 1, p), g_heapSet };
+    uint32_t dyn[2]; VkDescriptorSet s[3] = { nvmtl_snapshot_set_c(c, 0, p, &dyn[0]), nvmtl_snapshot_set_c(c, 1, p, &dyn[1]), g_heapSet };
     if (!s[0] || !s[1]) { c->nobind = 1; return; }
     c->nobind = 0;
     if (b->map && off + 12 <= b->size) memcpy(g, (const char *)b->map + off, 12);
     else { static int said; if (!said++) nvlog("vk: indirect dispatch grid is not CPU-visible — a kernel asking [[threads_per_grid]] reads 0"); }
     pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vp);
-    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, g_dyn_zero);
+    pvkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)p->layout, 0, g_heapSet ? 3 : 2, s, nvmtl_table_ubo() ? 2 : 0, dyn);
     uint32_t pc[12] = { g[0] * tg[0], g[1] * tg[1], g[2] * tg[2], 0, 0, 0, 0, 0, 0, g[0], g[1], g[2] };
     pvkCmdPushConstants(c->cb, (VkPipelineLayout)p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, NVMTL_DISPATCH_PC_BYTES, pc);
     pvkCmdDispatchIndirect(c->cb, (VkBuffer)b->buf, off);
@@ -5101,6 +5119,7 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
         pthread_mutex_unlock(&g_desc_lock);
     }
     free(c->sets); c->sets = NULL; c->nsets = c->capsets = 0; c->nobind = 0; c->skipped = 0;
+    if (c->table) { free(((nvmtl_bindtable *)c->table)->dc); ((nvmtl_bindtable *)c->table)->dc = NULL; }
     free(c->table); c->table = NULL;
     nvmtl_address_page *page = c->address_pages;
     const int keep = nvmtl_keep_verdict(c->wseq);
