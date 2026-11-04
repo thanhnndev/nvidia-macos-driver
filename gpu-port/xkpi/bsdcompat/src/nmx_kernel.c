@@ -4,9 +4,11 @@
  *
  * Per-thread records: LinuxKPI hangs Linux's task_struct off FreeBSD's struct thread, and DRM's locks record their
  * owner as a struct thread pointer. xnu has no per-thread storage for kexts, so records live in a hash table keyed by
- * thread_t, created on first use. User threads only pass through the driver inside a system call; the entry points
- * release a record the call created (nmx_thread_leave), so records do not accumulate. Kernel threads the port starts
- * keep theirs until they exit.
+ * thread_t, created on first use. Kernel threads the port starts drop theirs when they exit (nmx_thread_leave).
+ * Records of user threads stay: xnu tells a kext about no thread or process exit, and it recycles thread_t and
+ * proc_t, so a record found by its xnu pointer is checked against the owner's identity (thread_tid; pid and start
+ * time) and rebuilt for the new owner when it was made for an earlier one (ga403wm Step100: a new WindowServer
+ * thread on a recycled thread_t ran with the dead process's Linux task and mm, and amdgpu refused its userptr BOs).
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -90,6 +92,22 @@ struct nmx_proc_rec {
     struct nmx_proc_rec *next;
 };
 static struct nmx_proc_rec *nmx_procs[NMX_PROC_BUCKETS];
+/*
+ * Records of processes that are gone wait here (unlinked, under nmx_thread_lock) for nmx_proc_reap, which detaches
+ * their threads' Linux tasks and drops the record's mm reference; it frees them one reap later (the graveyard), so a
+ * pointer nmx_proc_find handed out just before cannot be used after it is freed.
+ */
+static struct nmx_proc_rec *nmx_procs_retired;
+static struct nmx_proc_rec *nmx_procs_grave;
+static volatile int nmx_procs_new;          /* records made since the last scan for exited processes */
+static volatile int nmx_reaping;
+/* Linux tasks taken from recycled thread records, released by nmx_proc_reap */
+#define NMX_TASKS_PENDING 64
+static struct task_struct *nmx_tasks_pending[NMX_TASKS_PENDING];
+static int nmx_tasks_npending;
+static unsigned nmx_tasks_leaked;           /* pending list full: the task (and its mm reference) is kept */
+void (*nmx_task_release_hook)(struct task_struct *ts);
+void (*nmx_proc_release_hook)(struct proc *p);
 static struct proc nmx_kernproc_rec = { .p_pid = 0, .p_comm = "kernel_task" };
 struct proc *nmx_kernproc = &nmx_kernproc_rec;
 struct proc *proc0 = &nmx_kernproc_rec;
@@ -100,14 +118,44 @@ static unsigned bucket_of(const void *p, unsigned n)
     return (unsigned)((v >> 4) ^ (v >> 12)) & (n - 1);
 }
 
+/* a process's start time in microseconds: with its pid, what tells the owners of one recycled proc_t apart */
+static uint64_t nmx_proc_start(void *xnu)
+{
+    struct timeval tv = { 0, 0 };
+    proc_starttime(xnu, &tv);
+    return (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
+}
+
+/* unlinks the record of a process that is gone and queues it for nmx_proc_reap; nmx_thread_lock held */
+static void nmx_proc_retire_locked(struct nmx_proc_rec **pp)
+{
+    struct nmx_proc_rec *r = *pp;
+    *pp = r->next;
+    r->next = nmx_procs_retired;
+    nmx_procs_retired = r;
+}
+
+/* the record of a live xnu process (current_proc() or a proc_find() reference), made on first use */
 static struct proc *nmx_proc_for(void *xnu)
 {
     if (xnu == NULL)
         return nmx_kernproc;
+    pid_t pid = proc_pid(xnu);
+    uint64_t start = nmx_proc_start(xnu);
     unsigned b = bucket_of(xnu, NMX_PROC_BUCKETS);
     lck_spin_lock(nmx_thread_lock);
-    for (struct nmx_proc_rec *r = nmx_procs[b]; r; r = r->next)
-        if (r->xnu == xnu) { lck_spin_unlock(nmx_thread_lock); return &r->p; }
+    for (struct nmx_proc_rec **pp = &nmx_procs[b]; *pp; pp = &(*pp)->next) {
+        struct nmx_proc_rec *r = *pp;
+        if (r->xnu != xnu)
+            continue;
+        if (r->p.p_pid == pid && r->p.nmx_start == start) {
+            lck_spin_unlock(nmx_thread_lock);
+            return &r->p;
+        }
+        /* the proc_t was recycled: this record (and its mm) belongs to the process that had it before */
+        nmx_proc_retire_locked(pp);
+        break;
+    }
     lck_spin_unlock(nmx_thread_lock);
 
     struct nmx_proc_rec *nr = IOMallocZero(sizeof(*nr));
@@ -115,14 +163,20 @@ static struct proc *nmx_proc_for(void *xnu)
         return nmx_kernproc;
     nr->xnu = xnu;
     nr->p.nmx_xnu = xnu;
-    nr->p.p_pid = proc_pid(xnu);
+    nr->p.p_pid = pid;
+    nr->p.nmx_start = start;
     proc_name(nr->p.p_pid, nr->p.p_comm, sizeof(nr->p.p_comm));
 
     lck_spin_lock(nmx_thread_lock);
     for (struct nmx_proc_rec *r = nmx_procs[b]; r; r = r->next)
-        if (r->xnu == xnu) { lck_spin_unlock(nmx_thread_lock); IOFree(nr, sizeof(*nr)); return &r->p; }
+        if (r->xnu == xnu && r->p.p_pid == pid && r->p.nmx_start == start) {
+            lck_spin_unlock(nmx_thread_lock);
+            IOFree(nr, sizeof(*nr));
+            return &r->p;
+        }
     nr->next = nmx_procs[b];
     nmx_procs[b] = nr;
+    nmx_procs_new++;
     lck_spin_unlock(nmx_thread_lock);
     return &nr->p;
 }
@@ -146,23 +200,65 @@ static struct nmx_thread_rec *nmx_thread_find(thread_t xt)
     return NULL;
 }
 
+/* queues a Linux task for release by nmx_proc_reap; nmx_thread_lock held */
+static void nmx_task_pending_locked(struct task_struct *ts)
+{
+    if (nmx_tasks_npending < NMX_TASKS_PENDING)
+        nmx_tasks_pending[nmx_tasks_npending++] = ts;
+    else
+        nmx_tasks_leaked++;
+}
+
+/*
+ * The record of a recycled thread_t, rebuilt for the thread that has it now. Only the owning thread rebuilds its
+ * record; the earlier owner's Linux task (and through it that process's mm) is released later by nmx_proc_reap,
+ * since this may run where nothing may sleep.
+ */
+static void nmx_thread_recycle(struct nmx_thread_rec *r, uint64_t tid)
+{
+    struct proc *p = nmx_curproc();     /* takes nmx_thread_lock itself */
+    lck_spin_lock(nmx_thread_lock);
+    struct task_struct *ts = r->td.td_lkpi_task;
+    r->td.td_lkpi_task = NULL;
+    r->td.td_proc = p;
+    r->td.td_tid = (int)(tid & 0x7fffffff);
+    r->td.td_xnu_tid = tid;
+    r->td.td_pinned = 0;
+    r->td.td_critnest = 0;
+    r->td.td_flags = 0;
+    r->td.td_pflags = 0;
+    r->td.td_fpop = NULL;
+    r->td.td_nmx_open = NULL;
+    r->td.td_siglist = 0;
+    r->td.td_wchan = NULL;
+    r->td.td_wmesg = NULL;
+    if (ts != NULL)
+        nmx_task_pending_locked(ts);
+    lck_spin_unlock(nmx_thread_lock);
+}
+
 /* the record for the calling thread, created on first use; 'transient' marks one made by a system-call entry */
 static struct thread *nmx_thread_get(int transient, int *created)
 {
     thread_t xt = current_thread();
+    uint64_t tid = thread_tid(xt);
     *created = 0;
     lck_spin_lock(nmx_thread_lock);
     struct nmx_thread_rec *r = nmx_thread_find(xt);
     lck_spin_unlock(nmx_thread_lock);
-    if (r)
+    if (r) {
+        if (__builtin_expect(r->td.td_xnu_tid != tid, 0))
+            nmx_thread_recycle(r, tid);
         return &r->td;
+    }
 
     struct nmx_thread_rec *nr = IOMallocZero(sizeof(*nr));
     if (nr == NULL)
         panic("NullMoth xkpi: no memory for a thread record");
     nr->td.td_xnu = xt;
     nr->td.td_proc = nmx_curproc();
-    nr->td.td_tid = (int)(thread_tid(xt) & 0x7fffffff);
+    nr->td.td_tid = (int)(tid & 0x7fffffff);
+    nr->td.td_xnu_tid = tid;
     nr->td.td_priority = PZERO;
     nr->td.td_base_pri = PZERO;
     nr->transient = transient;
@@ -533,6 +629,10 @@ void nmx_kernel_fini(void)
             while (r) { struct nmx_proc_rec *n = r->next; IOFree(r, sizeof(*r)); r = n; }
             nmx_procs[b] = NULL;
         }
+        struct nmx_proc_rec *lists[2] = { nmx_procs_retired, nmx_procs_grave };
+        for (int i = 0; i < 2; i++)
+            for (struct nmx_proc_rec *r = lists[i], *n; r; r = n) { n = r->next; IOFree(r, sizeof(*r)); }
+        nmx_procs_retired = nmx_procs_grave = NULL;
         lck_spin_free(nmx_thread_lock, nmx_lck_grp);
         nmx_thread_lock = NULL;
     }
@@ -633,6 +733,97 @@ struct task_struct *nmx_proc_any_task(struct proc *p, bool get)
             }
     lck_spin_unlock(nmx_thread_lock);
     return ts;
+}
+
+/*
+ * Releases what earlier owners of recycled records left, and the records of processes that exited; called by
+ * LinuxKPI where it may sleep (linux_alloc_current with M_WAITOK). One caller at a time; cheap when there is nothing
+ * to do. A process that exits is noticed when a new process record appears (the next process to use the driver).
+ */
+void nmx_proc_reap(void)
+{
+    if (nmx_procs_new == 0 && nmx_procs_retired == NULL && nmx_procs_grave == NULL && nmx_tasks_npending == 0)
+        return;
+    if (__atomic_exchange_n(&nmx_reaping, 1, __ATOMIC_ACQUIRE))
+        return;
+
+    /* 1. records whose process is gone (its proc_t not recycled yet) */
+    if (__atomic_exchange_n(&nmx_procs_new, 0, __ATOMIC_ACQ_REL) != 0) {
+        for (unsigned b = 0; b < NMX_PROC_BUCKETS; b++) {
+            enum { MAXB = 16 };
+            struct { struct nmx_proc_rec *r; void *xnu; pid_t pid; uint64_t start; } c[MAXB];
+            int n = 0;
+            lck_spin_lock(nmx_thread_lock);
+            for (struct nmx_proc_rec *r = nmx_procs[b]; r && n < MAXB; r = r->next) {
+                c[n].r = r; c[n].xnu = r->xnu; c[n].pid = r->p.p_pid; c[n].start = r->p.nmx_start;
+                n++;
+            }
+            if (n == MAXB)
+                nmx_procs_new = 1;      /* a long chain: the rest at the next reap */
+            lck_spin_unlock(nmx_thread_lock);
+            for (int i = 0; i < n; i++) {
+                void *xp = (void *)proc_find(c[i].pid);
+                bool alive = xp == c[i].xnu && nmx_proc_start(xp) == c[i].start;
+                if (xp != NULL)
+                    proc_rele((proc_t)xp);
+                if (alive)
+                    continue;
+                lck_spin_lock(nmx_thread_lock);
+                for (struct nmx_proc_rec **pp = &nmx_procs[b]; *pp; pp = &(*pp)->next)
+                    if (*pp == c[i].r) { nmx_proc_retire_locked(pp); break; }
+                lck_spin_unlock(nmx_thread_lock);
+            }
+        }
+    }
+
+    /* 2. free the graveyard (retired one reap ago), then retire: detach the threads, drop the mm */
+    lck_spin_lock(nmx_thread_lock);
+    struct nmx_proc_rec *grave = nmx_procs_grave;
+    struct nmx_proc_rec *retired = nmx_procs_retired;
+    nmx_procs_grave = NULL;
+    nmx_procs_retired = NULL;
+    for (struct nmx_proc_rec *r = retired; r; r = r->next)
+        for (unsigned b = 0; b < NMX_THREAD_BUCKETS; b++)
+            for (struct nmx_thread_rec *t = nmx_threads[b]; t; t = t->next)
+                if (t->td.td_proc == &r->p) {
+                    /* a thread of the dead process: its record waits for its thread_t to be recycled */
+                    t->td.td_proc = nmx_kernproc;
+                    if (t->td.td_lkpi_task != NULL) {
+                        nmx_task_pending_locked(t->td.td_lkpi_task);
+                        t->td.td_lkpi_task = NULL;
+                    }
+                }
+    lck_spin_unlock(nmx_thread_lock);
+    for (struct nmx_proc_rec *r = grave, *n; r; r = n) {
+        n = r->next;
+        IOFree(r, sizeof(*r));
+    }
+    struct nmx_proc_rec *last = NULL;
+    for (struct nmx_proc_rec *r = retired; r; r = r->next) {
+        if (nmx_proc_release_hook)
+            nmx_proc_release_hook(&r->p);
+        last = r;
+    }
+    if (last != NULL) {
+        lck_spin_lock(nmx_thread_lock);
+        last->next = nmx_procs_grave;
+        nmx_procs_grave = retired;
+        lck_spin_unlock(nmx_thread_lock);
+    }
+
+    /* 3. the Linux tasks of earlier owners */
+    for (;;) {
+        struct task_struct *ts = NULL;
+        lck_spin_lock(nmx_thread_lock);
+        if (nmx_tasks_npending > 0)
+            ts = nmx_tasks_pending[--nmx_tasks_npending];
+        lck_spin_unlock(nmx_thread_lock);
+        if (ts == NULL)
+            break;
+        if (nmx_task_release_hook)
+            nmx_task_release_hook(ts);
+    }
+    __atomic_store_n(&nmx_reaping, 0, __ATOMIC_RELEASE);
 }
 
 /* detaches every thread's Linux state and releases it outside the registry lock (unload) */
