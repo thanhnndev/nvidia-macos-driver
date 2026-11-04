@@ -35,6 +35,8 @@ typedef struct { void *rp; void *pipe; void *layout; int has_depth; uint32_t dfm
     uint64_t shape_identity;
     uint32_t lin;
     uint64_t tbm[2][4]; uint32_t tbany;
+    uint32_t fetch_mask;   /* colour attachments the fragment shader reads ([[color(n)]], set 3 binding 192+n) */
+    uint32_t fetch_zero;   /* framebuffer fetch is off by NVMTL_NO_FBFETCH but the shader reads [[color(n)]]: set 3 holds the dummy */
 } nvk_pipeline;
 void nvmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
@@ -62,6 +64,11 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  unsigned nobind, skipped;
                  void *dcache[32]; void *dcachepool; unsigned ndcache;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;
+                 void *fetchview[NVMTL_NCOL];   /* the open pass's colour views, read by [[color(n)]] framebuffer fetch */
+                 unsigned fetch_draw, topo;     /* the bound pipeline reads [[color(n)]] in this pass; last MTLPrimitiveType set */
+                 /* the last framebuffer fetch set made in this command buffer and what it points at: a draw whose pass
+                    and mask are the same reuses it (Core Animation draws hundreds of fetch draws per pass) */
+                 void *fetch_last_set; uint32_t fetch_last_mask; void *fetch_last_view[NVMTL_NCOL];
                  unsigned direct_sass;   /* recorded a dispatch of compiled machine code: never reuse this pool */
                  void *occlusion_pages; uint32_t occlusion_count;
                  void *timing_pool; nvmtl_gpu_interval timing;
