@@ -2011,20 +2011,35 @@ static int nvmtl_spirv_bands_ok(const void *p, size_t n, const char *what)
 }
 static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
 {
+    /* Which of our set 0/1 bindings the module declares. A binding number outside the layout's bands (192..199
+     * [[color(n)]] framebuffer fetch, imageblock 200..479, anything else) and any binding in the bindless heap set (2)
+     * is not in the set layout, so nothing is ever written for it: it is skipped, not a reason to drop the mask.
+     * (Dropping it made every WindowServer pipeline with framebuffer fetch write all ~200 bindings per draw.) */
     const uint32_t *w = (const uint32_t *)p; size_t nw = n / 4;
     memset(out, 0, 4 * sizeof *out);
     if (!p || nw < 5 || w[0] != 0x07230203u) return 0;
+    const uint32_t bound = w[3];
+    uint8_t *heap = bound && bound < (1u << 24) ? (uint8_t *)calloc(bound, 1) : NULL;
+    if (!heap) return 0;
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
-        if (!wc || i + wc > nw) return 0;
+        if (!wc || i + wc > nw) { free(heap); return 0; }
+        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] = 1;
+        i += wc;
+    }
+    for (size_t i = 5; i < nw; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (op == 71 && wc == 4 && w[i + 2] == 33) {
-            uint32_t b = w[i + 3];
-            if (b == NVMTL_ADDRESS_BINDING_NUMBER) out[NVMTL_ADDRESS_BINDING >> 6] |= 1ull << (NVMTL_ADDRESS_BINDING & 63);
-            else if (b < NVMTL_ADDRESS_BINDING) out[b >> 6] |= 1ull << (b & 63);
-            else if (!(b >= NVMTL_STEX_BINDING_NUMBER && b < NVMTL_STEX_BINDING_NUMBER + NVMTL_NSTEX)) return 0;
+            uint32_t id = w[i + 1], b = w[i + 3];
+            if (!(id < bound && heap[id])) {
+                if (b == NVMTL_ADDRESS_BINDING_NUMBER) out[NVMTL_ADDRESS_BINDING >> 6] |= 1ull << (NVMTL_ADDRESS_BINDING & 63);
+                else if (b < NVMTL_ADDRESS_BINDING) out[b >> 6] |= 1ull << (b & 63);
+                /* storage textures (480..607) are covered by stex_hi; other numbers are not in the layout */
+            }
         }
         i += wc;
     }
+    free(heap);
     return 1;
 }
 enum { NVMTL_SLOT_NONE = 0, NVMTL_SLOT_BUF, NVMTL_SLOT_TEX, NVMTL_SLOT_SAMP, NVMTL_SLOT_TEXBUF  };

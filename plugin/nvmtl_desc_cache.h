@@ -24,9 +24,9 @@
  *
  * This file is #included by nvmtl_vk.c right before nvmtl_snapshot_set_c (single translation unit). */
 
-#define NVMTL_DC_CAP     128                       /* entries per command buffer, power of two */
+#define NVMTL_DC_CAP     256                       /* entries per command buffer, power of two */
 #define NVMTL_DC_KEYMAX  192                       /* words; a longer key is simply not cached */
-#define NVMTL_DC_ARENA   (NVMTL_DC_CAP * 16)       /* key words per command buffer */
+#define NVMTL_DC_ARENA   (NVMTL_DC_CAP * 24)       /* key words per command buffer */
 enum { NVMTL_DC_DEP_IMG = 1, NVMTL_DC_DEP_BUF = 2 };
 typedef struct { uint64_t h; VkDescriptorSet set; VkBuffer pbuf; uint32_t koff, klen, idx, hi, poff, ie, be;
                  uint8_t used, addr, dep; } nvmtl_dc_ent;
@@ -101,7 +101,11 @@ static inline uint64_t nvmtl_dc_mix(uint64_t h, uint64_t v)
 }
 /* The key: what nvmtl_snapshot_set_md would write for each binding in pm (sampled/sampler/buffer bindings below
  * NVMTL_STEX_BASE) and for storage textures [0, hi). In UBO mode binding 640 adds nothing: a hit writes a fresh
- * table slot. In SSBO mode the table content itself is keyed. Returns the length, 0 when it does not fit. */
+ * table slot. In SSBO mode the table content itself is keyed. Returns the length, 0 when it does not fit.
+ * Only bindings that write a real descriptor are in the key, as (binding, value) pairs: an empty (or misaligned)
+ * binding always gets the same dummy, and pm and hi are in the header, so leaving those out keeps the key exact.
+ * (d5da629 spent 1-2 words on every binding of the layout; CoreAnimation's pipelines declare ~200, so 163260 of
+ * 175475 lookups on the Step100 boot overflowed NVMTL_DC_KEYMAX and were never cached.) */
 static unsigned nvmtl_dc_key(const nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], uint32_t hi, int ubo,
                              uint64_t *k, uint8_t *dep)
 {
@@ -114,29 +118,46 @@ static unsigned nvmtl_dc_key(const nvmtl_bindtable *t, uint32_t which, const uin
         const nvmtl_slot *sl = &t->s[which][i];
         if (i == NVMTL_ADDRESS_BINDING) {
             if (ubo) continue;
-            if (n + NVMTL_NBUF + NVMTL_NTEX > NVMTL_DC_KEYMAX) return 0;
-            for (unsigned j = 0; j < NVMTL_NBUF; j++) { const nvmtl_slot *s = &t->s[which][j];
-                k[n++] = s->kind == NVMTL_SLOT_BUF ? s->address + s->off : 1; if (s->kind == NVMTL_SLOT_BUF) *dep |= NVMTL_DC_DEP_BUF; }
-            for (unsigned j = 0; j < NVMTL_NTEX; j++) { const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + j];
-                k[n++] = (s->kind == NVMTL_SLOT_TEX && s->h) ? (uint64_t)s->size : 0; }
+            {   /* the table content, sparse: only the used entries, then a terminator */
+                if (n + 2 > NVMTL_DC_KEYMAX) return 0;
+                k[n++] = (uint64_t)i << 2 | 3;
+                for (unsigned j = 0; j < NVMTL_NBUF; j++) { const nvmtl_slot *s = &t->s[which][j];
+                    if (s->kind != NVMTL_SLOT_BUF) continue;
+                    if (n + 2 > NVMTL_DC_KEYMAX) return 0;
+                    k[n++] = j; k[n++] = s->address + s->off; *dep |= NVMTL_DC_DEP_BUF; }
+                for (unsigned j = 0; j < NVMTL_NTEX; j++) { const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + j];
+                    if (!(s->kind == NVMTL_SLOT_TEX && s->h)) continue;
+                    if (n + 2 > NVMTL_DC_KEYMAX) return 0;
+                    k[n++] = NVMTL_NBUF + j; k[n++] = (uint64_t)s->size; }
+                if (n + 1 > NVMTL_DC_KEYMAX) return 0;
+                k[n++] = ~0ull;
+            }
             continue;
         }
-        if (n + 2 > NVMTL_DC_KEYMAX) return 0;
         const VkDescriptorType ty = binding_type(i);
         if (ty == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || ty == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
             if (sl->kind == NVMTL_SLOT_BUF && (sl->off % NVMTL_SSBO_ALIGN) == 0) {
-                k[n++] = (uint64_t)(uintptr_t)sl->h; k[n++] = (uint64_t)sl->off; *dep |= NVMTL_DC_DEP_BUF;
-            } else { k[n++] = 0; k[n++] = ~0ull; }
+                if (n + 3 > NVMTL_DC_KEYMAX) return 0;
+                k[n++] = (uint64_t)i << 2 | 1; k[n++] = (uint64_t)(uintptr_t)sl->h; k[n++] = (uint64_t)sl->off;
+                *dep |= NVMTL_DC_DEP_BUF;
+            }
         } else if (ty == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
-            const int on = sl->kind == NVMTL_SLOT_TEX; k[n++] = on ? (uint64_t)(uintptr_t)sl->h : 0; if (on) *dep |= NVMTL_DC_DEP_IMG;
+            if (sl->kind == NVMTL_SLOT_TEX) {
+                if (n + 2 > NVMTL_DC_KEYMAX) return 0;
+                k[n++] = (uint64_t)i << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG;
+            }
         } else {
-            const int on = sl->kind == NVMTL_SLOT_SAMP; k[n++] = on ? (uint64_t)(uintptr_t)sl->h : 0; if (on) *dep |= NVMTL_DC_DEP_IMG;
+            if (sl->kind == NVMTL_SLOT_SAMP) {
+                if (n + 2 > NVMTL_DC_KEYMAX) return 0;
+                k[n++] = (uint64_t)i << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG;
+            }
         }
     }
-    if (n + hi > NVMTL_DC_KEYMAX) return 0;
     for (uint32_t j = 0; j < hi; j++) {
         const nvmtl_slot *sl = &t->s[which][NVMTL_STEX_BASE + j];
-        const int on = sl->kind == NVMTL_SLOT_TEX && sl->h; k[n++] = on ? (uint64_t)(uintptr_t)sl->h : 0; if (on) *dep |= NVMTL_DC_DEP_IMG;
+        if (!(sl->kind == NVMTL_SLOT_TEX && sl->h)) continue;
+        if (n + 2 > NVMTL_DC_KEYMAX) return 0;
+        k[n++] = (uint64_t)(NVMTL_STEX_BASE + j) << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG;
     }
     return n;
 }

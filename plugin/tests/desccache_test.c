@@ -258,7 +258,7 @@ static void run(int ubo, int cache, int destroy_rate, int ws, unsigned ncb, unsi
                         break;
                 }
             }
-            nvk_pipeline *p = ws ? &P[R(2)] : &P[R(10) < 7 ? R(2) : R(7)];
+            nvk_pipeline *p = ws == 2 ? &P[R(3) ? 6 : 1] : ws ? &P[R(2)] : &P[R(10) < 7 ? R(2) : R(7)];
             memset(g_bound, 0, sizeof g_bound);
             nvmtl_vk_cmd_bind_set(&c, p);
             if (c.nobind) { if (g_fail++ < 3 && g_verbose) fprintf(stderr, "FAIL: nobind\n"); continue; }
@@ -285,6 +285,8 @@ int main(int argc, char **argv)
     struct { int ubo, cache, destroy, ws, info; const char *name; } cfg[] = {
         { 1, 0, 0, 1, 0, "WS-like, UBO table, cache OFF" },  { 1, 1, 0, 1, 0, "WS-like, UBO table, cache ON" },
         { 1, 1, 5, 1, 0, "WS-like, cache ON, frees" },
+        { 1, 0, 0, 2, 0, "WS no-mask, cache OFF" },          { 1, 1, 0, 2, 0, "WS no-mask, cache ON" },
+        { 1, 1, 5, 2, 0, "WS no-mask, cache ON, frees" },
         { 1, 0, 0, 0, 0, "mixed, UBO table, cache OFF" },    { 1, 1, 0, 0, 0, "mixed, UBO table, cache ON" },
         { 1, 1, 3, 0, 0, "mixed, UBO, cache ON, frees" },    { 0, 0, 0, 0, 0, "mixed, SSBO table, cache OFF" },
         { 0, 1, 0, 0, 0, "mixed, SSBO table, cache ON" },    { 0, 1, 3, 0, 0, "mixed, SSBO, cache ON, frees" },
