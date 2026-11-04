@@ -1424,6 +1424,19 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (nvmtl_pixfmt_public(f, &vkf, &bpp, &a8)) return nil;
     if (vkf != [v nvi]->fmt && bpp != [v nvi]->bpp) {
         nvlog("newTextureView: pixel format %lu is %u B per element, its texture's is %u B - nil", (unsigned long)f, bpp, [v nvi]->bpp); return nil; }
+    /* Identity view (Step101c): same format as the root texture, every level and slice, same type, no own swizzle -
+       the image's own view is that view. WindowServer wraps the same IOSurfaces every frame (surface keep hands out a
+       view of the cached backing); each wrapper made and destroyed a VkImageView, and each destroy retired every
+       desc-cache set holding an image (~200/s). Off: NVMTL_NO_IDVIEW=1. */
+    { static int off = -1; if (off < 0) off = getenv("NVMTL_NO_IDVIEW") != NULL;
+      NVMTLTexture *root = v->_parent; nvk_image *im = [v nvi];
+      if (!off && root && !root->_parent && !root->_ownView && !root->_swzView && root->_fmt == f && !a8 && vkf == im->fmt
+          && !v->_baseLevel && v->_mips == (im->mips ? im->mips : 1) && !v->_baseSlice && v->_viewSlices == (im->mtl_type == 7 ? 1 : (im->layers ?: 1))
+          && v->_viewType == im->mtl_type && im->view) {
+          static _Atomic unsigned long long n; const unsigned long long k = atomic_fetch_add(&n, 1) + 1;
+          if (!(k & (k - 1))) nvlog("newTextureView: %llu identity view(s) share the image's own view", k);
+          v->_stex = im->storage && nvmtl_vk_format_is_storage(vkf);
+          return v; } }
     if (nvmtl_vk_image_view_create_range([v nvi], vkf, a8, v->_baseLevel, v->_mips, v->_baseSlice, v->_viewSlices, v->_viewType, &v->_ownView)) {
         nvlog("newTextureView: view create FAILED"); return nil;
     }
