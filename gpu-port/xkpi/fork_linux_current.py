@@ -21,7 +21,9 @@ void nmx_xnu_mm_forget(void *mm);
 
 /*
  * macOS port: one mm_struct per process, kept on the port's process record (FreeBSD finds it by walking the
- * process's threads, which xnu does not let a kext do).
+ * process's threads, which xnu does not let a kext do). The record holds one mm_users reference from the moment the
+ * mm is published until the port retires the record (the process is gone, nmx_proc_reap), so a published mm is
+ * never freed under the pointer and every thread of the process gets the same one.
  */
 static struct mm_struct *
 find_other_mm(struct proc *p)
@@ -34,21 +36,68 @@ find_other_mm(struct proc *p)
 	return (NULL);
 }
 """)
-# record a new mm on the process so later threads share it
-replace_once("\t\t\t/* set mm_struct pointer */\n\t\t\tts->mm = mm;\n",
-             "\t\t\t/* set mm_struct pointer */\n\t\t\tts->mm = mm;\n\t\t\t/* macOS port: later threads of this process share it */\n\t\t\tproc->p_lkpi_mm = mm;\n"
-             "\t\t\t/* macOS port: remember the Mach task, for driver workers that copy to this process */\n\t\t\tnmx_xnu_mm_note_task(mm);\n")
+# record a new mm on the process so later threads share it. PROC_LOCK is no lock here, so the mm is published with
+# a compare-and-swap: two first threads of one process must not each install their own (a userptr BO made on one
+# thread would then fail the mm check of a submit from the other).
+i = s.index("\tproc = td->td_proc;\n\n\tPROC_LOCK(proc);\n\tmm_other = find_other_mm(proc);\n")
+j = s.index("\t/* store pointer to task struct */\n", i)
+s = s[:i] + """	proc = td->td_proc;
+
+	/* macOS port: release what exited processes and recycled thread records left (it may sleep) */
+	if ((flags & M_WAITOK) != 0)
+		nmx_proc_reap();
+
+	PROC_LOCK(proc);
+	mm_other = find_other_mm(proc);
+
+	/* use allocated mm_struct as a fallback */
+	if (mm_other == NULL) {
+		PROC_UNLOCK(proc);
+		mm = uma_zalloc(linux_mm_zone, flags | M_ZERO);
+		if (mm == NULL) {
+			uma_zfree(linux_current_zone, ts);
+			return (ENOMEM);
+		}
+		/* setup new mm_struct: one user for this task, one for the process record */
+		init_rwsem(&mm->mmap_sem);
+		atomic_set(&mm->mm_count, 1);
+		atomic_set(&mm->mm_users, 2);
+
+		PROC_LOCK(proc);
+		for (;;) {
+			if (atomic_cmpset_ptr((volatile uintptr_t *)&proc->p_lkpi_mm, 0, (uintptr_t)mm)) {
+				/* set mm_struct pointer */
+				ts->mm = mm;
+				/* macOS port: remember the Mach task, for driver workers that copy to this process */
+				nmx_xnu_mm_note_task(mm);
+				/* clear pointer to not free memory */
+				mm = NULL;
+				break;
+			}
+			/* another thread of this process published one first: share it */
+			mm_other = find_other_mm(proc);
+			if (mm_other != NULL) {
+				ts->mm = mm_other;
+				sx_destroy(&mm->mmap_sem.sx);
+				break;
+			}
+		}
+	} else {
+		ts->mm = mm_other;
+	}
+
+""" + s[j:]
 
 replace_func("linux_mm_dtor(struct mm_struct *mm)\n", r"""
+/*
+ * macOS port: the last reference is gone. No process record points at the mm any more (a record holds a reference
+ * while it does), so there is nothing to clear; the Mach task record goes, and the lock the rwsem allocated.
+ */
 void
 linux_mm_dtor(struct mm_struct *mm)
 {
-	/* macOS port: forget the process's shared mm before it goes */
-	struct proc *p = curthread->td_proc;
-
-	if (p != NULL && p->p_lkpi_mm == mm)
-		p->p_lkpi_mm = NULL;
 	nmx_xnu_mm_forget(mm);
+	sx_destroy(&mm->mmap_sem.sx);
 	uma_zfree(linux_mm_zone, mm);
 }
 """)
@@ -111,6 +160,8 @@ linux_current_init(void *arg __unused)
 	atomic_thread_fence_seq_cst();
 
 	nmx_thread_release_hook = linuxkpi_thread_dtor_hook;
+	nmx_task_release_hook = linuxkpi_task_release_hook;
+	nmx_proc_release_hook = linuxkpi_proc_release_hook;
 	lkpi_alloc_current = linux_alloc_current;
 }
 """)
@@ -125,6 +176,10 @@ linux_current_uninit(void *arg __unused)
 	atomic_thread_fence_seq_cst();
 
 	nmx_threads_release_all(linuxkpi_thread_dtor_hook);
+	/* what is still pending, then the hooks (the records themselves go with the layer) */
+	nmx_proc_reap();
+	nmx_task_release_hook = NULL;
+	nmx_proc_release_hook = NULL;
 
 	uma_zdestroy(linux_current_zone);
 	uma_zdestroy(linux_mm_zone);
@@ -144,6 +199,24 @@ linuxkpi_thread_dtor_hook(struct thread *td)
 
 	td->td_lkpi_task = NULL;
 	put_task_struct(ts);
+}
+
+/* macOS port: a task taken from a recycled thread record (nmx_proc_reap) */
+static void
+linuxkpi_task_release_hook(struct task_struct *ts)
+{
+	put_task_struct(ts);
+}
+
+/* macOS port: a retired process record gives up its mm reference (nmx_proc_reap) */
+static void
+linuxkpi_proc_release_hook(struct proc *p)
+{
+	struct mm_struct *mm;
+
+	mm = (struct mm_struct *)atomic_readandclear_ptr((volatile uintptr_t *)&p->p_lkpi_mm);
+	if (mm != NULL)
+		mmput(mm);
 }
 """)
 replace_once("static eventhandler_tag linuxkpi_thread_dtor_tag;\n", "")

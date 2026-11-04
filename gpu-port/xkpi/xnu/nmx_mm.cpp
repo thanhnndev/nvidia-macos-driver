@@ -5,7 +5,9 @@
  * space. xnu has no such borrowing for a kext, so the port remembers each mm's Mach task (recorded on the process's
  * own thread when the mm is created) and copies through an IOMemoryDescriptor over the user range in that task,
  * which wires the pages for the duration of the copy. When the caller is already that process, plain copyin/copyout
- * is used.
+ * is used. The record holds a reference on the task until the mm is freed (an mm can outlive its process: a userptr
+ * BO keeps the task_struct and so the mm), and each use takes its own under the lock, so a task that exited is never
+ * used after xnu freed it.
  */
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
@@ -32,12 +34,19 @@ IOLock *lock()
     return gLock;
 }
 
-task_t find(void *mm)
+/* the mm's task with a reference the caller drops (task_deallocate), or null */
+task_t find_ref(void *mm)
 {
+    task_t task = nullptr;
+    IOLockLock(lock());
     for (MmTask *e = gList; e != nullptr; e = e->next)
-        if (e->mm == mm)
-            return e->task;
-    return nullptr;
+        if (e->mm == mm) {
+            task = e->task;
+            task_reference(task);
+            break;
+        }
+    IOLockUnlock(gLock);
+    return task;
 }
 }
 
@@ -48,6 +57,7 @@ extern "C" void nmx_xnu_mm_note_task(void *mm)
         return;     /* the copy helpers then report EFAULT for this process: nothing is written blindly */
     e->mm = mm;
     e->task = current_task();
+    task_reference(e->task);
     IOLockLock(lock());
     e->next = gList;
     gList = e;
@@ -62,6 +72,7 @@ extern "C" void nmx_xnu_mm_forget(void *mm)
             MmTask *e = *pp;
             *pp = e->next;
             IOLockUnlock(gLock);
+            task_deallocate(e->task);
             IODelete(e, MmTask, 1);
             return;
         }
@@ -73,17 +84,18 @@ extern "C" int nmx_xnu_mm_copy(void *mm, uint64_t uaddr, void *kbuf, size_t len,
 {
     if (len == 0)
         return 0;
-    IOLockLock(lock());
-    task_t task = find(mm);
-    IOLockUnlock(gLock);
+    task_t task = find_ref(mm);
     if (task == nullptr)
         return EFAULT;
 
-    if (task == current_task())
+    if (task == current_task()) {
+        task_deallocate(task);
         return to_user ? copyout(kbuf, (user_addr_t)uaddr, len) : copyin((user_addr_t)uaddr, kbuf, len);
+    }
 
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, len,
                                                                   kIODirectionOutIn, task);
+    task_deallocate(task);
     if (md == nullptr)
         return ENOMEM;
     if (md->prepare() != kIOReturnSuccess) {
@@ -105,15 +117,16 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         return EINVAL;
     task_t task = current_task();
     if (mm != nullptr) {
-        IOLockLock(lock());
-        task = find(mm);
-        IOLockUnlock(gLock);
+        task = find_ref(mm);
         if (task == nullptr)
             return EFAULT;
     }
-    /* the device writes the pages when the mapping is writable (kIODirectionIn), and always reads them */
+    /* the device writes the pages when the mapping is writable (kIODirectionIn), and always reads them; the BO that
+     * keeps this wiring keeps the mm, whose record keeps the task */
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE,
                                                                   write ? kIODirectionOutIn : kIODirectionOut, task);
+    if (mm != nullptr)
+        task_deallocate(task);
     if (md == nullptr)
         return ENOMEM;
     if (md->prepare() != kIOReturnSuccess) {
