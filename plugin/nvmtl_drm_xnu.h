@@ -369,10 +369,12 @@ extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
 static void nvmtl_drmx_install(const void *driver)
 {
     /* WindowServer is sandboxed too, but its profile lets it open the node: arm only where the sandbox refuses the
-       render node itself (App Sandbox, browser GPU processes). There the real calls are not tried first, so the
-       process does not file a sandbox violation report on every open/stat. */
+       render node itself (App Sandbox, browser GPU processes) or its ioctls (NotificationCenter: read allowed,
+       file-ioctl denied). There the real calls are not tried first, so the process does not file a sandbox
+       violation report on every open/stat/ioctl. */
     if (!nvmtl_drmx_forced()) {
-        if (sandbox_check(getpid(), "file-read-data", 1 /* SANDBOX_FILTER_PATH */, "/dev/dri/renderD128") == 0) return;
+        if (sandbox_check(getpid(), "file-read-data", 1 /* SANDBOX_FILTER_PATH */, "/dev/dri/renderD128") == 0 &&
+            sandbox_check(getpid(), "file-ioctl", 1, "/dev/dri/renderD128") == 0) return;
         g_drmx_force = 1;
     }
     int n = nvmtl_drmx_rebind_image(driver), libs = 0;
