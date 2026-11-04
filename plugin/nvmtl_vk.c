@@ -132,15 +132,6 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
             uint16_t want = nvmtl_gpu_choice();
             if (want && want != v) { nvlog("  NVMTL_GPU asks for %04x: the %04x accelerator does not claim this process", want, v); return v; }
         }
-    if (v && !g_vendor) {
-        if (v != 0x10de && !strcmp(getprogname(), "WindowServer")) {
-            io_service_t nv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
-            if (nv) {
-                IOObjectRelease(nv);
-                nvlog("  WindowServer: the %04x accelerator does not claim this process -- the NVIDIA display's accelerator must", v);
-                return v;
-            }
-        }
         g_vendor = v;
     }
     return v;
