@@ -368,7 +368,13 @@ extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
    keep the plain libc imports, so their path stays exactly what it was. */
 static void nvmtl_drmx_install(const void *driver)
 {
-    if (!nvmtl_drmx_forced() && sandbox_check(getpid(), NULL, 0) == 0) return;
+    /* WindowServer is sandboxed too, but its profile lets it open the node: arm only where the sandbox refuses the
+       render node itself (App Sandbox, browser GPU processes). There the real calls are not tried first, so the
+       process does not file a sandbox violation report on every open/stat. */
+    if (!nvmtl_drmx_forced()) {
+        if (sandbox_check(getpid(), "file-read-data", 1 /* SANDBOX_FILTER_PATH */, "/dev/dri/renderD128") == 0) return;
+        g_drmx_force = 1;
+    }
     int n = nvmtl_drmx_rebind_image(driver), libs = 0;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
@@ -378,7 +384,7 @@ static void nvmtl_drmx_install(const void *driver)
         int r = nvmtl_drmx_rebind_image((const void *)_dyld_get_image_header(i));
         if (r > 0) { n += r; libs++; }
     }
-    nvlog("drm-xnu: sandbox-safe DRM path armed (%d imports in the driver and %d libdrm images%s)", n, libs,
-          nvmtl_drmx_forced() ? ", forced by NVMTL_DRM_XNU=1" : "; used only where /dev/dri is refused");
+    nvlog("drm-xnu: sandbox-safe DRM path armed (%d imports in the driver and %d libdrm images; %s)", n, libs,
+          getenv("NVMTL_DRM_XNU") ? "forced by NVMTL_DRM_XNU=1" : "this process's sandbox refuses /dev/dri");
 }
 #endif
