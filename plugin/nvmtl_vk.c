@@ -76,19 +76,62 @@ static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
     IOObjectRelease(pci);
     return v;
 }
+/* NMXAccel drives the panel itself (its display pipe is armed and it is not headless): WindowServer composites there */
+static int nvmtl_nmx_owns_display(void)
+{
+    int hv = 1, armed = 0; size_t hn = sizeof hv, an = sizeof armed;
+    return sysctlbyname("debug.nmxaccel_headless", &hv, &hn, NULL, 0) == 0 && hv == 0 &&
+           sysctlbyname("debug.nmxaccel_armed", &armed, &an, NULL, 0) == 0 && armed;
+}
+/* NVMTL_GPU=amd|intel|nvidia picks the GPU for this process (apps; tests); 0 = no choice made */
+static uint16_t nvmtl_gpu_choice(void)
+{
+    const char *g = getenv("NVMTL_GPU");
+    if (!g || !*g) return 0;
+    if (!strcasecmp(g, "amd")) return 0x1002;
+    if (!strcasecmp(g, "intel")) return 0x8086;
+    if (!strcasecmp(g, "nvidia")) return 0x10de;
+    return 0;
+}
+static uint16_t nvmtl_nmx_vendor(void)
+{
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
+    uint16_t v = s ? nvmtl_pci_vendor_of(s) : 0;
+    if (s) IOObjectRelease(s);
+    return (v == 0x1002 || v == 0x8086) ? v : 0;
+}
 /* the vendor of the accelerator a Metal device was made on (0 if the port is neither of ours); the first one wins */
 uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
 {
     uint16_t v = 0;
     if (accel && IOObjectConformsTo(accel, "NMXAccel")) { v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0; }
     else if (accel && IOObjectConformsTo(accel, "NVAccel")) v = 0x10de;
-    /* WindowServer asks each display's accelerator in turn and the AMD panel comes first (it is the built-in
-       framebuffer). Letting 0x1002 claim the process made every later request, including the NVIDIA display's
-       accelerator, fail the vendor gate in nvmtl_process_is_allowed() and CoreDisplay aborted with "Failed to create
-       MetalDevice (null)" about 8 s later, then respawned every 10 s. The compositor's device must be the NVIDIA one:
-       its display is a real IOFramebuffer, and NVK reaches the GPU over IOKit, which the WindowServer sandbox allows.
-       The AMD panel does not need a Metal device in that process -- it presents through its display pipe. Apps are
-       untouched: only WindowServer defers, and only when an NVAccel exists to take the claim. */
+    /* WindowServer asks each display's accelerator in turn. The compositor's device belongs to the GPU that drives the
+       panel. When NMXAccel's display pipe is armed (the 890M owns the OLED), that is the AMD accelerator, and a
+       headless NVAccel (NVIDIA 2.7.1 publishes one even without a display) must not take the claim: 2026-11-04 Step102
+       boot, WindowServer ran on the RTX and copied every frame out through system memory (desktop lag, WS ~90 % CPU).
+       Without an armed NMX pipe the old rule stays: the NVIDIA display's accelerator claims WindowServer (its display
+       is a real IOFramebuffer; letting 0x1002 claim first made CoreDisplay abort "Failed to create MetalDevice").
+       Apps: NVMTL_GPU picks the vendor; otherwise the first accelerator asked wins. */
+    if (v && !g_vendor) {
+        if (!strcmp(getprogname(), "WindowServer")) {
+            if (nvmtl_nmx_owns_display()) {
+                if (v == 0x10de) {
+                    nvlog("  WindowServer: the panel is on NMXAccel's display pipe -- the headless NVIDIA accelerator does not claim this process");
+                    return v;
+                }
+            } else if (v != 0x10de) {
+                io_service_t nv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+                if (nv) {
+                    IOObjectRelease(nv);
+                    nvlog("  WindowServer: the %04x accelerator does not claim this process -- the NVIDIA display's accelerator must", v);
+                    return v;
+                }
+            }
+        } else {
+            uint16_t want = nvmtl_gpu_choice();
+            if (want && want != v) { nvlog("  NVMTL_GPU asks for %04x: the %04x accelerator does not claim this process", want, v); return v; }
+        }
     if (v && !g_vendor) {
         if (v != 0x10de && !strcmp(getprogname(), "WindowServer")) {
             io_service_t nv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
@@ -106,6 +149,13 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
 uint16_t nvmtl_vk_vendor(void)
 {
     if (g_vendor) return g_vendor;
+    if (!strcmp(getprogname(), "WindowServer") && nvmtl_nmx_owns_display()) {
+        uint16_t v = nvmtl_nmx_vendor();
+        if (v) { g_vendor = v; return g_vendor; }
+    }
+    { uint16_t want = nvmtl_gpu_choice();
+      if (want == 0x10de) { g_vendor = want; return g_vendor; }
+      if (want) { uint16_t v = nvmtl_nmx_vendor(); if (v == want) { g_vendor = v; return g_vendor; } } }
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
     if (s) { IOObjectRelease(s); g_vendor = 0x10de; return g_vendor; }
     s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
