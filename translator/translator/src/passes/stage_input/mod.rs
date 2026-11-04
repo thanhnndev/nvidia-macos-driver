@@ -956,7 +956,10 @@ pub(super) fn build_stage_input(
                 Some(KernRole::Buffer(index)) => Some(*index),
                 _ => None,
             });
-            let raw = (layout_ty.is_none() && is_raw_workgroup_array(&defs, pointee))
+            // A raw word view (uint array) from the emitter wins over the AIR layout: the body indexes it in
+            // 32-bit words, and the param is only spliced for the variable, so a layout-typed variable would
+            // retype those word chains to whole layout elements (Dawn helper with a branch-guarded access).
+            let raw = is_raw_workgroup_array(&defs, pointee)
                 .then(|| array_type(&defs, pointee))
                 .flatten();
             let (element_ty, default_elements) = match raw {
