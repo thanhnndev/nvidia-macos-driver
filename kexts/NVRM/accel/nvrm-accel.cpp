@@ -37,6 +37,10 @@ void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource
 bool                      nvAccelResHasContent(IOAccelResource2 *res);
 static void               nvAccelWriteStamp(int index, unsigned int value);
 #ifdef NMX_ACCEL
+extern "C" IOReturn nmx_drm_new_client(IOService *provider, task_t owningTask, void *securityID, UInt32 type,
+                                       IOUserClient **handler);   // nmx/nmx_drm_uc.cpp
+#endif
+#ifdef NMX_ACCEL
 #define NV_LOG_TAG "NMXAccel: "
 #else
 #define NV_LOG_TAG "NVAccel: "
@@ -630,6 +634,14 @@ public:
     IOService *fNVRM = nullptr;
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
                            IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+#ifdef NMX_ACCEL
+        // 'NMDR': the DRM render node through IOKit, for processes whose sandbox refuses /dev/dri (nmx/nmx_drm_uc.cpp)
+        if (type == 0x4E4D4452u) {
+            IOReturn dr = nmx_drm_new_client(this, owningTask, securityID, type, handler);
+            if (dr != kIOReturnSuccess) ALOG("newUserClient(NMDR): DRM client refused (0x%x)", (unsigned)dr);
+            return dr;
+        }
+#endif
         if ((type & 0xFFFF0000u) != 0x4E560000u) {
             IOReturn fr = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
             if (fUcLogged < 40) { fUcLogged++;
