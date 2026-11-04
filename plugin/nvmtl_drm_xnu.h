@@ -52,6 +52,9 @@ static int nvmtl_drmx_forced(void)
     if (g_drmx_force < 0) { const char *e = getenv("NVMTL_DRM_XNU"); g_drmx_force = (e && *e == '1') ? 1 : 0; }
     return g_drmx_force;
 }
+static int g_drmx_trace = -1;
+#define DRMX_TRACE(...) do { if (g_drmx_trace < 0) g_drmx_trace = getenv("NVMTL_DRM_XNU_TRACE") ? 1 : 0; \
+                             if (g_drmx_trace) nvlog("drm-xnu trace: " __VA_ARGS__); } while (0)
 static int nvmtl_drmx_refused(int err) { return err == EPERM || err == EACCES; }
 
 /* "/dev/dri/renderD128" -> 128, "/dev/dri/card0" -> 0; -1 for any other path */
@@ -59,12 +62,16 @@ static int nvmtl_drmx_node(const char *path)
 {
     if (!path || strncmp(path, "/dev/dri/", 9)) return -1;
     const char *n = path + 9, *d;
-    if (!strncmp(n, "renderD", 7)) d = n + 7;
-    else if (!strncmp(n, "card", 4)) d = n + 4;
+    int render;
+    if (!strncmp(n, "renderD", 7)) { d = n + 7; render = 1; }
+    else if (!strncmp(n, "card", 4)) { d = n + 4; render = 0; }
     else return -1;
     if (!*d) return -1;
     int v = 0;
     for (; *d; d++) { if (*d < '0' || *d > '9') return -1; v = v * 10 + (*d - '0'); if (v > 255) return -1; }
+    /* DRM minors: card0..63 primary, renderD128..191 render. libdrm on macOS names a node from its minor and asks
+       access("/dev/dri/card<minor>") to tell primary from render, so a wrong pairing must not look like a node */
+    if (render ? (v < 128 || v > 191) : v > 63) return -1;
     return v;
 }
 
@@ -173,6 +180,7 @@ static int nvmtl_drmx_w_ioctl(int fd, unsigned long cmd, ...)
     va_list ap; va_start(ap, cmd); void *arg = va_arg(ap, void *); va_end(ap);
     struct nvmtl_drmx_file *f = nvmtl_drmx_get(fd);
     if (!f) return ioctl(fd, cmd, arg);
+    DRMX_TRACE("ioctl fd %d cmd 0x%lx", fd, cmd);
     size_t len = (cmd & (IOC_IN | IOC_OUT)) ? IOCPARM_LEN(cmd) : 0;
     uint64_t in = (uint64_t)cmd, err = 0; uint32_t n = 1; size_t outlen = len;
     kern_return_t kr = IOConnectCallMethod(f->conn, NVMTL_DRMX_SEL_IOCTL, &in, 1, len ? arg : NULL, len, &err, &n,
@@ -182,7 +190,7 @@ static int nvmtl_drmx_w_ioctl(int fd, unsigned long cmd, ...)
         if (g_drmx_logged++ < 16) nvlog("drm-xnu: ioctl 0x%lx (%zu bytes) transport 0x%08x", cmd, len, kr);
         errno = EIO; return -1;
     }
-    if (err) { errno = (int)err; return -1; }
+    if (err) { DRMX_TRACE("ioctl fd %d cmd 0x%lx -> errno %llu", fd, cmd, (unsigned long long)err); errno = (int)err; return -1; }
     return 0;
 }
 
@@ -202,7 +210,7 @@ static int nvmtl_drmx_w_close(int fd)
         f = g_drmx_fd[fd]; g_drmx_fd[fd] = NULL;
         pthread_mutex_unlock(&g_drmx_lock);
     }
-    if (f) nvmtl_drmx_drop(f);
+    if (f) { DRMX_TRACE("close fd %d", fd); nvmtl_drmx_drop(f); }
     return close(fd);
 }
 
@@ -229,6 +237,7 @@ static int nvmtl_drmx_w_fcntl(int fd, int cmd, ...)
     va_list ap; va_start(ap, cmd); long arg = va_arg(ap, long); va_end(ap);
     struct nvmtl_drmx_file *f = (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) ? nvmtl_drmx_get(fd) : NULL;
     int r = fcntl(fd, cmd, arg);
+    if (f) DRMX_TRACE("fcntl dup fd %d -> %d", fd, r);
     return f ? nvmtl_drmx_share(f, r) : r;
 }
 
@@ -237,13 +246,14 @@ static int nvmtl_drmx_w_fstat(int fd, struct stat *st)
     struct nvmtl_drmx_file *f = nvmtl_drmx_get(fd);
     if (!f) return fstat(fd, st);
     nvmtl_drmx_fake_stat(st, f->major, f->minor);
+    DRMX_TRACE("fstat fd %d -> chr %d,0x%x", fd, f->major, f->minor);
     return 0;
 }
 
 static int nvmtl_drmx_w_stat(const char *path, struct stat *st)
 {
     int node = nvmtl_drmx_node(path);
-    if (node < 0) return stat(path, st);
+    if (node < 128) return stat(path, st);
     if (!nvmtl_drmx_forced()) {
         int r = stat(path, st);
         if (r == 0 || !nvmtl_drmx_refused(errno)) return r;
@@ -251,13 +261,14 @@ static int nvmtl_drmx_w_stat(const char *path, struct stat *st)
     int maj = nvmtl_drmx_node_major(node);
     if (maj < 0) { errno = EACCES; return -1; }
     nvmtl_drmx_fake_stat(st, maj, node);
+    DRMX_TRACE("stat %s -> chr %d,0x%x", path, maj, node);
     return 0;
 }
 
 static int nvmtl_drmx_w_access(const char *path, int mode)
 {
     int node = nvmtl_drmx_node(path);
-    if (node < 0) return access(path, mode);
+    if (node < 128) return access(path, mode);
     if (!nvmtl_drmx_forced()) {
         int r = access(path, mode);
         if (r == 0 || !nvmtl_drmx_refused(errno)) return r;
@@ -303,7 +314,8 @@ static DIR *nvmtl_drmx_w_opendir(const char *path)
 
 static struct dirent *nvmtl_drmx_w_readdir(DIR *d)
 {
-    if (!nvmtl_drmx_is_fake_dir(d)) return readdir(d);
+    if (!nvmtl_drmx_is_fake_dir(d)) { struct dirent *e = readdir(d); return e; }
+    DRMX_TRACE("readdir (fake /dev/dri)");
     struct nvmtl_drmx_dir *fd = (struct nvmtl_drmx_dir *)d;
     if (fd->pos++ != 0) return NULL;
     memset(&fd->ent, 0, sizeof(fd->ent));
