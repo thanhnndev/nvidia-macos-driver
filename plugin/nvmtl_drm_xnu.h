@@ -16,6 +16,9 @@
  *   ioctl     on such a descriptor -> the connection's ioctl selector (same command numbers, same argument bytes)
  *   close, dup, fcntl(F_DUPFD*) keep a reference count per DRM file; fstat/stat answer a character device with the
  *             node's real device number; opendir/readdir of a refused /dev/dri list the render node
+ * The WebKit GPU process profile also refuses reading /dev/null, pipe(2), fcntl(F_DUPFD/F_DUPFD_CLOEXEC) and the
+ * page-size sysctl: the handle falls back to /dev/random (readable there), a refused F_DUPFD* becomes dup(2)
+ * (+ F_SETFD), and getpagesize/sysconf(_SC_PAGESIZE) answer vm_page_size (docs/890M-ROADMAP.md, "Safari WebGL").
  * A process whose sandbox lets it open the node (WindowServer, Terminal, tools) never takes this path: every wrapper
  * tries the real call first and only steps in when it fails with EPERM/EACCES. NVMTL_DRM_XNU=1 forces it (tests).
  */
@@ -95,10 +98,13 @@ static io_connect_t nvmtl_drmx_connect(void)
     return conn;
 }
 
-/* a read-only descriptor every sandbox allows: /dev/null, else the read end of a closed pipe */
+/* a read-only descriptor the sandbox allows: /dev/null, /dev/random (the WebKit GPU process refuses /dev/null but
+   reads /dev/random), else the read end of a closed pipe */
 static int nvmtl_drmx_handle_fd(void)
 {
     int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) return fd;
+    fd = open("/dev/random", O_RDONLY | O_CLOEXEC);
     if (fd >= 0) return fd;
     int ends[2];
     if (pipe(ends)) return -1;
@@ -235,8 +241,17 @@ static int nvmtl_drmx_w_dup(int fd)
 static int nvmtl_drmx_w_fcntl(int fd, int cmd, ...)
 {
     va_list ap; va_start(ap, cmd); long arg = va_arg(ap, long); va_end(ap);
-    struct nvmtl_drmx_file *f = (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) ? nvmtl_drmx_get(fd) : NULL;
+    int is_dup = cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC;
+    struct nvmtl_drmx_file *f = is_dup ? nvmtl_drmx_get(fd) : NULL;
     int r = fcntl(fd, cmd, arg);
+    if (r < 0 && is_dup && nvmtl_drmx_refused(errno)) {
+        /* the sandbox refuses the F_DUPFD* command (WebKit GPU process); dup(2) and F_SETFD are allowed. dup takes the
+           lowest free number, which can be below `arg`: callers here (RADV os_dupfd_cloexec, arg 3) only need >= 3,
+           and 0..2 are always taken. */
+        r = dup(fd);
+        if (r >= 0 && cmd == F_DUPFD_CLOEXEC) fcntl(r, F_SETFD, FD_CLOEXEC);
+        DRMX_TRACE("fcntl F_DUPFD%s refused: dup fd %d -> %d", cmd == F_DUPFD_CLOEXEC ? "_CLOEXEC" : "", fd, r);
+    }
     if (f) DRMX_TRACE("fcntl dup fd %d -> %d", fd, r);
     return f ? nvmtl_drmx_share(f, r) : r;
 }
@@ -337,6 +352,8 @@ static int nvmtl_drmx_w_closedir(DIR *d)
     return 0;
 }
 
+static int nvmtl_drmx_w_getpagesize(void) { return (int)nvmtl_page_size(); }
+
 /* Point the node-touching libc imports of one image at the wrappers; returns how many pointers changed. */
 static int nvmtl_drmx_rebind_image(const void *inside)
 {
@@ -352,6 +369,8 @@ static int nvmtl_drmx_rebind_image(const void *inside)
         { "_opendir$INODE64", (void *)nvmtl_drmx_w_opendir },
         { "_readdir$INODE64", (void *)nvmtl_drmx_w_readdir },
         { "_closedir", (void *)nvmtl_drmx_w_closedir },
+        { "_getpagesize", (void *)nvmtl_drmx_w_getpagesize },
+        { "_sysconf", (void *)nvmtl_sysconf },
     };
     int total = 0;
     for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {

@@ -307,16 +307,20 @@ static PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr; static PFN_vkCreateInst
 // sysconf(_SC_PHYS_PAGES) returns -1 there; NVK then fails "Failed to query total system memory", the device never comes
 // up and the app has no Metal device (measured 10-12: Chrome on an RTX 5060 had no WebGL with its GPU sandbox on, and
 // WebGL on the GPU with it off). The kernel's host_info answers the same number through a Mach call sandboxes allow.
+// The WebKit GPU process may not read sysctl hw.pagesize_compat either (not on its sysctl list), so getpagesize() and
+// sysconf(_SC_PAGESIZE) fail there. vm_page_size is libsystem_kernel's copy from the commpage: no syscall, same value.
+static long nvmtl_page_size(void) { return (long)vm_page_size; }
 #include "nvmtl_fd_token.h"
 static long nvmtl_sysconf(int name)
 {
     long v = sysconf(name);
+    if (v <= 0 && (name == _SC_PAGESIZE || name == _SC_PAGE_SIZE)) return nvmtl_page_size();
     if (v > 0 || name != _SC_PHYS_PAGES) return v;
     static mach_port_t host;
     if (!host) host = mach_host_self();
     host_basic_info_data_t hi; mach_msg_type_number_t n = HOST_BASIC_INFO_COUNT;
     if (host_info(host, HOST_BASIC_INFO, (host_info_t)&hi, &n) != KERN_SUCCESS || !hi.max_mem) return v;
-    long page = getpagesize();
+    long page = nvmtl_page_size();
     return page > 0 ? (long)(hi.max_mem / (uint64_t)page) : v;
 }
 // Point one imported symbol of the image that holds `inside` at `repl` (its lazy and non-lazy pointers). Returns how
@@ -363,11 +367,12 @@ static int nvmtl_rebind_import(const void *inside, const char *symbol, void *rep
                 if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL || (si & INDIRECT_SYMBOL_ABS) || si >= st->nsyms) continue;
                 if (syms[si].n_un.n_strx >= st->strsize) continue;
                 if (strcmp(strs + syms[si].n_un.n_strx, symbol)) continue;
-                vm_address_t page = (vm_address_t)&slots[e] & ~(vm_address_t)(getpagesize() - 1);
+                const vm_size_t psz = (vm_size_t)nvmtl_page_size();   // not getpagesize(): see nvmtl_page_size
+                vm_address_t page = (vm_address_t)&slots[e] & ~(vm_address_t)(psz - 1);
                 // __DATA_CONST is read-only after binding: open the one page, write, close it again
-                if (vm_protect(mach_task_self(), page, getpagesize(), 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) continue;
+                if (vm_protect(mach_task_self(), page, psz, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) continue;
                 slots[e] = repl;
-                if (!strcmp(sg->segname, "__DATA_CONST")) vm_protect(mach_task_self(), page, getpagesize(), 0, VM_PROT_READ);
+                if (!strcmp(sg->segname, "__DATA_CONST")) vm_protect(mach_task_self(), page, psz, 0, VM_PROT_READ);
                 changed++;
             }
         }
