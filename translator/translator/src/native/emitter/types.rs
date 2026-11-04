@@ -500,7 +500,7 @@ impl Emitter {
                     .global_values
                     .get(name)
                     .cloned()
-                    .ok_or_else(|| format!("native emitter: unknown global value {name}"))?;
+                    .ok_or_else(|| crate::linked_functions::unknown_global_error(name))?;
                 Ok(id)
             }
             LlValue::Gep(_) => Err(

@@ -3385,3 +3385,39 @@ pub fn rewrite_runtime_table_lookups(
     }
     Ok(result)
 }
+
+/// The error for a global the emitter cannot resolve. A visible function no linked function supplied is
+/// renamed to `<symbol>.MTL_UNRESOLVED_VISIBLE_FN`; when such a stub is used as a value (passed as a
+/// function pointer to a helper, as RenderBox's `sample_custom` takes `custom_fn`) rather than called, it
+/// reaches the emitter as a global it has no id for. Naming it as a visible function reference lets the
+/// caller see that the module needs linking (the pipeline's linked functions supply it) instead of a bare
+/// "unknown global value" about our own rename.
+pub(crate) fn unknown_global_error(name: &str) -> String {
+    let bare = name.trim_start_matches('@').trim_matches('"');
+    match bare.strip_suffix(UNRESOLVED_VISIBLE_SUFFIX) {
+        Some(symbol) => format!(
+            "native emitter: visible function reference {symbol:?} is used on a live path but no linked function supplies it"
+        ),
+        None => format!("native emitter: unknown global value {name}"),
+    }
+}
+
+#[cfg(test)]
+mod unknown_global_error_tests {
+    use super::*;
+
+    #[test]
+    fn an_unresolved_visible_stub_reads_as_a_visible_function_reference() {
+        let e = unknown_global_error("@custom_fn.MTL_UNRESOLVED_VISIBLE_FN");
+        assert!(e.contains("visible function reference \"custom_fn\""), "{e}");
+        assert!(e.contains("no linked function supplies it"), "{e}");
+    }
+
+    #[test]
+    fn any_other_global_keeps_the_plain_message() {
+        assert_eq!(
+            unknown_global_error("@g"),
+            "native emitter: unknown global value @g"
+        );
+    }
+}

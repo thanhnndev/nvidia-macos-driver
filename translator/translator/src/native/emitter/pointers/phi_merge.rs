@@ -467,7 +467,7 @@ impl Emitter {
                         LlType::Ptr(_) => None,
                         other => Some(other.clone()),
                     })
-                    .ok_or_else(|| format!("native emitter: unknown global value {name}"))
+                    .ok_or_else(|| crate::linked_functions::unknown_global_error(name))
             }
             LlValue::Gep(gep) => Ok(Some(gep_pointee(
                 &self.resolve_type(&gep.source_ty)?,

@@ -1716,7 +1716,7 @@ impl Emitter {
             .strip_suffix(crate::linked_functions::UNRESOLVED_VISIBLE_SUFFIX)
         {
             return Err(format!(
-                "native emitter: visible function {symbol:?} is called on a live path but no linked function supplies it"
+                "native emitter: visible function reference {symbol:?} is called on a live path but no linked function supplies it"
             ));
         }
         let callee = *self
@@ -1790,7 +1790,7 @@ impl Emitter {
             .strip_suffix(crate::linked_functions::UNRESOLVED_VISIBLE_SUFFIX)
         {
             return Err(format!(
-                "native emitter: visible function {symbol:?} is called on a live path but no linked function supplies it"
+                "native emitter: visible function reference {symbol:?} is called on a live path but no linked function supplies it"
             ));
         }
         let callee = *self
