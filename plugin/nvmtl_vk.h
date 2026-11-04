@@ -69,6 +69,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  /* the last framebuffer fetch set made in this command buffer and what it points at: a draw whose pass
                     and mask are the same reuses it (Core Animation draws hundreds of fetch draws per pass) */
                  void *fetch_last_set; uint32_t fetch_last_mask; void *fetch_last_view[NVMTL_NCOL];
+                 void **btsh; unsigned nbtsh, capbtsh;
                  unsigned direct_sass;   /* recorded a dispatch of compiled machine code: never reuse this pool */
                  void *occlusion_pages; uint32_t occlusion_count;
                  void *timing_pool; nvmtl_gpu_interval timing;

@@ -1012,6 +1012,7 @@ static int nvmtl_vk_initialize(void)
                    if (!p_pstat_props || !p_pstat_stats) g_pstat = 0;
                    nvlog("pstat: per-pipeline compile statistics %s", g_pstat ? "ON (NVMTL_PSTAT=1)" : "unavailable"); }
     { extern void nvmtl_bl_hook_destroy(void); nvmtl_bl_hook_destroy(); }
+    { extern void nvmtl_btsh_hook(void); nvmtl_btsh_hook(); }
     if (g_sample_locations) {
         pvkCmdSetSampleLocationsEXT = (PFN_vkCmdSetSampleLocationsEXT)pvkGetDeviceProcAddr(g_dev, "vkCmdSetSampleLocationsEXT");
         if (!pvkCmdSetSampleLocationsEXT) g_sample_locations = 0;
@@ -2499,6 +2500,138 @@ void nvmtl_vk_bindless_drop(uint32_t slot)
     pthread_mutex_unlock(&g_heap_lock);
 }
 
+
+/*
+ * Buffer textures at a row pitch RADV cannot alias. GFX11 linear images need a row pitch that is a multiple of 256 B
+ * (ac_surface_get_pitch_align is 256/bpe texels), so vkCreateImage with the app's explicit DRM linear layout returns
+ * VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT for any other bytesPerRow. Apple's own code makes such textures
+ * (RenderBox: RGBA16F 131 px wide, 1048 B per row) and they came back nil. Those textures now get a shadow: an image of
+ * the same format and tiling at the next 256 B pitch, with its own memory, and a VkBuffer over that memory. A command
+ * buffer that uses the texture (a sampled or storage binding, a colour attachment, a blit) copies the app's rows into
+ * the shadow in the pre-submit prologue, and, for a texture the GPU may write, copies them back at the end of the same
+ * command buffer, so the app's buffer stays the texture's storage as Metal defines it. Shadows are found by VkImage and
+ * by every VkImageView made of them (vkCreateImageView/vkDestroyImageView/vkDestroyImage are wrapped). Not covered: a
+ * texture reached only through an argument buffer, and a buffer write and a texture read of the same rows inside one
+ * command buffer. NVMTL_NO_BUFTEX_SHADOW=1 refuses these textures as before.
+ */
+typedef struct nvmtl_btsh {
+    _Atomic int ref; VkImage img; VkBuffer src; size_t soff, spitch; VkBuffer sh; VkDeviceMemory mem; uint32_t sysmem;
+    size_t apitch; uint32_t rowbytes, h; int writable;
+} nvmtl_btsh;
+typedef struct { const void *key; nvmtl_btsh *s; } nvmtl_btsh_ent;
+static pthread_mutex_t g_btsh_lock = PTHREAD_MUTEX_INITIALIZER;
+static nvmtl_btsh_ent *g_btsh_ent; static unsigned g_btsh_n, g_btsh_cap;
+static _Atomic unsigned g_btsh_live;
+static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs;
+static int nvmtl_btsh_on(void)
+{
+    static int on = -1;
+    if (on < 0) { on = !getenv("NVMTL_NO_BUFTEX_SHADOW");
+        nvlog("buffer texture: shadow images for unaligned row pitches %s", on ? "ON" : "OFF (NVMTL_NO_BUFTEX_SHADOW)"); }
+    return on;
+}
+static void nvmtl_btsh_release(nvmtl_btsh *s)
+{
+    if (!s || atomic_fetch_sub(&s->ref, 1) != 1) return;
+    if (s->sh) pvkDestroyBuffer(g_dev, s->sh, NULL);
+    if (s->mem) { pvkFreeMemory(g_dev, s->mem, NULL); if (!s->sysmem) g_budget_stale = 1; }
+    free(s); atomic_fetch_sub(&g_btsh_live, 1);
+}
+static nvmtl_btsh *nvmtl_btsh_find_locked(const void *key)
+{
+    for (unsigned i = 0; i < g_btsh_n; i++) if (g_btsh_ent[i].key == key) return g_btsh_ent[i].s;
+    return NULL;
+}
+static int nvmtl_btsh_put_locked(const void *key, nvmtl_btsh *s)
+{
+    if (g_btsh_n == g_btsh_cap) {
+        unsigned nc = g_btsh_cap ? g_btsh_cap * 2 : 64;
+        nvmtl_btsh_ent *ne = realloc(g_btsh_ent, nc * sizeof *ne);
+        if (!ne) return -1;
+        g_btsh_ent = ne; g_btsh_cap = nc;
+    }
+    atomic_fetch_add(&s->ref, 1);
+    g_btsh_ent[g_btsh_n++] = (nvmtl_btsh_ent){ key, s };
+    return 0;
+}
+static nvmtl_btsh *nvmtl_btsh_take_locked(const void *key)
+{
+    for (unsigned i = 0; i < g_btsh_n; i++)
+        if (g_btsh_ent[i].key == key) { nvmtl_btsh *s = g_btsh_ent[i].s; g_btsh_ent[i] = g_btsh_ent[--g_btsh_n]; return s; }
+    return NULL;
+}
+static PFN_vkCreateImageView g_btsh_real_cv; static PFN_vkDestroyImageView g_btsh_real_dv; static PFN_vkDestroyImage g_btsh_real_di;
+static VKAPI_ATTR VkResult VKAPI_CALL nvmtl_btsh_create_view(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a, VkImageView *v)
+{
+    VkResult r = g_btsh_real_cv(d, ci, a, v);
+    if (r == VK_SUCCESS && ci && atomic_load(&g_btsh_live)) {
+        pthread_mutex_lock(&g_btsh_lock);
+        nvmtl_btsh *s = nvmtl_btsh_find_locked((const void *)ci->image);
+        if (s && nvmtl_btsh_put_locked((const void *)*v, s)) nvlog("buffer texture: shadow view %p not recorded (out of memory)", (void *)*v);
+        pthread_mutex_unlock(&g_btsh_lock);
+    }
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL nvmtl_btsh_destroy_view(VkDevice d, VkImageView v, const VkAllocationCallbacks *a)
+{
+    nvmtl_btsh *s = NULL;
+    if (v && atomic_load(&g_btsh_live)) { pthread_mutex_lock(&g_btsh_lock); s = nvmtl_btsh_take_locked((const void *)v); pthread_mutex_unlock(&g_btsh_lock); }
+    g_btsh_real_dv(d, v, a);
+    nvmtl_btsh_release(s);
+}
+static VKAPI_ATTR void VKAPI_CALL nvmtl_btsh_destroy_image(VkDevice d, VkImage im, const VkAllocationCallbacks *a)
+{
+    nvmtl_btsh *s = NULL;
+    if (im && atomic_load(&g_btsh_live)) { pthread_mutex_lock(&g_btsh_lock); s = nvmtl_btsh_take_locked((const void *)im); pthread_mutex_unlock(&g_btsh_lock); }
+    g_btsh_real_di(d, im, a);
+    nvmtl_btsh_release(s);
+}
+void nvmtl_btsh_hook(void)
+{
+    if (g_btsh_real_cv || !pvkCreateImageView || !pvkDestroyImageView || !pvkDestroyImage) return;
+    g_btsh_real_cv = pvkCreateImageView; pvkCreateImageView = nvmtl_btsh_create_view;
+    g_btsh_real_dv = pvkDestroyImageView; pvkDestroyImageView = nvmtl_btsh_destroy_view;
+    g_btsh_real_di = pvkDestroyImage; pvkDestroyImage = nvmtl_btsh_destroy_image;
+}
+/* The command buffer keeps a reference to every shadow it uses until it retires. */
+static void nvmtl_btsh_note(nvk_cmdbuf *c, const void *key)
+{
+    if (!c || !key || !atomic_load(&g_btsh_live)) return;
+    pthread_mutex_lock(&g_btsh_lock);
+    nvmtl_btsh *s = nvmtl_btsh_find_locked(key);
+    if (s) {
+        unsigned i = 0;
+        while (i < c->nbtsh && c->btsh[i] != s) i++;
+        if (i == c->nbtsh) {
+            if (c->nbtsh == c->capbtsh) {
+                unsigned nc = c->capbtsh ? c->capbtsh * 2 : 8;
+                void **nb = realloc(c->btsh, nc * sizeof *nb);
+                if (nb) { c->btsh = nb; c->capbtsh = nc; }
+            }
+            if (c->nbtsh < c->capbtsh) { atomic_fetch_add(&s->ref, 1); c->btsh[c->nbtsh++] = s; }
+            else nvlog("buffer texture: shadow %p not tracked by command buffer (out of memory) - its rows go stale", (void *)s);
+        }
+    }
+    pthread_mutex_unlock(&g_btsh_lock);
+}
+static void nvmtl_btsh_note_img(nvk_cmdbuf *c, const nvk_image *img) { if (img) nvmtl_btsh_note(c, img->img); }
+static void nvmtl_btsh_retire(nvk_cmdbuf *c)
+{
+    for (unsigned i = 0; i < c->nbtsh; i++) nvmtl_btsh_release((nvmtl_btsh *)c->btsh[i]);
+    free(c->btsh); c->btsh = NULL; c->nbtsh = c->capbtsh = 0;
+}
+static void nvmtl_btsh_rows(VkCommandBuffer cb, const nvmtl_btsh *s, int in)
+{
+    VkBufferCopy stackr[64]; VkBufferCopy *r = s->h <= 64 ? stackr : malloc(sizeof *r * s->h);
+    if (!r) { nvlog("buffer texture: shadow copy of %u rows skipped (out of memory)", s->h); return; }
+    for (uint32_t y = 0; y < s->h; y++) {
+        const VkDeviceSize app = s->soff + (VkDeviceSize)y * s->spitch, own = (VkDeviceSize)y * s->apitch;
+        r[y] = in ? (VkBufferCopy){ app, own, s->rowbytes } : (VkBufferCopy){ own, app, s->rowbytes };
+    }
+    pvkCmdCopyBuffer(cb, in ? s->src : s->sh, in ? s->sh : s->src, s->h, r);
+    if (r != stackr) free(r);
+}
+
 int nvmtl_vk_bind_buffer_offset(nvk_cmdbuf *c, uint32_t set, uint32_t index, size_t offset);
 
 static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_t kind, void *h, size_t off)
@@ -2510,6 +2643,7 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
     }
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     nvmtl_slot *sl = &t->s[set][binding];
+    if (kind == NVMTL_SLOT_TEX) nvmtl_btsh_note(c, h);
     if (sl->kind != kind || sl->h != h || sl->off != off) {
         t->dirty[set] = 1;
         t->chg[set][binding >> 6] |= 1ull << (binding & 63);
@@ -4696,6 +4830,7 @@ static void nvmtl_clear_colour(VkClearColorValue *cv, uint32_t fmt, const float 
 static void nvmtl_private_depth_layout(nvk_cmdbuf *, nvk_image *, VkImageLayout);
 int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
 {
+    for (uint32_t i = 0; i < NVMTL_NCOL; i++) { nvmtl_btsh_note_img(c, ps->col[i]); nvmtl_btsh_note_img(c, ps->res[i]); }
     if (!p->rp || !ps->w || !ps->h) { nvlog("begin_render: apps2 no render pass or a %ux%u pass — pass REFUSED", ps->w, ps->h); return -1; }
     nvmtl_sample_pattern pattern = ps->sample_pattern;
     if (!pattern.count && nvmtl_sample_default(p->samples > 1 ? p->samples : 1, &pattern)) return -1;
@@ -5245,6 +5380,7 @@ static void nvmtl_vk_zero_dummies(void)
 
 int nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4])
 {
+    nvmtl_btsh_note_img(c, img);
     VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
         0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -5402,6 +5538,7 @@ void nvmtl_vk_cmd_end_render(nvk_cmdbuf *c) {
 
 static void nvmtl_cmd_retire(nvk_cmdbuf *c)
 {
+    nvmtl_btsh_retire(c);
     nvmtl_counter_retire(c);
     nvmtl_vk_cmd_retire_occlusion(c);
     if (c->timing_pool) {
@@ -5553,6 +5690,47 @@ static void nvmtl_subwho_note(const char *who, uint64_t ns)
         nvlog("vk: submit census over %llu submissions - %s", (unsigned long long)total, line);
     }
 }
+/* Shadowed buffer textures (see nvmtl_btsh): the app's rows go into each shadow the command buffer uses before it runs,
+   and come back from each one it may write after its last command. */
+static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
+{
+    if (!p->begun) {
+        if (nvmtl_vk_cmd_begin(NULL, &p->cb)) { g_pre_fail++; nvlog("buffer texture: shadow upload prologue begin FAILED - %u shadows keep old rows", c->nbtsh); return; }
+        p->begun = 1;
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+        pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    } else if (p->n) {
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+        pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    for (unsigned i = 0; i < c->nbtsh; i++) {
+        const nvmtl_btsh *s = (const nvmtl_btsh *)c->btsh[i];
+        nvmtl_btsh_rows(p->cb.cb, s, 1);
+        p->n++; p->copies++; p->bytes += (unsigned long long)s->rowbytes * s->h;
+    }
+    atomic_fetch_add(&g_btsh_in, c->nbtsh);
+    const unsigned long long k = atomic_fetch_add(&g_btsh_cbs, 1);
+    if (k < 4 || ((k + 1) & 0x3ff) == 0)
+        nvlog("buffer texture: %llu command buffers used shadowed buffer textures (%llu shadows made, %u live; %llu row uploads, %llu writebacks)",
+              k + 1, (unsigned long long)atomic_load(&g_btsh_made), (unsigned)atomic_load(&g_btsh_live),
+              (unsigned long long)atomic_load(&g_btsh_in), (unsigned long long)atomic_load(&g_btsh_out));
+}
+static void nvmtl_btsh_post(nvk_cmdbuf *c)
+{
+    unsigned nw = 0;
+    for (unsigned i = 0; i < c->nbtsh; i++) nw += ((const nvmtl_btsh *)c->btsh[i])->writable != 0;
+    if (!nw) return;
+    VkMemoryBarrier b0 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b0, 0, NULL, 0, NULL);
+    for (unsigned i = 0; i < c->nbtsh; i++) {
+        const nvmtl_btsh *s = (const nvmtl_btsh *)c->btsh[i];
+        if (s->writable) nvmtl_btsh_rows(c->cb, s, 0);
+    }
+    VkMemoryBarrier b1 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b1, 0, NULL, 0, NULL);
+    atomic_fetch_add(&g_btsh_out, nw);
+}
 int nvmtl_vk_submit_wait_at(nvk_cmdbuf *c, const char *who)
 {
     nvmtl_inflight f;
@@ -5568,6 +5746,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     if (c->counter_error || nvmtl_counter_flush(c)) { nvmtl_cmd_retire(c); return -1; }
     VkCommandBuffer counter_reset = VK_NULL_HANDLE;
     if (nvmtl_counter_reset_finish(c, &counter_reset)) { nvmtl_cmd_retire(c); return -1; }
+    if (c->nbtsh && !c->in_rp) nvmtl_btsh_post(c);
     c->timing.clock = nvmtl_clock_snapshot();
     c->timing.host_before_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (c->timing_pool && !c->in_rp)
@@ -5592,6 +5771,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
         const int k0 = g_perf_kind; g_perf_kind |= 1; nvmtl_pre_submit_hook(); g_perf_kind = k0;
         g_pre_cur = up;
     }
+    if (c->nbtsh) nvmtl_btsh_pre(pre, c);
     const uint64_t sD = nvmtl_perf_now();
     VkCommandBuffer cbs[3]; uint32_t ncb = 0;
     if (counter_reset) cbs[ncb++] = counter_reset;
@@ -6208,6 +6388,7 @@ static void nvmtl_private_depth_layout(nvk_cmdbuf *c, nvk_image *img, VkImageLay
 }
 int nvmtl_vk_cmd_prepare_sampled_image(nvk_cmdbuf *c, nvk_image *img, int storage)
 {
+    nvmtl_btsh_note_img(c, img);
     if (!c || !img || c->in_rp) return -1;
     const VkImageLayout to = storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     if (g_sample_locations && img->samples > 1 && (nvmtl_barrier_aspect(img) & VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -7072,6 +7253,7 @@ int nvmtl_vk_cmd_copy_buffer_to_image_layer(nvk_cmdbuf *c, nvk_buffer *b, size_t
 int nvmtl_vk_cmd_copy_buffer_to_image_level_layer(nvk_cmdbuf *c, nvk_buffer *b, size_t off, uint32_t row_bytes,
                                   nvk_image *img, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level, uint32_t layer)
 {
+    nvmtl_btsh_note_img(c, img);
     if (level >= (img->mips ? img->mips : 1)) { nvlog("copy_buffer_to_image: level %u — this image has %u", level, img->mips ? img->mips : 1); return -1; }
     const uint32_t lw = nvmtl_lvl(img->w, level), lh = nvmtl_lvl(img->h, level);
     const uint32_t bpp = g_copy_bpp_override ? g_copy_bpp_override : (img->bpp ? img->bpp : 4);
@@ -7101,6 +7283,7 @@ int nvmtl_vk_cmd_copy_image_to_buffer_layer(nvk_cmdbuf *c, nvk_image *img, uint3
 int nvmtl_vk_cmd_copy_image_to_buffer_level_layer(nvk_cmdbuf *c, nvk_image *img, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                   nvk_buffer *b, size_t off, uint32_t row_bytes, uint32_t level, uint32_t layer)
 {
+    nvmtl_btsh_note_img(c, img);
     if (level >= (img->mips ? img->mips : 1)) { nvlog("copy_image_to_buffer: level %u — this image has %u", level, img->mips ? img->mips : 1); return -1; }
     const uint32_t lw = nvmtl_lvl(img->w, level), lh = nvmtl_lvl(img->h, level);
     const uint32_t bpp = g_copy_bpp_override ? g_copy_bpp_override : (img->bpp ? img->bpp : 4);
@@ -7279,7 +7462,10 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     if (!bpp) bpp = 4;
     if (row_pitch < (size_t)w * bpp || row_pitch > UINT32_MAX || row_pitch % bpp) {
         nvlog("buffer texture: bytesPerRow %zu cannot hold %u texels of %u B", row_pitch, w, bpp); return -1; }
-    if (g_linmod && row_pitch % 32) {
+    // RADV's linear pitch rule (256 B); a pitch it would refuse gets a shadow image (nvmtl_btsh)
+    int shadow = g_linmod && row_pitch % 256 && nvmtl_btsh_on();
+    size_t ipitch = shadow ? ((size_t)w * bpp + 255) & ~(size_t)255 : row_pitch;
+    if (g_linmod && !shadow && row_pitch % 32) {
         nvlog("buffer texture: bytesPerRow %zu is not a multiple of 32 B (the texture header's linear pitch unit)", row_pitch); return -1; }
     if (offset > b->size || (size_t)row_pitch * (h - 1) + (size_t)w * bpp > b->size - offset) {
         nvlog("buffer texture: %ux%u at offset %zu pitch %zu overruns the %zu-byte buffer", w, h, offset, row_pitch, b->size); return -1; }
@@ -7295,7 +7481,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         nvlog("buffer texture: VkFormat %u linear features 0x%x drop%s%s", vkfmt, (unsigned)lf, wantS != storage ? " ShaderWrite" : "", wantR != render ? " RenderTarget" : "");
     memset(out, 0, sizeof *out); out->w = w; out->h = h; out->mips = 1; out->fmt = vkfmt; out->bpp = bpp;
     out->storage = storage ? 1 : 0; out->mtl_type = 2; out->layers = 1;
-    VkSubresourceLayout pl = { 0, 0, (VkDeviceSize)row_pitch, 0, 0 };
+    VkSubresourceLayout pl = { 0, 0, (VkDeviceSize)ipitch, 0, 0 };
     VkImageDrmFormatModifierExplicitCreateInfoEXT eci = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT, NULL,
         0 , 1, &pl };
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, g_linmod ? (void *)&eci : NULL, 0, VK_IMAGE_TYPE_2D, (VkFormat)vkfmt,
@@ -7322,14 +7508,19 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         else { nvlog("buffer texture: VkFormat %u stays single-format - its sRGB/linear view format %u is refused (linear features 0x%x, VkResult %d%s)",
                      vkfmt, vp, (unsigned)pp.linearTilingFeatures, (int)qr, gif ? "" : ", no vkGetPhysicalDeviceImageFormatProperties2"); vp = 0; }
     }
-    VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(buffer texture)");
+    { VkResult cr = nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img);
+      if (cr != VK_SUCCESS) {
+          nvlog("vk: vkCreateImage(buffer texture) -> %d (%ux%u VkFormat %u, %u B texels, app pitch %zu, image pitch %zu%s, %s, storage %d, render %d)",
+                (int)cr, w, h, vkfmt, bpp, row_pitch, ipitch, shadow ? " shadow" : "", g_linmod ? "DRM linear" : "LINEAR", storage, render);
+          return -1; } }
     out->layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
     out->vkflags = (uint32_t)ici.flags; out->usage = (uint32_t)ici.usage; out->vpair = vp;
     if (!g_linmod) {
         PFN_vkGetImageSubresourceLayout gsl = (PFN_vkGetImageSubresourceLayout)pvkGetInstanceProcAddr(g_inst, "vkGetImageSubresourceLayout");
         VkImageSubresource sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 }; VkSubresourceLayout got; memset(&got, 0, sizeof got);
         if (gsl) gsl(g_dev, (VkImage)out->img, &sr, &got);
-        if (!gsl || got.rowPitch != row_pitch || got.offset) {
+        if (gsl && got.rowPitch != row_pitch && !got.offset && nvmtl_btsh_on()) { shadow = 1; ipitch = (size_t)got.rowPitch; }
+        else if (!gsl || got.rowPitch != row_pitch || got.offset) {
             nvlog("buffer texture: LINEAR tiling picked pitch %llu offset %llu, the app's bytesPerRow is %zu - refused",
                   (unsigned long long)got.rowPitch, (unsigned long long)got.offset, row_pitch);
             pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
@@ -7337,6 +7528,38 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
     uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
     size_t at = b->moff + offset;
+    if (shadow) {
+        nvmtl_btsh *s = calloc(1, sizeof *s);
+        if (!s) { nvlog("buffer texture: shadow record out of memory"); return -1; }
+        atomic_init(&s->ref, 0); atomic_fetch_add(&g_btsh_live, 1);
+        s->img = (VkImage)out->img; s->src = (VkBuffer)b->buf; s->soff = offset; s->spitch = row_pitch; s->apitch = ipitch;
+        s->rowbytes = w * bpp; s->h = h; s->writable = storage || render;
+        void *mem = NULL; uint32_t sysmem = 0;
+        VkResult ar = nvmtl_alloc_opaque_image_mem(&mr, &mem, &sysmem, "buffer texture shadow");
+        if (ar != VK_SUCCESS) { nvlog("buffer texture: shadow memory (%llu B) -> %d", (unsigned long long)mr.size, (int)ar);
+            atomic_fetch_add(&s->ref, 1); nvmtl_btsh_release(s); return -1; }
+        s->mem = (VkDeviceMemory)mem; s->sysmem = sysmem; atomic_fetch_add(&s->ref, 1);
+        VkBufferCreateInfo sbi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)ipitch * (h - 1) + s->rowbytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+        VkResult br = pvkCreateBuffer(g_dev, &sbi, NULL, &s->sh);
+        VkMemoryRequirements bmr; memset(&bmr, 0, sizeof bmr);
+        if (br == VK_SUCCESS) pvkGetBufferMemoryRequirements(g_dev, s->sh, &bmr);
+        if (br == VK_SUCCESS && (!(bmr.memoryTypeBits & mr.memoryTypeBits) || bmr.size > mr.size)) br = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if (br == VK_SUCCESS) br = pvkBindBufferMemory(g_dev, s->sh, s->mem, 0);
+        if (br == VK_SUCCESS) br = pvkBindImageMemory(g_dev, (VkImage)out->img, s->mem, 0);
+        if (br == VK_SUCCESS) {
+            pthread_mutex_lock(&g_btsh_lock);
+            if (nvmtl_btsh_put_locked((const void *)out->img, s)) br = VK_ERROR_OUT_OF_HOST_MEMORY;
+            pthread_mutex_unlock(&g_btsh_lock);
+        }
+        nvmtl_btsh_release(s);   // the map holds it now, or nothing does
+        if (br != VK_SUCCESS) {
+            nvlog("buffer texture: shadow %ux%u pitch %zu (buffer types 0x%x size %llu, image types 0x%x size %llu) -> %d",
+                  w, h, ipitch, bmr.memoryTypeBits, (unsigned long long)bmr.size, mr.memoryTypeBits, (unsigned long long)mr.size, (int)br);
+            return -1; }
+        out->mem = mem; out->placed = 1; out->alloc = 0; out->sysmem = sysmem;
+        atomic_fetch_add(&g_btsh_made, 1);
+    } else {
     // a buffer of unknown memory type must suit every type the image takes; pooled, placed and dedicated buffers and host
     // imports record theirs (htype). Without it RADV's image types (not its 32-bit ones) refused every pooled buffer, and
     // every buffer texture of RenderBox (Tahoe's layered icons drew as yellow squares) and CoreImage came back nil.
@@ -7351,14 +7574,15 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
               (unsigned long long)mr.size, (unsigned long long)(mr.size - (b->size - offset)), b->size, offset);
     VKCK(pvkBindImageMemory(g_dev, (VkImage)out->img, (VkDeviceMemory)b->mem, at), "vkBindImageMemory(buffer texture)");
     out->mem = b->mem; out->placed = 1; out->alloc = 0;
+    }
     VkComponentMapping swz = a8 ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }
                                 : (VkComponentMapping){ 0, 0, 0, 0 };
     VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, out->img, VK_IMAGE_VIEW_TYPE_2D,
         (VkFormat)vkfmt, swz, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     VKCK(nvmtl_opaque_CreateImageView(g_dev, &vci, NULL, &out->view), "vkCreateImageView(buffer texture)");
 
-    nvlog("buffer texture: %ux%u VkFormat %u pitch %zu bound at %zu (%s, align %llu, size %llu, storage %d, render %d, view pair %u)", w, h, vkfmt, row_pitch, at,
-          g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vpair);
+    nvlog("buffer texture: %ux%u VkFormat %u pitch %zu %s %zu (%s, align %llu, size %llu, storage %d, render %d, view pair %u)", w, h, vkfmt, row_pitch,
+          shadow ? "shadowed at pitch" : "bound at", shadow ? ipitch : at, g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vpair);
     return 0;
 }
 
@@ -7671,6 +7895,7 @@ int nvmtl_vk_cmd_copy_image_sub3(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uin
                                  nvk_image *dst, uint32_t dl, uint32_t ds, uint32_t dx, uint32_t dy, uint32_t dz,
                                  uint32_t w, uint32_t h, uint32_t depth)
 {
+    nvmtl_btsh_note_img(c, src); nvmtl_btsh_note_img(c, dst);
     if (!depth) depth = 1;
     const int s3 = src && src->mtl_type == 7, d3 = dst && dst->mtl_type == 7;
     if (!c || !src || !dst || !w || !h || src->fmt != dst->fmt
@@ -7721,6 +7946,7 @@ int nvmtl_vk_cmd_copy_image_sub3(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uin
 int nvmtl_vk_cmd_copy_image_sub(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uint32_t ss, uint32_t sx, uint32_t sy,
                                 nvk_image *dst, uint32_t dl, uint32_t ds, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
 {
+    nvmtl_btsh_note_img(c, src); nvmtl_btsh_note_img(c, dst);
     return nvmtl_vk_cmd_copy_image_sub3(c, src, sl, ss, sx, sy, 0, dst, dl, ds, dx, dy, 0, w, h, 1);
 }
 int nvmtl_vk_image_view_create_range(nvk_image *img, uint32_t vkfmt, int a8, uint32_t baseLevel, uint32_t levelCount,
