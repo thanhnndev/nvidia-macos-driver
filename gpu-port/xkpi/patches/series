@@ -19,3 +19,4 @@ drm-syncobj-etime.patch
 amdgpu-ibprep-optin.patch
 ttm-pool-order0.patch
 amdgpu-ibprobe.patch
+amdgpu-dm-ips-trace.patch
