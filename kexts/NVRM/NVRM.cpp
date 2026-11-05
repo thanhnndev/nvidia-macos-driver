@@ -745,6 +745,24 @@ void NVRM::bootHoldCap(thread_call_param_t p0, thread_call_param_t)
     s->release();
 }
 
+// true once NVRMFB has enumerated at least one display nub (it writes connected-displays there) and every enumerated
+// nub reports 0 connected displays. Same test as NVAccel's headless check.
+static bool nvrmNoDisplayOnAnyNub()
+{
+    bool seen = false, none = true;
+    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("NVRMDisplay"))) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *sv = OSDynamicCast(IOService, o);
+            OSNumber *cd = sv ? OSDynamicCast(OSNumber, sv->getProperty("connected-displays")) : nullptr;
+            if (!cd) continue;
+            seen = true;
+            if (cd->unsigned32BitValue() > 0) none = false;
+        }
+        it->release();
+    }
+    return seen && none;
+}
+
 void NVRM::autoGo(void *p0, wait_result_t)
 {
     NVRM *s = (NVRM *)p0;
@@ -791,9 +809,15 @@ void NVRM::autoGo(void *p0, wait_result_t)
         s->setProperty("nvrm-autogo", "up");
         int want = 1; if (!PE_parse_boot_argn("nvfbheads", &want, sizeof(want)) || want < 1) want = 1;
         int mask = 0, last = -1, still = 0, i;
+        bool noDisplay = false;
         for (i = 0; i < 20; i++) {
             if (nvrmSysR("debug.nvaccel_heads_published", &mask) != 0) mask = 0;
             if ((int)nvrmPop((unsigned)mask) >= want) break;
+            // NVRMFB enumerated this card and found nothing plugged in (its screen is on another GPU, e.g. an
+            // iGPU-only laptop panel): no head will ever publish and level 1 never takes, so waiting here only keeps
+            // WindowServer in IOKitWaitQuiet (36 s on an OLED-only GA403WM boot). NVAccel's headless check keeps the
+            // card a Metal device without a display.
+            if (mask == 0 && nvrmNoDisplayOnAnyNub()) { noDisplay = true; break; }
             still = (mask && mask == last) ? still + 1 : 0; last = mask;
             if (still >= 3) break;
             if (gDisplayNub0) {
@@ -804,6 +828,13 @@ void NVRM::autoGo(void *p0, wait_result_t)
         }
         LOG("auto-go: heads published mask 0x%x (%u of nvfbheads %d) after %d s", mask, nvrmPop((unsigned)mask), want, i);
         s->fBringUp = 0;   // the cap may fire from here on; the next line decides whether it got there first
+        if (noDisplay) {
+            LOG("auto-go: NVRMFB reports 0 connected displays on every nub after %d s — releasing the boot hold now, "
+                "not arming the display stack (the card stays a headless Metal device)", i);
+            s->setProperty("nvrm-display", "not armed: no display on any NVIDIA connector");
+            s->releaseBootHold("no display on any NVIDIA connector");
+            s->release(); thread_terminate(current_thread()); return;
+        }
         if (!OSCompareAndSwap(1, 2, &s->fBootHold)) {
             LOG("auto-go: the hold was already released (cap) — NOT arming with WindowServer up; heads 0x%x", mask);
             s->setProperty("nvrm-display", "not armed: hold released by the cap first");
