@@ -117,6 +117,7 @@ public:
     volatile UInt32 fBootHold = 0;
     // A fixed settle + 40 s cap lost the desktop whenever the GSP bring-up ran long (up to 48 s here); while go(2)
     // runs the cap now waits in 10 s steps, up to nvrmholdcap seconds (default 120). A hung bring-up is still released.
+    bool            fNoHold = false;       // -nvrmnohold: never hold the registry busy; auto-go still runs and arms
     volatile UInt32 fBringUp = 0;          // 1 from go(2) until the display is armed or the bring-up gave up
     uint64_t        fBringUpStartNs = 0;
     uint32_t        fHoldCapMs = 120000;   // boot-arg nvrmholdcap (seconds)
@@ -487,6 +488,14 @@ bool NVRM::start(IOService *provider)
         if (PE_parse_boot_argn("-nvrmnogo", nogo, sizeof(nogo))) {
             setProperty("nvrm-autogo", "off (-nvrmnogo)"); LOG("auto-go OFF (-nvrmnogo): idle until `nvrmctl go <pass>`");
         } else {
+            char nh[8] = { 0 };
+            fNoHold = PE_parse_boot_argn("-nvrmnohold", nh, sizeof(nh));
+            if (fNoHold) {
+                // the desktop is on another GPU: WindowServer does not wait for this card. go(2) and the display arm
+                // still run on the auto-go thread; a display on this card is armed with WindowServer already up.
+                setProperty("nvrm-boot-hold", "off (-nvrmnohold)");
+                LOG("boot hold OFF (-nvrmnohold): WindowServer does not wait for this card; auto-go still runs");
+            } else {
             fBootHold = 1; adjustBusy(1); setProperty("nvrm-boot-hold", "holding");
             { uint32_t sec = 0; if (PE_parse_boot_argn("nvrmholdcap", &sec, sizeof(sec)) && sec >= 40 && sec <= 600) fHoldCapMs = sec * 1000; }
             if (thread_call_t cap = thread_call_allocate(&NVRM::bootHoldCap, this)) {
@@ -500,11 +509,16 @@ bool NVRM::start(IOService *provider)
                 fHoldCapCall = cap;   // the cap re-arms itself while the bring-up is still running
                 retain(); thread_call_enter_delayed(cap, dl);
             } else { releaseBootHold("no cap timer — not holding"); }
+            }
             retain();
             if (kernel_thread_start(&NVRM::autoGo, this, &th) == KERN_SUCCESS) {
                 thread_deallocate(th);
                 setProperty("nvrm-autogo-settle-ms", fAutoGoSettleMs, 32);
                 setProperty("nvrm-autogo", "scheduled");
+                if (fNoHold)
+                    LOG("auto-go: go(2) in %u ms on its own thread (BAR1 %s); registry NOT held (-nvrmnohold)",
+                        fAutoGoSettleMs, bar1Placed ? "placed outside the console" : "not placed");
+                else
                 LOG("auto-go: go(2) in %u ms on its own thread (BAR1 %s); registry held busy until the display is armed (cap settle + 40 s)",
                     fAutoGoSettleMs, bar1Placed ? "placed outside the console" : "not placed");
             } else {
@@ -703,7 +717,7 @@ void NVRM::headWatch(void *p0, wait_result_t)
                 if (vh != armH[i]) { absolutetime_to_nanoseconds(now, &up); kprintf("NVRM-xnu: armwatch: %llu ms HEAD0 +0x%03x 0x%08x -> 0x%08x\n", up / 1000000ull, 0x2000 + i * 4, armH[i], vh); armH[i] = vh; armLogs++; }
                 if (vw != armW[i]) { absolutetime_to_nanoseconds(now, &up); kprintf("NVRM-xnu: armwatch: %llu ms WIN    +0x%03x 0x%08x -> 0x%08x\n", up / 1000000ull, 0x1000 + i * 4, armW[i], vw); armW[i] = vw; armLogs++; }
             }
-            if (!released && s->fBootHold == 0) released = now;
+            if (!released && !s->fNoHold && s->fBootHold == 0) released = now;   // with -nvrmnohold: the 90 s limit
             uint64_t sinceRel = 0; if (released) absolutetime_to_nanoseconds(now - released, &sinceRel);
             if ((released && sinceRel > 15000000000ull) || ns > 90000000000ull) break;
             IOSleep(5);
@@ -718,6 +732,12 @@ void NVRM::headWatch(void *p0, wait_result_t)
 
 void NVRM::releaseBootHold(const char *why)
 {
+    if (fNoHold) {
+        char b[96]; snprintf(b, sizeof b, "off (-nvrmnohold); auto-go: %s", why);
+        setProperty("nvrm-boot-hold", b);
+        LOG("auto-go finished (%s) — no boot hold was taken (-nvrmnohold)", why);
+        return;
+    }
     if (!OSCompareAndSwap(1, 0, &fBootHold) && !OSCompareAndSwap(2, 0, &fBootHold)) return;
     adjustBusy(-1);
     setProperty("nvrm-boot-hold", why);
@@ -835,7 +855,7 @@ void NVRM::autoGo(void *p0, wait_result_t)
             s->releaseBootHold("no display on any NVIDIA connector");
             s->release(); thread_terminate(current_thread()); return;
         }
-        if (!OSCompareAndSwap(1, 2, &s->fBootHold)) {
+        if (!s->fNoHold && !OSCompareAndSwap(1, 2, &s->fBootHold)) {
             LOG("auto-go: the hold was already released (cap) — NOT arming with WindowServer up; heads 0x%x", mask);
             s->setProperty("nvrm-display", "not armed: hold released by the cap first");
             s->release(); thread_terminate(current_thread()); return;
