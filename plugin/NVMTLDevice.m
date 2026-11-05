@@ -362,6 +362,37 @@ static bool nvmtl_process_is_allowed(void)
     return ok;
 }
 
+// Surface-wrapper keys for -newTextureWithDescriptor:iosurface:plane: (see nvmtl_surface_keep).
+@interface NVMTLSurfKey : NSObject <NSCopying> { @public uint32_t _sid, _plane; uint64_t _w, _h, _fmt, _ropt, _fbo; NSUInteger _hash; }
+@end
+@implementation NVMTLSurfKey
+- (id)copyWithZone:(NSZone *)zone { (void)zone; return self; }   // immutable
+- (NSUInteger)hash { return _hash; }
+- (BOOL)isEqual:(id)o {
+    if (o == self) return YES;
+    if (!o || object_getClass(o) != object_getClass(self)) return NO;
+    const NVMTLSurfKey *k = o;
+    return k->_sid == _sid && k->_plane == _plane && k->_w == _w && k->_h == _h && k->_fmt == _fmt && k->_ropt == _ropt
+        && k->_fbo == _fbo;
+}
+@end
+static inline uint64_t nvmtl_mix64(uint64_t x) {   // splitmix64 finaliser
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
+static NVMTLSurfKey *nvmtl_surf_key(uint32_t sid, uint32_t plane, uint64_t w, uint64_t h, uint64_t fmt, uint64_t ropt,
+                                    uint64_t fbo) {
+    NVMTLSurfKey *k = [NVMTLSurfKey new];
+    k->_sid = sid; k->_plane = plane; k->_w = w; k->_h = h; k->_fmt = fmt; k->_ropt = ropt; k->_fbo = fbo;
+    uint64_t x = nvmtl_mix64(((uint64_t)sid << 32) | plane);
+    x = nvmtl_mix64(x ^ (w << 32 | (h & 0xffffffffull)));
+    x = nvmtl_mix64(x ^ fmt ^ (ropt << 20) ^ (fbo << 40));
+    k->_hash = (NSUInteger)x;
+    return k;
+}
+@interface NVMTLSurfKeep : NSObject { @public NVMTLTexture *_tex; uint64_t _last; }
+@end
+@implementation NVMTLSurfKeep
+@end
+
 @implementation NVMTLDevice
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
@@ -826,36 +857,92 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // pinned, then put) every frame: ~20% of WindowServer's main thread on the 890M (docs/890M-TRACE.md Step93). Unheld
 // host entries stay for NVMTL_KEEP_MS (default 3000) and at most NVMTL_KEEP_IDLE (default 48) of them; the backing
 // still holds the surface, so its memory and ID stay valid meanwhile.
-static char nvmtl_surface_used_key;
+//
+// The maps are keyed by NVMTLSurfKey, not by an NSArray of NSNumbers: -[NSArray hash] is the element count, so every
+// 7-field key hashed to 7 and each lookup was a linear scan of isEqualToArray: compares. With the sweep below doing
+// two lookups per entry on every insert, one miss cost O(n^2) NSNumber compares: 2.5 ms at 200 entries, 10.5 ms at
+// 400, ~63 % of WindowServer's main thread during 60 fps Edge video (docs/890M-TRACE.md, Edge video lag part 2).
+// The last-used time lives in the keep entry itself (the old separate `used` map also kept a stamp for every key
+// ever touched after its keep entry went).
+// Miss accounting, so a boot log says why WindowServer imports a surface again (a new surface, the same surface
+// under another key, or a surface whose entry the sweep dropped, and why). Under @synchronized(device) like the rest.
+enum { NVMTL_GONE_UNHELD = 1, NVMTL_GONE_EXPIRED = 2, NVMTL_GONE_CAP = 3 };
+static struct { uint64_t hits, misses, fresh, otherKey, gone[4], sweeps, sweepNsMax, sweepNsSum, logged, lastLogMs; } nvmtl_sk;
+static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_gone;   // surface ID -> why its last entry went
+static NSCountedSet<NSNumber *> *nvmtl_sk_live;                      // surface IDs with an entry in keep
 static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull; }
-static void nvmtl_surface_touch(id dev, NSArray *key) {
-    NSMutableDictionary *used = objc_getAssociatedObject(dev, &nvmtl_surface_used_key);
-    if (!used) { used = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_used_key, used, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-    used[key] = @(nvmtl_keep_now_ms());
+static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
+    if (!nvmtl_sk.lastLogMs) { nvmtl_sk.lastLogMs = now; return; }
+    if (now - nvmtl_sk.lastLogMs < 30000) return;
+    nvlog("surface keep: %llu s: hits %llu, misses %llu (new surface %llu, same surface other key %llu, after drop: "
+          "unheld %llu, expired %llu, idle cap %llu), %lu entries, sweep avg %llu us max %llu us",
+          (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.hits, nvmtl_sk.misses, nvmtl_sk.fresh,
+          nvmtl_sk.otherKey, nvmtl_sk.gone[NVMTL_GONE_UNHELD], nvmtl_sk.gone[NVMTL_GONE_EXPIRED], nvmtl_sk.gone[NVMTL_GONE_CAP],
+          (unsigned long)keep.count, nvmtl_sk.sweeps ? nvmtl_sk.sweepNsSum / nvmtl_sk.sweeps / 1000 : 0,
+          nvmtl_sk.sweepNsMax / 1000);
+    const uint64_t logged = nvmtl_sk.logged;
+    memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
 }
-static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
+static void nvmtl_sk_miss(NVMTLSurfKey *key) {
+    nvmtl_sk.misses++;
+    NSNumber *sid = @(key->_sid);
+    const char *why;
+    if ([nvmtl_sk_live countForObject:sid]) { nvmtl_sk.otherKey++; why = "same surface, other key"; }
+    else {
+        const unsigned g = [nvmtl_sk_gone[sid] unsignedIntValue];
+        if (g >= 1 && g <= 3) { nvmtl_sk.gone[g]++; why = g == NVMTL_GONE_UNHELD ? "dropped: unheld" : g == NVMTL_GONE_EXPIRED ? "dropped: expired" : "dropped: idle cap"; }
+        else { nvmtl_sk.fresh++; why = "new surface"; }
+    }
+    if (nvmtl_sk.logged < 12) { nvmtl_sk.logged++;
+        nvlog("surface keep: miss (%s): surface %u plane %u %llux%llu fmt %llu ropt 0x%llx fbo %llu", why, key->_sid,
+              key->_plane, (unsigned long long)key->_w, (unsigned long long)key->_h, (unsigned long long)key->_fmt,
+              (unsigned long long)key->_ropt, (unsigned long long)key->_fbo); }
+}
+static void nvmtl_sk_drop(NSMutableDictionary *keep, NVMTLSurfKey *k, unsigned why) {
+    [keep removeObjectForKey:k];
+    NSNumber *sid = @(k->_sid);
+    [nvmtl_sk_live removeObject:sid];
+    if (nvmtl_sk_gone.count > 4096) [nvmtl_sk_gone removeAllObjects];
+    nvmtl_sk_gone[sid] = @(why);
+}
+static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
+    NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
+    NVMTLSurfKeep *e = keep[key];
+    if (e) e->_last = nvmtl_keep_now_ms();
+    nvmtl_sk.hits++;
+    if (keep) nvmtl_sk_report(keep, e ? e->_last : nvmtl_keep_now_ms());
+}
+static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     static long keepMs = -1, keepIdle = -1;
     if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 3000;
                       e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48; }
-    NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
+    NSMutableDictionary<NVMTLSurfKey *, NVMTLSurfKeep *> *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-    NSMutableDictionary *used = objc_getAssociatedObject(dev, &nvmtl_surface_used_key);
-    const uint64_t now = nvmtl_keep_now_ms();
-    NSMutableArray *idle = [NSMutableArray new];
-    for (NSArray *k in keep.allKeys) {
-        NVMTLTexture *b = keep[k];
-        if (b->_surf && CFGetRetainCount(b->_surf) > 1) continue;
-        const uint64_t last = [used[k] unsignedLongLongValue];
-        if (b->_surf && b->_hostOn && now - last < (uint64_t)keepMs) { [idle addObject:k]; continue; }
-        [keep removeObjectForKey:k]; [used removeObjectForKey:k];
+    if (!nvmtl_sk_live) { nvmtl_sk_live = [NSCountedSet new]; nvmtl_sk_gone = [NSMutableDictionary new]; }
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), now = t0 / 1000000ull;
+    nvmtl_sk_miss(key);
+    NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new];
+    [keep enumerateKeysAndObjectsUsingBlock:^(NVMTLSurfKey *k, NVMTLSurfKeep *e, BOOL *stop) {
+        (void)stop; NVMTLTexture *b = e->_tex;
+        if (b->_surf && CFGetRetainCount(b->_surf) > 1) return;
+        if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)keepMs) { [idle addObject:k]; return; }
+        [gone addObject:k];
+    }];
+    for (NVMTLSurfKey *k in gone) {
+        NVMTLTexture *b = keep[k]->_tex;
+        nvmtl_sk_drop(keep, k, (b->_surf && b->_hostOn) ? NVMTL_GONE_EXPIRED : NVMTL_GONE_UNHELD);
     }
     if ((long)idle.count > keepIdle) {
-        [idle sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
-            return [used[a] unsignedLongLongValue] < [used[b] unsignedLongLongValue] ? NSOrderedAscending : NSOrderedDescending; }];
-        for (NSUInteger i = 0; i + keepIdle < idle.count; i++) { [keep removeObjectForKey:idle[i]]; [used removeObjectForKey:idle[i]]; }
+        [idle sortUsingComparator:^NSComparisonResult(NVMTLSurfKey *a, NVMTLSurfKey *b) {
+            return keep[a]->_last < keep[b]->_last ? NSOrderedAscending : NSOrderedDescending; }];
+        for (NSUInteger i = 0; i + keepIdle < idle.count; i++) nvmtl_sk_drop(keep, idle[i], NVMTL_GONE_CAP);
     }
-    keep[key] = t;
-    nvmtl_surface_touch(dev, key);
+    NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = now;
+    if (!keep[key]) [nvmtl_sk_live addObject:@(key->_sid)];
+    keep[key] = e;
+    const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    nvmtl_sk.sweeps++; nvmtl_sk.sweepNsSum += dt; if (dt > nvmtl_sk.sweepNsMax) nvmtl_sk.sweepNsMax = dt;
+    nvmtl_sk_report(keep, now);
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
@@ -877,7 +964,8 @@ static void nvmtl_surface_keep(id dev, NSArray *key, NVMTLTexture *t) {
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    NVMTLSurfKey *key = surf ? nvmtl_surf_key((uint32_t)IOSurfaceGetID(surf), (uint32_t)plane, w, h, (uint64_t)d.pixelFormat,
+                                            (uint64_t)t->_ropt, (uint64_t)t->_fbo) : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
