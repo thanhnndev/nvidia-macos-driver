@@ -45,7 +45,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
-  nvk_buffer _hostBuf; BOOL _hostOn;   // the image lies on the IOSurface's own pages (nvmtl_surface_image_create)
+  nvk_buffer _hostBuf; BOOL _hostOn; BOOL _hostSL; /* _hostSL: _hostBuf is on RADV's surface list (nvmtl_vk_surface_list_mark) */   // the image lies on the IOSurface's own pages (nvmtl_surface_image_create)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;

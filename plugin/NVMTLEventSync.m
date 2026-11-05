@@ -172,6 +172,23 @@ static int nvmtl_skip_empty_on(void) {
     return on;
 }
 
+// Surface list: the command buffer holds every resource it uses until it completes (that is what keeps them alive),
+// so its resource set names every IOSurface texture its commands read or write. Each one's imported allocation is added
+// to this part's command buffer, which is then marked exact: its submit no longer carries every live surface.
+static void nvmtl_part_list_surfaces(nvk_cmdbuf *c, NVMTLResSet *res, NSSet *surfaces, NVMTLTexture *present)
+{
+    if (!c || !c->cb) return;
+    void (^use)(id) = ^(id o) {
+        if (![o isKindOfClass:[NVMTLTexture class]]) return;
+        NVMTLTexture *r = (NVMTLTexture *)o; while (r->_parent) r = r->_parent;
+        if (r->_hostOn && r->_hostSL) nvmtl_vk_cmd_use_surface(c, &r->_hostBuf);
+    };
+    for (id o in res) use(o);
+    for (id o in surfaces) use(o);
+    if (present) use(present);
+    nvmtl_vk_cmd_exact(c);
+}
+
 @implementation NVMTLCommandBuffer (EventSubmission)
 - (void)nvmtlReserveQueue {
     if (_reservation) return;
@@ -191,6 +208,7 @@ static int nvmtl_skip_empty_on(void) {
     part->commands = _c;
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
+    nvmtl_part_list_surfaces(&part->commands, part->resources, part->surfaces, _present);
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
     static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;

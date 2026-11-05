@@ -1110,6 +1110,10 @@ unsigned long long nvmtl_tex_objs_released(void) { return nvmtl_tex_objs_gone; }
     for (NSUInteger k = 0; k < m; k++) { NSUInteger w = i->w >> k ? i->w >> k : 1, h = i->h >> k ? i->h >> k : 1; tot += ((w + bw - 1) / bw) * ((h + bh - 1) / bh) * bpp; }
     return tot * l; }
 - (MTLResourceID)gpuResourceID {
+    // An argument buffer can reach this texture in any command buffer without it being bound there: its IOSurface pages
+    // go back to the global BO list, which every submit carries.
+    { NVMTLTexture *root = self; while (root->_parent) root = root->_parent;
+      @synchronized (root) { if (root->_hostSL) { root->_hostSL = NO; nvmtl_vk_surface_list_unmark(&root->_hostBuf); } } }
     @synchronized (self) { if (!_resid) _resid = nvmtl_resid_for_texture(self); }
     MTLResourceID rid; rid._impl = _resid; return rid;
 }

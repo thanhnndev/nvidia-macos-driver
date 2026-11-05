@@ -798,6 +798,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             if (!nvmtl_vk_buffer_import_host(base, span, &hb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, 0, row, &t->_i)) {
                     t->_hostBuf = hb; t->_hostOn = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+                    t->_hostSL = nvmtl_vk_surface_list_mark(&t->_hostBuf) ? YES : NO;
                     static unsigned long long nh; static unsigned said;
                     if (said++ < 8 || ++nh % 2000 == 0)
                         nvlog("surface %u %ux%u pitch %zu -> its own pages (host import, no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);

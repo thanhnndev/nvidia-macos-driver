@@ -1500,6 +1500,66 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
     return 0;
 }
 
+/* Surface list (RADV radv_nvmtl.c, macOS port). Host-pointer imports are not local BOs, so RADV keeps them on its
+   global BO list and EVERY submit hands all of them to the kernel: ~1.4 us of CS ioctl per live IOSurface per submit,
+   ~1 ms per WindowServer frame with ~700 surfaces (docs/890M-TRACE.md, Edge video lag part 5). An IOSurface import is
+   moved to RADV's surface list; each command buffer adds the surface allocations its resources use and is marked
+   exact; a submit with any command buffer that is not exact still carries the whole list. NVMTL_SURFACE_LIST=0 keeps
+   every import on the global list. */
+static VkResult (*g_sl_set)(VkDevice, VkDeviceMemory, VkBool32);
+static void (*g_sl_use)(VkCommandBuffer, VkDeviceMemory);
+static void (*g_sl_exact)(VkCommandBuffer);
+static _Atomic unsigned long long g_sl_marked, g_sl_refused, g_sl_unmarked, g_sl_uses, g_sl_exacts;
+static int nvmtl_sl_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_SURFACE_LIST");
+        uint32_t (*abi)(void) = g_lib ? (uint32_t (*)(void))dlsym(g_lib, "radv_nvmtl_abi") : NULL;
+        if (abi && abi() == 1) {
+            g_sl_set = (VkResult (*)(VkDevice, VkDeviceMemory, VkBool32))dlsym(g_lib, "radv_nvmtl_memory_set_surface");
+            g_sl_use = (void (*)(VkCommandBuffer, VkDeviceMemory))dlsym(g_lib, "radv_nvmtl_cmd_use_memory");
+            g_sl_exact = (void (*)(VkCommandBuffer))dlsym(g_lib, "radv_nvmtl_cmd_exact");
+        }
+        on = !(e && e[0] == '0') && g_sl_set && g_sl_use && g_sl_exact;
+        nvlog("vk: surface list %s (NVMTL_SURFACE_LIST=%s, driver %s)", on ? "ON - an IOSurface import goes only to the submits that use it"
+              : "OFF - every IOSurface import rides every submit", e ? e : "unset", abi ? "has radv_nvmtl" : "has no radv_nvmtl entry points");
+    }
+    return on;
+}
+static void nvmtl_sl_census(void)
+{
+    const unsigned long long m = atomic_load(&g_sl_marked);
+    if (m && (m & 0x3FF) == 0)
+        nvlog("vk: surface list: %llu imports moved (%llu refused, %llu back to global for gpuResourceID), %llu command buffers exact, %llu surface uses listed",
+              m, (unsigned long long)atomic_load(&g_sl_refused), (unsigned long long)atomic_load(&g_sl_unmarked),
+              (unsigned long long)atomic_load(&g_sl_exacts), (unsigned long long)atomic_load(&g_sl_uses));
+}
+int nvmtl_vk_surface_list_mark(nvk_buffer *b)
+{
+    if (!b || !b->mem || !b->imported || !nvmtl_sl_on()) return 0;
+    VkResult r = g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_TRUE);
+    if (r != VK_SUCCESS) { if (atomic_fetch_add(&g_sl_refused, 1) < 4) nvlog("vk: surface list refused an import (%d) - it stays on the global list", (int)r); return 0; }
+    atomic_fetch_add(&g_sl_marked, 1); nvmtl_sl_census();
+    return 1;
+}
+void nvmtl_vk_surface_list_unmark(nvk_buffer *b)
+{
+    if (!b || !b->mem || !nvmtl_sl_on()) return;
+    if (g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_FALSE) == VK_SUCCESS) atomic_fetch_add(&g_sl_unmarked, 1);
+}
+void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b)
+{
+    if (!c || !c->cb || !b || !b->mem || !g_sl_use) return;
+    g_sl_use((VkCommandBuffer)c->cb, (VkDeviceMemory)b->mem); atomic_fetch_add(&g_sl_uses, 1);
+}
+void nvmtl_vk_cmd_exact(nvk_cmdbuf *c)
+{
+    if (!c || !c->cb || !g_sl_exact || !nvmtl_sl_on()) return;
+    g_sl_exact((VkCommandBuffer)c->cb); atomic_fetch_add(&g_sl_exacts, 1);
+}
+static void nvmtl_vk_cb_exact_raw(VkCommandBuffer cb) { if (cb && g_sl_exact && nvmtl_sl_on()) g_sl_exact(cb); }
+
 static pthread_key_t g_stage_key; static pthread_once_t g_stage_once = PTHREAD_ONCE_INIT;
 static void nvmtl_stage_free(void *p) { nvk_buffer *b = p; nvmtl_vk_buffer_destroy(b); free(b); }
 static void nvmtl_stage_key_make(void) { if (pthread_key_create(&g_stage_key, nvmtl_stage_free)) nvlog("stage: pthread_key_create FAILED"); }
@@ -5885,7 +5945,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     if (c->nbtsh) nvmtl_btsh_pre(pre, c);
     const uint64_t sD = nvmtl_perf_now();
     VkCommandBuffer cbs[3]; uint32_t ncb = 0;
-    if (counter_reset) cbs[ncb++] = counter_reset;
+    if (counter_reset) { nvmtl_vk_cb_exact_raw(counter_reset); cbs[ncb++] = counter_reset; }
     if (pre->begun) {
         VkResult pr = VK_SUCCESS;
         if (pre->n) {
@@ -5893,7 +5953,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
             pvkCmdPipelineBarrier(pre->cb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
             pr = pvkEndCommandBuffer(pre->cb.cb);
         }
-        if (pre->n && pr == VK_SUCCESS) cbs[ncb++] = pre->cb.cb;
+        if (pre->n && pr == VK_SUCCESS) { nvmtl_vk_cb_exact_raw((VkCommandBuffer)pre->cb.cb); cbs[ncb++] = pre->cb.cb; }
         else {
             if (pre->n) { g_pre_fail++; nvlog("vk: pre-submit prologue End -> %d - %u uploads/fills (%llu bytes) LOST, the GPU keeps the old bytes", pr, pre->n, pre->bytes); }
             nvmtl_cmd_retire(&pre->cb); nvmtl_pre_drop(pre); pre->begun = 0;

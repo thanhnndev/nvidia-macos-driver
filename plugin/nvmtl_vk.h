@@ -287,6 +287,11 @@ void nvmtl_vk_cmd_draw_indirect(nvk_cmdbuf *c, nvk_buffer *b, size_t off);
 void nvmtl_vk_cmd_draw_indexed_indirect(nvk_cmdbuf *c, nvk_buffer *idx, size_t idxOff, int is32, nvk_buffer *b, size_t off);
 void nvmtl_vk_cmd_dispatch_indirect(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffer *b, size_t off);
 void nvmtl_vk_cmd_barrier(nvk_cmdbuf *c);
+/* surface list (radv_nvmtl): IOSurface imports only ride the submits that use them */
+int nvmtl_vk_surface_list_mark(nvk_buffer *b);
+void nvmtl_vk_surface_list_unmark(nvk_buffer *b);
+void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b);
+void nvmtl_vk_cmd_exact(nvk_cmdbuf *c);
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);
 void nvmtl_vk_image_destroy(nvk_image *i);
 /* Plain device textures recycled by creation key instead of freed and reallocated (CA's per-frame blur surfaces).
