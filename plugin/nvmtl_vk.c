@@ -2599,12 +2599,26 @@ void nvmtl_vk_bindless_drop(uint32_t slot)
 typedef struct nvmtl_btsh {
     _Atomic int ref; VkImage img; VkBuffer src; size_t soff, spitch; VkBuffer sh; VkDeviceMemory mem; uint32_t sysmem;
     size_t apitch; uint32_t rowbytes, h; int writable;
+    /* One-copy path: cimg is a second linear image over the same memory as img (same format, size and pitch), made
+       only for transfers and kept in VK_IMAGE_LAYOUT_GENERAL, so the app's rows go in with one vkCmdCopyBufferToImage
+       (bufferRowLength = the app's pitch) instead of one VkBufferCopy per row: RADV turns every region into its own
+       compute dispatch, and WindowServer's RenderBox masks (176x48 R8, pitch 192) cost 48 dispatches per upload,
+       ~20 % of its main thread during video (docs/890M-TRACE.md, Edge video lag part 4). img's own layout tracking is
+       untouched: cimg is never bound or sampled. */
+    VkImage cimg; uint32_t w, bpp; _Atomic int cgeneral;
 } nvmtl_btsh;
 typedef struct { const void *key; nvmtl_btsh *s; } nvmtl_btsh_ent;
 static pthread_mutex_t g_btsh_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvmtl_btsh_ent *g_btsh_ent; static unsigned g_btsh_n, g_btsh_cap;
 static _Atomic unsigned g_btsh_live;
-static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs;
+static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs, g_btsh_one;
+static int nvmtl_btsh_onecopy_on(void)
+{
+    static int on = -1;
+    if (on < 0) { on = !getenv("NVMTL_BTSH_ROWCOPY");
+        nvlog("buffer texture: shadow uploads as one image copy %s", on ? "ON" : "OFF (NVMTL_BTSH_ROWCOPY: one VkBufferCopy per row)"); }
+    return on;
+}
 static int nvmtl_btsh_on(void)
 {
     static int on = -1;
@@ -2615,6 +2629,7 @@ static int nvmtl_btsh_on(void)
 static void nvmtl_btsh_release(nvmtl_btsh *s)
 {
     if (!s || atomic_fetch_sub(&s->ref, 1) != 1) return;
+    if (s->cimg) pvkDestroyImage(g_dev, s->cimg, NULL);
     if (s->sh) pvkDestroyBuffer(g_dev, s->sh, NULL);
     if (s->mem) { pvkFreeMemory(g_dev, s->mem, NULL); if (!s->sysmem) g_budget_stale = 1; }
     free(s); atomic_fetch_sub(&g_btsh_live, 1);
@@ -2702,8 +2717,22 @@ static void nvmtl_btsh_retire(nvk_cmdbuf *c)
     for (unsigned i = 0; i < c->nbtsh; i++) nvmtl_btsh_release((nvmtl_btsh *)c->btsh[i]);
     free(c->btsh); c->btsh = NULL; c->nbtsh = c->capbtsh = 0;
 }
-static void nvmtl_btsh_rows(VkCommandBuffer cb, const nvmtl_btsh *s, int in)
+static void nvmtl_btsh_rows(VkCommandBuffer cb, const nvmtl_btsh *cs, int in)
 {
+    nvmtl_btsh *s = (nvmtl_btsh *)cs;
+    if (s->cimg) {
+        if (!atomic_exchange(&s->cgeneral, 1)) {   // first use: PREINITIALIZED keeps the bytes (linear, no metadata)
+            VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0,
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, s->cimg, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+            pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+        }
+        VkBufferImageCopy r = { (VkDeviceSize)s->soff, (uint32_t)(s->spitch / s->bpp), 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                { 0, 0, 0 }, { s->w, s->h, 1 } };
+        if (in) pvkCmdCopyBufferToImage(cb, s->src, s->cimg, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        else pvkCmdCopyImageToBuffer(cb, s->cimg, VK_IMAGE_LAYOUT_GENERAL, s->src, 1, &r);
+        return;
+    }
     VkBufferCopy stackr[64]; VkBufferCopy *r = s->h <= 64 ? stackr : malloc(sizeof *r * s->h);
     if (!r) { nvlog("buffer texture: shadow copy of %u rows skipped (out of memory)", s->h); return; }
     for (uint32_t y = 0; y < s->h; y++) {
@@ -5793,8 +5822,8 @@ static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
     atomic_fetch_add(&g_btsh_in, c->nbtsh);
     const unsigned long long k = atomic_fetch_add(&g_btsh_cbs, 1);
     if (k < 4 || ((k + 1) & 0x3ff) == 0)
-        nvlog("buffer texture: %llu command buffers used shadowed buffer textures (%llu shadows made, %u live; %llu row uploads, %llu writebacks)",
-              k + 1, (unsigned long long)atomic_load(&g_btsh_made), (unsigned)atomic_load(&g_btsh_live),
+        nvlog("buffer texture: %llu command buffers used shadowed buffer textures (%llu shadows made, %llu of them one-copy, %u live; %llu row uploads, %llu writebacks)",
+              k + 1, (unsigned long long)atomic_load(&g_btsh_made), (unsigned long long)atomic_load(&g_btsh_one), (unsigned)atomic_load(&g_btsh_live),
               (unsigned long long)atomic_load(&g_btsh_in), (unsigned long long)atomic_load(&g_btsh_out));
 }
 static void nvmtl_btsh_post(nvk_cmdbuf *c)
@@ -7654,6 +7683,33 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         if (br == VK_SUCCESS && (!(bmr.memoryTypeBits & mr.memoryTypeBits) || bmr.size > mr.size)) br = VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (br == VK_SUCCESS) br = pvkBindBufferMemory(g_dev, s->sh, s->mem, 0);
         if (br == VK_SUCCESS) br = pvkBindImageMemory(g_dev, (VkImage)out->img, s->mem, 0);
+        s->w = w; s->bpp = bpp;
+        if (br == VK_SUCCESS && nvmtl_btsh_onecopy_on() && !(offset % bpp) && !(row_pitch % bpp)) {
+            // the transfer-only twin of img (see nvmtl_btsh): same tiling, format, size and pitch, bound at the same place
+            VkSubresourceLayout cpl = { 0, 0, (VkDeviceSize)ipitch, 0, 0 };
+            VkImageDrmFormatModifierExplicitCreateInfoEXT ceci = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT, NULL,
+                0, 1, &cpl };
+            VkImageCreateInfo cci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, g_linmod ? (void *)&ceci : NULL, 0, VK_IMAGE_TYPE_2D, (VkFormat)vkfmt,
+                { w, h, 1 }, 1, 1, VK_SAMPLE_COUNT_1_BIT, ici.tiling, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_PREINITIALIZED };
+            VkImage ci = VK_NULL_HANDLE; const char *why = NULL;
+            if (pvkCreateImage(g_dev, &cci, NULL, &ci) != VK_SUCCESS) { why = "vkCreateImage"; ci = VK_NULL_HANDLE; }
+            if (ci) {
+                VkMemoryRequirements cmr; pvkGetImageMemoryRequirements(g_dev, ci, &cmr);
+                if (cmr.size > mr.size || (cmr.memoryTypeBits & mr.memoryTypeBits) != mr.memoryTypeBits) why = "memory requirements";
+                if (!why && !g_linmod) {
+                    PFN_vkGetImageSubresourceLayout gsl2 = (PFN_vkGetImageSubresourceLayout)pvkGetInstanceProcAddr(g_inst, "vkGetImageSubresourceLayout");
+                    VkImageSubresource sr2 = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 }; VkSubresourceLayout got2; memset(&got2, 0, sizeof got2);
+                    if (gsl2) gsl2(g_dev, ci, &sr2, &got2);
+                    if (!gsl2 || got2.rowPitch != ipitch || got2.offset) why = "row pitch";
+                }
+                if (!why && pvkBindImageMemory(g_dev, ci, s->mem, 0) != VK_SUCCESS) why = "vkBindImageMemory";
+                if (why) { pvkDestroyImage(g_dev, ci, NULL); ci = VK_NULL_HANDLE; }
+            }
+            if (ci) { s->cimg = ci; atomic_fetch_add(&g_btsh_one, 1); }
+            else { static _Atomic unsigned nlog; if (atomic_fetch_add(&nlog, 1) < 4)
+                nvlog("buffer texture: %ux%u VkFormat %u shadow keeps per-row copies (transfer twin: %s)", w, h, vkfmt, why); }
+        }
         if (br == VK_SUCCESS) {
             pthread_mutex_lock(&g_btsh_lock);
             if (nvmtl_btsh_put_locked((const void *)out->img, s)) br = VK_ERROR_OUT_OF_HOST_MEMORY;
