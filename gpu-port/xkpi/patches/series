@@ -13,3 +13,4 @@ amdgpu-wptr-flush-b13.patch
 amdgpu-ibmap-b14.patch
 amdgpu-zz-ibprepare-b15.patch
 amdgpu-job-timeout-hook.patch
+amdgpu-dm-ips-trace.patch

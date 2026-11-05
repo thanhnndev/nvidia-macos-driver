@@ -1,0 +1,91 @@
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-11-05 21:43:17
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-11-05 21:43:37
+@@ -3114,6 +3114,34 @@
+ 	}
+ }
+ 
++/*
++ * NullMoth ga403wm (Step115): the SMU reports the DISPLAY block as not ready for S0i3 for the whole s0ix sleep.
++ * Once per suspend/resume, log what decides whether DCN enters IPS (s0ix, IPS caps and config, idle optimizations,
++ * streams) and the DMUB firmware's IPS counters from the shared state (read from memory: no GPINT, so the
++ * DMCUB is not woken). Entry counters that do not move between "suspend done" and "resume" mean no IPS in sleep.
++ */
++static void nmx_dm_ips_trace(struct amdgpu_device *adev, const char *where)
++{
++	struct dc *dc = adev->dm.dc;
++	struct dc_dmub_srv *ds;
++	volatile struct dmub_shared_state_ips_fw *fw = NULL;
++
++	if (dc == NULL)
++		return;
++	ds = dc->ctx ? dc->ctx->dmub_srv : NULL;
++	if (ds && ds->dmub && ds->dmub->shared_state)
++		fw = &ds->dmub->shared_state[DMUB_SHARED_SHARE_FEATURE__IPS_FW].data.ips_fw;
++	printf("NullMoth ips: %s: in_s0ix %d ips_support %d disable_ips %u idle_opt %d streams %d dmub %d\n",
++	    where, adev->in_s0ix, dc->caps.ips_support, dc->config.disable_ips, dc->idle_optimizations_allowed,
++	    dc->current_state ? (int)dc->current_state->stream_count : -1, ds != NULL);
++	if (fw != NULL)
++		printf("NullMoth ips: %s: fw signals %08x rcg %u/%u ips1 %u/%u ips2 %u/%u (entry/exit)\n", where,
++		    fw->signals.all, fw->rcg_entry_count, fw->rcg_exit_count, fw->ips1_entry_count,
++		    fw->ips1_exit_count, fw->ips2_entry_count, fw->ips2_exit_count);
++	else
++		printf("NullMoth ips: %s: no DMUB shared state (firmware without IPS signals)\n", where);
++}
++
+ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+@@ -3152,12 +3180,18 @@
+ 
+ 	hpd_rx_irq_work_suspend(dm);
+ 
++	nmx_dm_ips_trace(adev, "suspend before");
+ 	dc_set_power_state(dm->dc, DC_ACPI_CM_POWER_STATE_D3);
++	nmx_dm_ips_trace(adev, "after dc_set_power_state(D3)");
+ 
+ 	if (dm->dc->caps.ips_support && adev->in_s0ix)
+ 		dc_allow_idle_optimizations(dm->dc, true);
++	printf("NullMoth ips: dc_allow_idle_optimizations(true) %s\n",
++	    (dm->dc->caps.ips_support && adev->in_s0ix) ? "called" : "skipped (no ips_support or not s0ix)");
++	nmx_dm_ips_trace(adev, "after allow_idle_optimizations");
+ 
+ 	dc_dmub_srv_set_power_state(dm->dc->ctx->dmub_srv, DC_ACPI_CM_POWER_STATE_D3);
++	nmx_dm_ips_trace(adev, "suspend done (dmub D3)");
+ 
+ 	return 0;
+ }
+@@ -3325,6 +3359,7 @@
+ 	int i, r, j;
+ 	struct dc_commit_streams_params commit_params = {};
+ 
++	nmx_dm_ips_trace(adev, "resume (before idle exit)");
+ 	if (dm->dc->caps.ips_support) {
+ 		dc_dmub_srv_apply_idle_power_optimizations(dm->dc, false);
+ 	}
+--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn35_clk_mgr.c	2026-11-05 21:43:17
++++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn35_clk_mgr.c	2026-11-05 21:43:37
+@@ -1388,11 +1388,16 @@
+ 		dm_helpers_free_gpu_mem(clk_mgr->base.base.ctx, DC_MEM_ALLOC_TYPE_GART,
+ 				smu_dpm_clks_dcn351.dpm_clks);
+ 
++	/* NullMoth ga403wm (Step115): what PMFW says about IPS, and what it does to disable_ips */
++	printf("NullMoth ips: dcn35 clk_mgr: smu_ver %08x disable_ips %u%s\n", clk_mgr->base.smu_ver,
++	    ctx->dc->config.disable_ips,
++	    ctx->dc->config.disable_ips == DMUB_IPS_DISABLE_ALL ? " (IPS disabled by config: PMFW not asked)" : "");
+ 	if (ctx->dc->config.disable_ips != DMUB_IPS_DISABLE_ALL) {
+ 		bool ips_support = false;
+ 
+ 		/*avoid call pmfw at init*/
+ 		ips_support = dcn35_smu_get_ips_supported(&clk_mgr->base);
++		printf("NullMoth ips: dcn35_smu_get_ips_supported = %d\n", ips_support);
+ 		if (ips_support) {
+ 			ctx->dc->debug.ignore_pg = false;
+ 			ctx->dc->debug.disable_dpp_power_gate = false;
+@@ -1408,6 +1413,7 @@
+ 			/*let's reset the config control flag*/
+ 			ctx->dc->config.disable_ips = DMUB_IPS_DISABLE_ALL; /*pmfw not support it, disable it all*/
+ 		}
++		printf("NullMoth ips: dcn35 clk_mgr: disable_ips now %u\n", ctx->dc->config.disable_ips);
+ 	}
+ }
+ 
