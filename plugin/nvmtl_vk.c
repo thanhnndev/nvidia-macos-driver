@@ -1632,7 +1632,7 @@ int nvmtl_bl_audit_on(void)
     if (on < 0) { const char *e = getenv("NVMTL_BL_AUDIT"); struct stat st;
         on = e ? (e[0] == '1') : (stat("/Library/NullMoth/nvmtl-bl-audit", &st) == 0);
         if (on) nvlog("vk: buffer-list AUDIT ON - no-copy imports used by a part but not named by its resources are logged (buffer list %s)",
-                      getenv("NVMTL_BUFFER_LIST") && getenv("NVMTL_BUFFER_LIST")[0] == '1' ? "on" : "off"); }
+                      nvmtl_bl_on() ? "on" : "off"); }
     return on;
 }
 void nvmtl_vk_nocopy_register(const nvk_buffer *b)
@@ -1656,6 +1656,53 @@ static void nvmtl_audit_used(nvk_cmdbuf *c, void *buf, const void *who, unsigned
     nvmtl_audit *a = buf ? nvmtl_audit_of(c) : NULL; if (!a || pset_has(&a->used, buf)) return;
     pset_add(&a->used, buf);
     if (a->nwho < 64) { a->who[a->nwho] = who; a->whoBuf[a->nwho] = buf; a->whoSlot[a->nwho] = (uint16_t)slot; a->nwho++; }
+}
+/* Texture side of the audit (part 15): a buffer texture bound straight on a no-copy import's pages reaches the
+   shader through an image descriptor, which RADV does not list. Image -> buffer and view -> buffer are recorded (audit
+   only), so a sampled or storage binding of such a view counts as a use of that buffer. */
+typedef struct { const void **k; void **v; unsigned n, cap; } nvmtl_pmap;
+static void **pmap_slot(const nvmtl_pmap *m, const void *p) {
+    if (!m->cap) return NULL;
+    for (unsigned i = (unsigned)(((uintptr_t)p >> 4) * 2654435761u) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
+        if (!m->k[i]) return NULL; if (m->k[i] == p) return &m->v[i]; } }
+static void pmap_put(nvmtl_pmap *m, const void *p, void *v) {
+    if (!p) return; void **sl = pmap_slot(m, p); if (sl) { *sl = v; return; }
+    if ((m->n + 1) * 2 > m->cap) {
+        unsigned nc = m->cap ? m->cap * 2 : 64; nvmtl_pmap g = { calloc(nc, sizeof(void *)), calloc(nc, sizeof(void *)), 0, nc };
+        if (!g.k || !g.v) { free(g.k); free(g.v); return; }
+        for (unsigned i = 0; i < m->cap; i++) if (m->k[i] && m->v[i]) pmap_put(&g, m->k[i], m->v[i]);
+        free(m->k); free(m->v); *m = g; }
+    for (unsigned i = (unsigned)(((uintptr_t)p >> 4) * 2654435761u) & (m->cap - 1);; i = (i + 1) & (m->cap - 1))
+        if (!m->k[i]) { m->k[i] = p; m->v[i] = v; m->n++; return; } }
+static void pmap_del(nvmtl_pmap *m, const void *p) { void **sl = pmap_slot(m, p); if (sl) *sl = NULL; }   /* tombstone: value NULL */
+static nvmtl_pmap g_aud_img, g_aud_view; static pthread_mutex_t g_aud_map_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned long long g_aud_tex_used;
+static void nvmtl_audit_img_on_buffer(const void *img, const nvk_buffer *b)
+{
+    if (!img || !b || !b->buf || !b->imported || nvmtl_bl_audit_on() != 1) return;
+    pthread_mutex_lock(&g_aud_map_lock); pmap_put(&g_aud_img, img, b->buf); pthread_mutex_unlock(&g_aud_map_lock);
+}
+static void nvmtl_audit_view_made(const void *img, const void *view)
+{
+    if (!img || !view || nvmtl_bl_audit_on() != 1) return;
+    pthread_mutex_lock(&g_aud_map_lock);
+    void **b = pmap_slot(&g_aud_img, img); if (b && *b) pmap_put(&g_aud_view, view, *b);
+    pthread_mutex_unlock(&g_aud_map_lock);
+}
+static void nvmtl_audit_handle_gone(const void *h)
+{
+    if (!h || nvmtl_bl_audit_on() != 1) return;
+    pthread_mutex_lock(&g_aud_map_lock); pmap_del(&g_aud_img, h); pmap_del(&g_aud_view, h); pthread_mutex_unlock(&g_aud_map_lock);
+}
+static void nvmtl_audit_tex_used(nvk_cmdbuf *c, const void *view, const void *who, unsigned slot)
+{
+    if (!view || nvmtl_bl_audit_on() != 1) return;
+    pthread_mutex_lock(&g_aud_map_lock); void **b = pmap_slot(&g_aud_view, view); void *buf = b ? *b : NULL; pthread_mutex_unlock(&g_aud_map_lock);
+    if (buf) {
+        if (atomic_fetch_add(&g_aud_tex_used, 1) == 0) {
+            Dl_info di; const char *sym = (who && dladdr(who, &di) && di.dli_sname) ? di.dli_sname : "?";
+            nvlog("vk: buffer-list audit: first texture binding on no-copy pages (view %p of import %p, slot %u, bound by %s)", view, buf, slot, sym); }
+        nvmtl_audit_used(c, buf, who, slot); }
 }
 void nvmtl_vk_audit_listed(nvk_cmdbuf *c, const nvk_buffer *b)
 {
@@ -1681,15 +1728,16 @@ void nvmtl_vk_audit_check(nvk_cmdbuf *c, const char *where)
             const void *who = NULL; unsigned slot = 0xffff;
             for (unsigned j = 0; j < a->nwho; j++) if (a->whoBuf[j] == buf) { who = a->who[j]; slot = a->whoSlot[j]; break; }
             Dl_info di; const char *sym = (who && dladdr(who, &di) && di.dli_sname) ? di.dli_sname : "?";
-            nvlog("vk: buffer-list AUDIT MISS (%s): no-copy import %p is named by a descriptor/address table of this part (slot %u, bound by %s +%ld) "
+            nvlog("vk: buffer-list AUDIT MISS (%s): no-copy import %p is named by a descriptor/address table/texture of this part (slot %u, bound by %s +%ld) "
                   "but not by its resources", where ? where : "?", buf, slot, sym,
                   (long)(who && dladdr(who, &di) && di.dli_saddr ? (const char *)who - (const char *)di.dli_saddr : 0));
         }
     }
     pthread_mutex_unlock(&g_nocopy_lock);
     if ((parts & 0xFFF) == 0)
-        nvlog("vk: buffer-list audit: %llu parts, %llu no-copy uses, %llu NOT named by the part's resources",
-              parts, (unsigned long long)atomic_load(&g_aud_used), (unsigned long long)atomic_load(&g_aud_missing));
+        nvlog("vk: buffer-list audit: %llu parts, %llu no-copy uses (%llu texture bindings on no-copy pages), %llu NOT named by the part's resources",
+              parts, (unsigned long long)atomic_load(&g_aud_used), (unsigned long long)atomic_load(&g_aud_tex_used),
+              (unsigned long long)atomic_load(&g_aud_missing));
 }
 void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b)
 {
@@ -2864,6 +2912,7 @@ static PFN_vkCreateImageView g_btsh_real_cv; static PFN_vkDestroyImageView g_bts
 static VKAPI_ATTR VkResult VKAPI_CALL nvmtl_btsh_create_view(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a, VkImageView *v)
 {
     VkResult r = g_btsh_real_cv(d, ci, a, v);
+    if (r == VK_SUCCESS && ci) nvmtl_audit_view_made((const void *)ci->image, (const void *)*v);
     if (r == VK_SUCCESS && ci && atomic_load(&g_btsh_live)) {
         pthread_mutex_lock(&g_btsh_lock);
         nvmtl_btsh *s = nvmtl_btsh_find_locked((const void *)ci->image);
@@ -2876,6 +2925,7 @@ static VKAPI_ATTR void VKAPI_CALL nvmtl_btsh_destroy_view(VkDevice d, VkImageVie
 {
     nvmtl_btsh *s = NULL;
     if (v && atomic_load(&g_btsh_live)) { pthread_mutex_lock(&g_btsh_lock); s = nvmtl_btsh_take_locked((const void *)v); pthread_mutex_unlock(&g_btsh_lock); }
+    nvmtl_audit_handle_gone((const void *)v);
     g_btsh_real_dv(d, v, a);
     nvmtl_btsh_release(s);
 }
@@ -2883,6 +2933,7 @@ static VKAPI_ATTR void VKAPI_CALL nvmtl_btsh_destroy_image(VkDevice d, VkImage i
 {
     nvmtl_btsh *s = NULL;
     if (im && atomic_load(&g_btsh_live)) { pthread_mutex_lock(&g_btsh_lock); s = nvmtl_btsh_take_locked((const void *)im); pthread_mutex_unlock(&g_btsh_lock); }
+    nvmtl_audit_handle_gone((const void *)im);
     g_btsh_real_di(d, im, a);
     nvmtl_btsh_release(s);
 }
@@ -3336,7 +3387,8 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
                 continue;
             }
             if (NVMTL_COPY_HAS(copym, i)) { cp[ncp++] = (VkCopyDescriptorSet){ VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET, NULL, from, NVMTL_BINDING_NUMBER(i), 0, set, NVMTL_BINDING_NUMBER(i), 0, 1 }; continue; }
-            if (sl && sl->kind == NVMTL_SLOT_TEX) { ii[i] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, (VkImageView)sl->h, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }; pi = &ii[i]; }
+            if (sl && sl->kind == NVMTL_SLOT_TEX) { ii[i] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, (VkImageView)sl->h, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }; pi = &ii[i];
+                                                    nvmtl_audit_tex_used(c, sl->h, sl->who, 200 + which * 1000 + i); }
             else pi = &dummyI;
         } else {
             if (NVMTL_COPY_HAS(copym, i)) { cp[ncp++] = (VkCopyDescriptorSet){ VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET, NULL, from, NVMTL_BINDING_NUMBER(i), 0, set, NVMTL_BINDING_NUMBER(i), 0, 1 }; continue; }
@@ -3359,6 +3411,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         void *view = bound ? sl->h : g_dummyStex.view;
         if (!bound) { static int said; if (!said++) nvlog("vk: storage texture %u is declared by the shader (through %u) but nothing writable is bound there — %s", j, stex_hi - 1, view ? "dummy" : "left UNWRITTEN"); }
         if (!view) continue;
+        if (bound) nvmtl_audit_tex_used(c, view, sl->who, 300 + which * 1000 + j);
         ii[i] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, (VkImageView)view, VK_IMAGE_LAYOUT_GENERAL };
         w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, NVMTL_BINDING_NUMBER(i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], NULL, NULL };
     }
@@ -7218,6 +7271,7 @@ int nvmtl_vk_bind_texture_view(nvk_cmdbuf *c, uint32_t set, uint32_t index, void
     const nvmtl_slot *was = (c->table && set < 2) ? &((nvmtl_bindtable *)c->table)->s[set][NVMTL_NBUF + index] : NULL;
     const int same = was && was->kind == NVMTL_SLOT_TEX && was->h == view;
     int r = nvmtl_bind_slot(c, set, NVMTL_NBUF + index, NVMTL_SLOT_TEX, view, 0);
+    if (!r && c->table && set < 2) ((nvmtl_bindtable *)c->table)->s[set][NVMTL_NBUF + index].who = __builtin_return_address(0);
     if (!r && !same && c->table && set < 2) { extern uint32_t nvmtl_bl_slot(void *); ((nvmtl_bindtable *)c->table)->s[set][NVMTL_NBUF + index].size = view ? nvmtl_bl_slot(view) : 0; }
     return r;
 }
@@ -7967,6 +8021,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         nvlog("buffer texture: image size %llu runs %llu B past the buffer's %zu at offset %zu (the tail of the last row, never addressed)",
               (unsigned long long)mr.size, (unsigned long long)(mr.size - (b->size - offset)), b->size, offset);
     VKCK(pvkBindImageMemory(g_dev, (VkImage)out->img, (VkDeviceMemory)b->mem, at), "vkBindImageMemory(buffer texture)");
+    nvmtl_audit_img_on_buffer(out->img, b);
     out->mem = b->mem; out->placed = 1; out->alloc = 0;
     }
     VkComponentMapping swz = a8 ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }
