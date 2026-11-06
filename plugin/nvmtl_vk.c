@@ -1592,6 +1592,100 @@ void nvmtl_vk_buffer_list_unmark(nvk_buffer *b)
         if (u <= 4 || (u & 0x3FF) == 0) nvlog("vk: buffer list: a no-copy import's address escaped (%llu so far) - it rides every submit again", u);
     }
 }
+
+/* Buffer-list audit (docs/890M-TRACE.md part 12). The buffer list faulted once in WindowServer: some path uses a
+   no-copy import that the part's resource set does not name. With /Library/NullMoth/nvmtl-bl-audit present (or
+   NVMTL_BL_AUDIT=1), every no-copy import is registered; each part records the buffers its descriptor sets and address
+   tables name (only bindings the pipeline declares) and the no-copy buffers its resource set would list; at seal a
+   registered buffer that is used but would not be listed is logged with the method that bound it. It works with the
+   buffer list OFF, so nothing is left out of a submit while it looks. */
+typedef struct { void **k; unsigned n, cap; } nvmtl_pset;
+static int pset_has(const nvmtl_pset *s, const void *p) {
+    if (!s->cap) return 0;
+    for (unsigned i = (unsigned)(((uintptr_t)p >> 4) * 2654435761u) & (s->cap - 1);; i = (i + 1) & (s->cap - 1)) {
+        if (!s->k[i]) return 0; if (s->k[i] == p) return 1; } }
+static void pset_add(nvmtl_pset *s, void *p) {
+    if (!p || pset_has(s, p)) return;
+    if ((s->n + 1) * 2 > s->cap) {
+        nvmtl_pset g = { calloc(s->cap ? s->cap * 2 : 64, sizeof(void *)), 0, s->cap ? s->cap * 2 : 64 };
+        if (!g.k) return;
+        for (unsigned i = 0; i < s->cap; i++) if (s->k[i]) pset_add(&g, s->k[i]);
+        free(s->k); *s = g; }
+    for (unsigned i = (unsigned)(((uintptr_t)p >> 4) * 2654435761u) & (s->cap - 1);; i = (i + 1) & (s->cap - 1))
+        if (!s->k[i]) { s->k[i] = p; s->n++; return; } }
+static void pset_del(nvmtl_pset *s, const void *p) {   /* rebuild without p: deletes are rare (import destroyed) */
+    if (!pset_has(s, p)) return;
+    nvmtl_pset g = { calloc(s->cap, sizeof(void *)), 0, s->cap }; if (!g.k) return;
+    for (unsigned i = 0; i < s->cap; i++) if (s->k[i] && s->k[i] != p) pset_add(&g, s->k[i]);
+    free(s->k); *s = g; }
+typedef struct { nvmtl_pset used, listed; const void *who[64]; void *whoBuf[64]; uint16_t whoSlot[64]; unsigned nwho; } nvmtl_audit;
+static nvmtl_pset g_nocopy; static pthread_mutex_t g_nocopy_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned long long g_aud_parts, g_aud_used, g_aud_missing, g_aud_logged;
+int nvmtl_bl_audit_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_BL_AUDIT"); struct stat st;
+        on = e ? (e[0] == '1') : (stat("/Library/NullMoth/nvmtl-bl-audit", &st) == 0);
+        if (on) nvlog("vk: buffer-list AUDIT ON - no-copy imports used by a part but not named by its resources are logged (buffer list %s)",
+                      getenv("NVMTL_BUFFER_LIST") && getenv("NVMTL_BUFFER_LIST")[0] == '1' ? "on" : "off"); }
+    return on;
+}
+void nvmtl_vk_nocopy_register(const nvk_buffer *b)
+{
+    if (!b || !b->buf || !nvmtl_bl_audit_on()) return;
+    pthread_mutex_lock(&g_nocopy_lock); pset_add(&g_nocopy, b->buf); pthread_mutex_unlock(&g_nocopy_lock);
+}
+static void nvmtl_nocopy_unregister(const void *buf)
+{
+    if (!buf || nvmtl_bl_audit_on() != 1) return;
+    pthread_mutex_lock(&g_nocopy_lock); pset_del(&g_nocopy, buf); pthread_mutex_unlock(&g_nocopy_lock);
+}
+static nvmtl_audit *nvmtl_audit_of(nvk_cmdbuf *c)
+{
+    if (!c || !nvmtl_bl_audit_on()) return NULL;
+    if (!c->audit) c->audit = calloc(1, sizeof(nvmtl_audit));
+    return (nvmtl_audit *)c->audit;
+}
+static void nvmtl_audit_used(nvk_cmdbuf *c, void *buf, const void *who, unsigned slot)
+{
+    nvmtl_audit *a = buf ? nvmtl_audit_of(c) : NULL; if (!a || pset_has(&a->used, buf)) return;
+    pset_add(&a->used, buf);
+    if (a->nwho < 64) { a->who[a->nwho] = who; a->whoBuf[a->nwho] = buf; a->whoSlot[a->nwho] = (uint16_t)slot; a->nwho++; }
+}
+void nvmtl_vk_audit_listed(nvk_cmdbuf *c, const nvk_buffer *b)
+{
+    nvmtl_audit *a = (b && b->buf) ? nvmtl_audit_of(c) : NULL; if (a) pset_add(&a->listed, b->buf);
+}
+static void nvmtl_audit_free(nvk_cmdbuf *c)
+{
+    nvmtl_audit *a = c ? (nvmtl_audit *)c->audit : NULL; if (!a) return;
+    free(a->used.k); free(a->listed.k); free(a); c->audit = NULL;
+}
+void nvmtl_vk_audit_check(nvk_cmdbuf *c, const char *where)
+{
+    nvmtl_audit *a = c ? (nvmtl_audit *)c->audit : NULL; if (!a) return;
+    const unsigned long long parts = atomic_fetch_add(&g_aud_parts, 1) + 1;
+    pthread_mutex_lock(&g_nocopy_lock);
+    for (unsigned i = 0; i < a->used.cap; i++) {
+        void *buf = a->used.k[i];
+        if (!buf || !pset_has(&g_nocopy, buf)) continue;
+        atomic_fetch_add(&g_aud_used, 1);
+        if (pset_has(&a->listed, buf)) continue;
+        atomic_fetch_add(&g_aud_missing, 1);
+        if (atomic_fetch_add(&g_aud_logged, 1) < 40) {
+            const void *who = NULL; unsigned slot = 0xffff;
+            for (unsigned j = 0; j < a->nwho; j++) if (a->whoBuf[j] == buf) { who = a->who[j]; slot = a->whoSlot[j]; break; }
+            Dl_info di; const char *sym = (who && dladdr(who, &di) && di.dli_sname) ? di.dli_sname : "?";
+            nvlog("vk: buffer-list AUDIT MISS (%s): no-copy import %p is named by a descriptor/address table of this part (slot %u, bound by %s +%ld) "
+                  "but not by its resources", where ? where : "?", buf, slot, sym,
+                  (long)(who && dladdr(who, &di) && di.dli_saddr ? (const char *)who - (const char *)di.dli_saddr : 0));
+        }
+    }
+    pthread_mutex_unlock(&g_nocopy_lock);
+    if ((parts & 0xFFF) == 0)
+        nvlog("vk: buffer-list audit: %llu parts, %llu no-copy uses, %llu NOT named by the part's resources",
+              parts, (unsigned long long)atomic_load(&g_aud_used), (unsigned long long)atomic_load(&g_aud_missing));
+}
 void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b)
 {
     if (!c || !c->cb || !b || !b->mem || !g_sl_use) return;
@@ -2288,7 +2382,7 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
     return 1;
 }
 enum { NVMTL_SLOT_NONE = 0, NVMTL_SLOT_BUF, NVMTL_SLOT_TEX, NVMTL_SLOT_SAMP, NVMTL_SLOT_TEXBUF  };
-typedef struct { uint8_t kind; void *h; size_t off; size_t size; uint64_t address; } nvmtl_slot;
+typedef struct { uint8_t kind; void *h; size_t off; size_t size; uint64_t address; const void *who; } nvmtl_slot;
 #define NVMTL_EMB_KEYMAX 480
 static int nvmtl_dirty_only_on(void)
 {
@@ -3207,6 +3301,9 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     VkDescriptorBufferInfo addressInfo;
     if (!g_mutable) tb = NULL;
     if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) && nvmtl_address_snapshot(c, which, &addressInfo)) { c->skipped++; return VK_NULL_HANDLE; }
+    if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) && nvmtl_bl_audit_on() && c->table)
+        for (uint32_t i = 0; i < NVMTL_NBUF; i++) { const nvmtl_slot *sl = &((nvmtl_bindtable *)c->table)->s[which][i];
+            if (sl->kind == NVMTL_SLOT_BUF && NVMTL_E78_HAS(mask, i)) nvmtl_audit_used(c, sl->h, sl->who, 500 + which * 1000 + i); }
     VkDescriptorBufferInfo dummyB = { (VkBuffer)g_dummyBuf.buf, 0, VK_WHOLE_SIZE };
     VkDescriptorImageInfo  dummyI = { VK_NULL_HANDLE, (VkImageView)g_dummyImg.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo  dummyS = { g_dummySampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
@@ -3221,6 +3318,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
             if (i == NVMTL_ADDRESS_BINDING) pb = &addressInfo;
             else if (sl && sl->kind == NVMTL_SLOT_BUF && (sl->off % NVMTL_SSBO_ALIGN) == 0) {
                 bi[i] = (VkDescriptorBufferInfo){ (VkBuffer)sl->h, sl->off, VK_WHOLE_SIZE }; pb = &bi[i];
+                if (c->audit || nvmtl_bl_audit_on()) nvmtl_audit_used(c, sl->h, sl->who, which * 1000 + i);
             } else {
                 if (sl && sl->kind == NVMTL_SLOT_BUF) { static int said; if (!said++) nvlog("vk: buffer slot %u is bound at offset %zu, not a multiple of %d — reachable only through the address table", i, sl->off, NVMTL_SSBO_ALIGN); }
                 pb = &dummyB;
@@ -3319,6 +3417,7 @@ int nvmtl_vk_bind_buffer(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_buffer
     if (!b || !b->buf || offset >= b->size) { nvlog("bind buffer: offset %zu outside length %zu", offset, b ? b->size : 0); return -1; }
     int r = nvmtl_bind_slot(c, set, index, NVMTL_SLOT_BUF, b->buf, offset);
     if (!r) { nvmtl_bindtable *t = (nvmtl_bindtable *)c->table; nvmtl_slot *sl = &t->s[set][index]; uint64_t a = nvmtl_vk_buffer_address(b);
+              sl->who = __builtin_return_address(0);
               if (sl->size != b->size || sl->address != a) t->dirty[set] = 1;
               sl->size = b->size; sl->address = a; }
     return r;
@@ -5753,6 +5852,7 @@ void nvmtl_vk_cmd_end_render(nvk_cmdbuf *c) {
 
 static void nvmtl_cmd_retire(nvk_cmdbuf *c)
 {
+    nvmtl_audit_free(c);
     nvmtl_btsh_retire(c);
     nvmtl_counter_retire(c);
     nvmtl_vk_cmd_retire_occlusion(c);
@@ -6134,6 +6234,7 @@ static void nvmtl_vk_buffer_destroy_body(nvk_buffer *b)
 {
     if (g_state != 1 || !b || !b->buf) return;
     g_buf_gone++;
+    if (b->imported) nvmtl_nocopy_unregister(b->buf);
     pvkDestroyBuffer(g_dev, (VkBuffer)b->buf, NULL);
     if (b->pool) pool_buffer_release(b);
     if (!b->placed && !b->imported && b->mem && b->map && pvkUnmapMemory) { pvkUnmapMemory(g_dev, (VkDeviceMemory)b->mem); b->map = NULL; }

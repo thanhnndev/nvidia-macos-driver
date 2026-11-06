@@ -77,6 +77,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *counter_recording; unsigned counter_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
+                 void *audit;   /* buffer-list audit (nvmtl_bl_audit_on): used vs listed no-copy imports of this part */
                } nvk_cmdbuf;
 int  nvmtl_vk_init(void);
 int nvmtl_vk_sample_positions_backend(void);
@@ -294,6 +295,10 @@ void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b);
 void nvmtl_vk_cmd_exact(nvk_cmdbuf *c);
 int nvmtl_vk_buffer_list_mark(nvk_buffer *b);
 int nvmtl_vk_integrated(void);
+int nvmtl_bl_audit_on(void);
+void nvmtl_vk_nocopy_register(const nvk_buffer *b);
+void nvmtl_vk_audit_listed(nvk_cmdbuf *c, const nvk_buffer *b);
+void nvmtl_vk_audit_check(nvk_cmdbuf *c, const char *where);
 int nvmtl_managed_sysmem(void);
 void nvmtl_vk_buffer_list_unmark(nvk_buffer *b);
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);

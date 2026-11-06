@@ -178,7 +178,9 @@ static int nvmtl_skip_empty_on(void) {
 static void nvmtl_part_list_surfaces(nvk_cmdbuf *c, NVMTLResSet *res, NSSet *surfaces, NVMTLTexture *present)
 {
     if (!c || !c->cb) return;
-    void (^buf)(NVMTLBuffer *) = ^(NVMTLBuffer *b) { if (b && b->_hostSL) nvmtl_vk_cmd_use_surface(c, &b->_b); };
+    const int aud = nvmtl_bl_audit_on();
+    void (^buf)(NVMTLBuffer *) = ^(NVMTLBuffer *b) { if (!b) return; if (aud) nvmtl_vk_audit_listed(c, &b->_b);
+                                                     if (b->_hostSL) nvmtl_vk_cmd_use_surface(c, &b->_b); };
     void (^use)(id) = ^(id o) {
         if ([o isKindOfClass:[NVMTLBuffer class]]) { buf((NVMTLBuffer *)o); return; }
         if (![o isKindOfClass:[NVMTLTexture class]]) return;
@@ -190,6 +192,7 @@ static void nvmtl_part_list_surfaces(nvk_cmdbuf *c, NVMTLResSet *res, NSSet *sur
     for (id o in res) use(o);
     for (id o in surfaces) use(o);
     if (present) use(present);
+    if (aud) nvmtl_vk_audit_check(c, "seal");
     nvmtl_vk_cmd_exact(c);
 }
 
