@@ -3360,6 +3360,9 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) && nvmtl_bl_audit_on() && c->table)
         for (uint32_t i = 0; i < NVMTL_NBUF; i++) { const nvmtl_slot *sl = &((nvmtl_bindtable *)c->table)->s[which][i];
             if (sl->kind == NVMTL_SLOT_BUF && NVMTL_E78_HAS(mask, i)) nvmtl_audit_used(c, sl->h, sl->who, 500 + which * 1000 + i); }
+    if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) && nvmtl_bl_audit_on() && c->table)   // the table carries every bound texture's bindless slot
+        for (uint32_t i = 0; i < NVMTL_NTEX; i++) { const nvmtl_slot *sl = &((nvmtl_bindtable *)c->table)->s[which][NVMTL_NBUF + i];
+            if (sl->kind == NVMTL_SLOT_TEX && sl->h) nvmtl_audit_tex_used(c, sl->h, sl->who, 600 + which * 1000 + i); }
     VkDescriptorBufferInfo dummyB = { (VkBuffer)g_dummyBuf.buf, 0, VK_WHOLE_SIZE };
     VkDescriptorImageInfo  dummyI = { VK_NULL_HANDLE, (VkImageView)g_dummyImg.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo  dummyS = { g_dummySampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
