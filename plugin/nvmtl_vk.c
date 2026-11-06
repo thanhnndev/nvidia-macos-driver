@@ -1566,13 +1566,18 @@ static _Atomic unsigned long long g_bl_marked, g_bl_unmarked;
 static int nvmtl_bl_on(void)
 {
     static int on = -1;
-    // OFF by default since 2026-11-06 14:07: the first boot with it on had one GPU permission fault (TCP read) in
-    // WindowServer, a hang, and WindowServer's restart (docs/890M-TRACE.md part 11). Some path uses a no-copy import
-    // without the command buffer naming it; a userptr BO left out of a submit is not revalidated, so it faults once
-    // its pages were invalidated. NVMTL_BUFFER_LIST=1 turns it on to hunt that path.
-    if (on < 0) { const char *e = getenv("NVMTL_BUFFER_LIST"); on = (e && e[0] == '1') && nvmtl_sl_on();
-        nvlog("vk: buffer list %s (NVMTL_BUFFER_LIST=%s)", on ? "ON - a no-copy buffer import goes only to the submits that use it"
-              : "OFF (default; NVMTL_BUFFER_LIST=1 turns it on) - every no-copy buffer import rides every submit", e ? e : "unset"); }
+    // The one GPU permission fault with the list on (2026-11-06 14:07, docs/890M-TRACE.md parts 11 and 13) was in
+    // ClickToX (pid 7955; the kernel names thread 32923), not WindowServer: the hang it caused took WindowServer down.
+    // WindowServer ran ~20 min with the list on and no fault, and the audit found 0 no-copy uses outside its parts'
+    // resources in 32k parts. So the list is ON in WindowServer only (its submit ioctl is ~12 % of the main thread
+    // without it); other processes keep every no-copy import on the global list until the audit clears them.
+    // NVMTL_BUFFER_LIST=0/1 decides for any process; /Library/NullMoth/nvmtl-bl-off turns it off everywhere.
+    if (on < 0) { const char *e = getenv("NVMTL_BUFFER_LIST"); struct stat st; const char *me = getprogname();
+        const int ws = me && !strcmp(me, "WindowServer"), off = stat("/Library/NullMoth/nvmtl-bl-off", &st) == 0;
+        on = (e ? e[0] == '1' : (ws && !off)) && nvmtl_sl_on();
+        nvlog("vk: buffer list %s (NVMTL_BUFFER_LIST=%s, %s%s)", on ? "ON - a no-copy buffer import goes only to the submits that use it"
+              : "OFF - every no-copy buffer import rides every submit", e ? e : "unset", ws ? "WindowServer" : "not WindowServer",
+              off ? ", nvmtl-bl-off present" : ""); }
     return on;
 }
 int nvmtl_vk_buffer_list_mark(nvk_buffer *b)
