@@ -105,6 +105,7 @@ public:
     virtual void free() override;
     IOReturn go(uint32_t pass);
     static void autoGo(void *p0, wait_result_t w);
+    void waitForNmxFb();
     static void bootHoldCap(thread_call_param_t p0, thread_call_param_t p1);
     void releaseBootHold(const char *why);
     void snapshotBootScreen();
@@ -783,6 +784,75 @@ static bool nvrmNoDisplayOnAnyNub()
     return seen && none;
 }
 
+// The 890M's PCI device (NMXGPU's provider), or nullptr. Retained.
+static IOPCIDevice *nvrmCopy890M()
+{
+    OSDictionary *m = IOService::serviceMatching("NMXGPU");
+    if (!m) return nullptr;
+    IOService *g = IOService::copyMatchingService(m);
+    m->release();
+    if (!g) return nullptr;
+    IOPCIDevice *d = OSDynamicCast(IOPCIDevice, g->getProvider());
+    if (d) d->retain();
+    g->release();
+    return d;
+}
+
+// One line with the 890M's MSI capability (control, address, data), to see whether this card's MSI bring-up
+// changes it (ga403wm 2026-11-06: the 890M's next MSI after NVRM's MSI enable never arrived).
+static void nvrmLog890MMsi(const char *where)
+{
+    IOPCIDevice *d = nvrmCopy890M();
+    if (!d) return;
+    UInt8 cap = 0;
+    if (d->findPCICapability(kIOPCIMSICapability, &cap) && cap) {
+        UInt16 ctrl = d->configRead16(cap + 2);
+        UInt32 lo = d->configRead32(cap + 4);
+        bool b64 = ctrl & 0x80;
+        UInt32 hi = b64 ? d->configRead32(cap + 8) : 0;
+        UInt16 data = d->configRead16(cap + (b64 ? 0xC : 0x8));
+        LOG("890M MSI %s: ctrl 0x%04x addr 0x%08x%08x data 0x%04x cmd 0x%04x", where, ctrl, hi, lo, data, d->configRead16(0x04));
+    } else {
+        LOG("890M MSI %s: no MSI capability", where);
+    }
+    d->release();
+}
+
+// ga403wm (2026-11-06 15:43/15:48 black boots): this card's MSI enable + RmInitAdapter ran while NMXGPU was still
+// attaching. The 890M's next MSI was lost, NMXGPU noticed only ~5 s later (degraded IH poll), and NMXAMDFB was
+// published after this card's boot hold had ended, so WindowServer scanned the 890M with no framebuffer and used the
+// virtual display. Good boots won the race by 0.11-0.12 s. With NMXGPU present, the bring-up now waits for NMXAMDFB
+// with the boot hold still taken, so WindowServer waits too. nvrmnmxwait=<s> (default 20, 0 = off) caps the wait.
+void NVRM::waitForNmxFb()
+{
+    uint32_t cap = 20;
+    PE_parse_boot_argn("nvrmnmxwait", &cap, sizeof(cap));
+    if (cap == 0) { setProperty("nvrm-nmx-wait", "off (nvrmnmxwait=0)"); LOG("890M wait: off (nvrmnmxwait=0)"); return; }
+    if (cap > 120) cap = 120;
+    uint64_t t0; clock_get_uptime(&t0);
+    // NMXGPU itself registers before this card starts; give it a short grace in case the order flips
+    OSDictionary *mg = serviceMatching("NMXGPU"), *mf = serviceMatching("NMXAMDFB");
+    if (!mg || !mf) { if (mg) mg->release(); if (mf) mf->release(); LOG("890M wait: no matching dictionary - not waiting"); return; }
+    IOService *g = waitForMatchingService(mg, 3ULL * NSEC_PER_SEC);
+    mg->release();
+    if (!g) { mf->release(); setProperty("nvrm-nmx-wait", "no NMXGPU"); LOG("890M wait: no NMXGPU in 3 s - not waiting"); return; }
+    g->release();
+    IOService *fb = waitForMatchingService(mf, (uint64_t)cap * NSEC_PER_SEC);
+    mf->release();
+    uint64_t t1, ns; clock_get_uptime(&t1); absolutetime_to_nanoseconds(t1 - t0, &ns);
+    char b[96];
+    if (fb) {
+        fb->release();
+        snprintf(b, sizeof b, "NMXAMDFB after %llu ms", (unsigned long long)(ns / 1000000ULL));
+        LOG("890M wait: NMXAMDFB registered after %llu ms - starting this card's bring-up (MSI + RmInitAdapter)",
+            (unsigned long long)(ns / 1000000ULL));
+    } else {
+        snprintf(b, sizeof b, "TIMEOUT %u s (no NMXAMDFB)", cap);
+        LOG("890M wait: no NMXAMDFB after %u s - starting the bring-up anyway", cap);
+    }
+    setProperty("nvrm-nmx-wait", b);
+}
+
 void NVRM::autoGo(void *p0, wait_result_t)
 {
     NVRM *s = (NVRM *)p0;
@@ -811,6 +881,7 @@ void NVRM::autoGo(void *p0, wait_result_t)
     } else {
         IOSleep(s->fAutoGoSettleMs);
     }
+    s->waitForNmxFb();
     s->measureBootRaster();
     { thread_t hw = THREAD_NULL; s->retain();
       if (kernel_thread_start(&NVRM::headWatch, s, &hw) == KERN_SUCCESS) thread_deallocate(hw); else s->release(); }
@@ -1483,11 +1554,14 @@ IOReturn NVRM::go(uint32_t pass)
                     OSMemberFunctionCast(IOInterruptEventAction, this, &NVRM::interruptOccurred),
                     OSMemberFunctionCast(IOFilterInterruptAction, this, &NVRM::interruptFilter), fPCI, msi);
         if (!fWorkLoop || !fIntSrc || fWorkLoop->addEventSource(fIntSrc) != kIOReturnSuccess) { LOG("interrupt source setup FAILED"); return kIOReturnError; }
+        nvrmLog890MMsi("before this card's MSI enable");
         fIntSrc->enable();
+        nvrmLog890MMsi("after this card's MSI enable");
         nv->interrupt_line = (NvU32)msi;
         LOG("MSI %d armed; calling rm_init_adapter() — GSP boot from inside macOS", msi);
         NvBool ok = rm_init_adapter(NULL, nv);
         LOG("rm_init_adapter -> %s", ok ? "OK" : "FAILED");
+        nvrmLog890MMsi("after rm_init_adapter");
         nv_xnu_dump_live_allocs();
         nv_xnu_dump_gsp_regs(nv);
         if (!ok) return kIOReturnError;
