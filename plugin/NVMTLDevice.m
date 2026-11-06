@@ -1017,7 +1017,8 @@ static BOOL nvmtl_surface_can_shader_write(NVMTLTexture *t) {
 static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL writable) {
     if (usage == MTLTextureUsageUnknown && !writable) return usage;
     static int ws = -1;
-    if (ws < 0) { const char *me = getprogname(); ws = me && !strcmp(me, "WindowServer"); }
+    if (ws < 0) { const char *me = getprogname(), *e = getenv("NVMTL_SURF_WIDEN");
+                  ws = (me && !strcmp(me, "WindowServer")) || (e && e[0] == '0'); }   // NVMTL_SURF_WIDEN=0: old usage
     if (!fbo && !ws) {
         usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
         if (writable) usage |= MTLTextureUsageShaderWrite;
@@ -1072,7 +1073,8 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL writable)
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(t));
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
-    if (key && !t->_vramOn) nvmtl_surface_keep(self, key, t);
+    { static int keepOff = -1; if (keepOff < 0) { const char *e = getenv("NVMTL_KEEP_OFF"); keepOff = e && e[0] == '1'; }
+      if (key && !t->_vramOn && !keepOff) nvmtl_surface_keep(self, key, t); }   // NVMTL_KEEP_OFF=1: weak cache only
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

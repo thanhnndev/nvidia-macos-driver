@@ -256,6 +256,12 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 @interface NVMTLCommandQueue () { @public NSString *_label; } @end
 @interface NVMTLCommandBuffer () { @public NSString *_label; uint64_t _rep; } @end
 @interface NVMTLCommandBuffer () { @public NSMutableSet *_stTwins; } @end
+@interface NVMTLCommandBuffer () { @public uint64_t _fsCommitNs; } @end
+// NVMTL_FRAME_STATS=1: every 5 s, command buffers committed, commit -> completed latency, and surface-in copies
+// (count, time) for this process. Lag diagnosis (Photo Booth camera preview, docs/890M-TRACE.md).
+int nvmtl_frame_stats_on(void);
+void nvmtl_frame_stats_cb(uint64_t commitNs, uint64_t doneNs);
+void nvmtl_frame_stats_surfin(uint64_t ns, size_t bytes);
 @interface NVMTLTexture () { @public nvk_image _stTwin; BOOL _stTwinTried; } @end
 @interface NVMTLDepthStencilState () { @public NSString *_label; } @end
 @interface NVMTLSamplerState () { @public NSString *_label; } - (const nvk_sampler *)nvmtlClampedLo:(float)lo hi:(float)hi; @end

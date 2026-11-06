@@ -1219,6 +1219,33 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         return monitor;
     }
 }
+int nvmtl_frame_stats_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_FRAME_STATS"); on = e && e[0] == '1'; } return on; }
+static struct { uint64_t cbs, latSum, latMax, ins, inNs, inMax, inBytes, t0; } nvmtl_fs;
+static os_unfair_lock nvmtl_fs_lock = OS_UNFAIR_LOCK_INIT;
+static void nvmtl_fs_report_locked(uint64_t now) {
+    if (!nvmtl_fs.t0) { nvmtl_fs.t0 = now; return; }
+    if (now - nvmtl_fs.t0 < 5000000000ull) return;
+    const double s = (now - nvmtl_fs.t0) / 1e9;
+    nvlog("frame stats: %.1f s: %llu command buffers (%.1f/s), commit->completed avg %.2f ms max %.2f ms; surface-in %llu "
+          "copies (%.1f/s, %.1f MB/s), avg %.2f ms max %.2f ms", s, nvmtl_fs.cbs, nvmtl_fs.cbs / s,
+          nvmtl_fs.cbs ? nvmtl_fs.latSum / 1e6 / nvmtl_fs.cbs : 0, nvmtl_fs.latMax / 1e6, nvmtl_fs.ins, nvmtl_fs.ins / s,
+          nvmtl_fs.inBytes / 1048576.0 / s, nvmtl_fs.ins ? nvmtl_fs.inNs / 1e6 / nvmtl_fs.ins : 0, nvmtl_fs.inMax / 1e6);
+    memset(&nvmtl_fs, 0, sizeof nvmtl_fs); nvmtl_fs.t0 = now;
+}
+void nvmtl_frame_stats_cb(uint64_t commitNs, uint64_t doneNs) {
+    const uint64_t d = doneNs > commitNs ? doneNs - commitNs : 0;
+    os_unfair_lock_lock(&nvmtl_fs_lock);
+    nvmtl_fs.cbs++; nvmtl_fs.latSum += d; if (d > nvmtl_fs.latMax) nvmtl_fs.latMax = d;
+    nvmtl_fs_report_locked(doneNs);
+    os_unfair_lock_unlock(&nvmtl_fs_lock);
+}
+void nvmtl_frame_stats_surfin(uint64_t ns, size_t bytes) {
+    os_unfair_lock_lock(&nvmtl_fs_lock);
+    nvmtl_fs.ins++; nvmtl_fs.inNs += ns; nvmtl_fs.inBytes += bytes; if (ns > nvmtl_fs.inMax) nvmtl_fs.inMax = ns;
+    nvmtl_fs_report_locked(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    os_unfair_lock_unlock(&nvmtl_fs_lock);
+}
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf || r->_hostOn) return;   // host-backed: the GPU reads the surface's own pages
@@ -1235,7 +1262,9 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
+    const uint64_t fs0 = nvmtl_frame_stats_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     int rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
+    if (fs0) nvmtl_frame_stats_surfin(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - fs0, row * r->_i.h);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }

@@ -343,6 +343,7 @@ static void nvmtl_part_list_surfaces(nvk_cmdbuf *c, NVMTLResSet *res, NSSet *sur
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
     [_completionCondition unlock];
+    if (_fsCommitNs) nvmtl_frame_stats_cb(_fsCommitNs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     [_parts removeAllObjects];
     // A finished command buffer lets go of everything only its GPU work needed: the setBytes ring and the scratch
     // buffers it filled, and any resources still listed on it. Apple's command buffers do the same. An app's
@@ -599,6 +600,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         _committed = YES;
         if (!__atomic_load_n(&_rep, __ATOMIC_ACQUIRE)) __atomic_store_n(&_rep, nvmtl_ep_enter(), __ATOMIC_RELEASE);
         [_completionCondition lock]; _cbstatus = MTLCommandBufferStatusCommitted; [_completionCondition unlock];
+        if (nvmtl_frame_stats_on()) _fsCommitNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         [self nvmtlSealPartWithSignal:nil value:0 restart:NO];
         nvmtl_surface_register_writes(self);
         nvmtl_nmx_fence_mark(self);
