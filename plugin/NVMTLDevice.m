@@ -796,8 +796,60 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
+// Planes of a multi-plane surface (camera and video frames: 420v/420f/x420 from CoreMediaIO and VideoToolbox) on an
+// AMD APU: like the single-plane path below, the GPU reads the plane in the surface's own pages, here one host import of
+// the whole surface per plane wrapper, with the image at the plane's offset. Their rows are rarely 256 B multiples
+// (Photo Booth's 1920x1080 camera frames: 2884-2904 B), so the image is a shadow (nvmtl_btsh in nvmtl_vk.c): each
+// command buffer that uses it copies the plane's rows into it on the GPU before it runs. Before this every plane
+// wrapper was a private image filled on the CPU, a submit and a wait per copy: ~400 copies and ~600 MB/s in Photo Booth
+// at 30 fps (docs/890M-TRACE.md). A wrapper whose descriptor allows writes (RenderTarget, ShaderWrite or Unknown) also
+// copies its rows back at the end of each command buffer; a read-only one never touches the surface.
+// Off in WindowServer until it has run there (it composites video planes of every app; NVMTL_PLANE_HOST=1 turns it on
+// in any process, NVMTL_PLANE_HOST=0 or NVMTL_NO_PLANE_HOST=1 keeps the private images).
+static int nvmtl_plane_host_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_PLANE_HOST"), *me = getprogname();
+                  const int ws = me && !strcmp(me, "WindowServer");
+                  on = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST") && !getenv("NVMTL_NO_PLANE_HOST")
+                       && (e ? e[0] == '1' : !ws);
+                  nvlog("surface planes: %s", on ? "host import of the surface's own pages, shadowed on the GPU (NVMTL_NO_PLANE_HOST=1: private copies)"
+                                                   : "private images copied in and out"); }
+    return on;
+}
+static unsigned long long g_plane_host, g_plane_host_ro;
+static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
+                                   uint32_t vkf, uint32_t bpp, int a8, int stex, int rw)
+{
+    if (!bpp) bpp = 4;
+    const size_t al = nvmtl_vk_host_import_align(), alloc = IOSurfaceGetAllocSize(surf);
+    const uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surf), pb = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surf, (uint32_t)plane);
+    const size_t row = IOSurfaceGetBytesPerRowOfPlane(surf, (uint32_t)plane);
+    const char *why = NULL;
+    if (!base || !pb || !al || !alloc) why = "no base address";
+    else if (base & (al - 1)) why = "base not page aligned";
+    else if (pb < base || pb - base >= alloc) why = "plane outside the allocation";
+    else if (!row || row < (size_t)w * bpp || row % bpp || (pb - base) % bpp) why = "row pitch";
+    else if (h > IOSurfaceGetHeightOfPlane(surf, (uint32_t)plane) || (size_t)w > IOSurfaceGetWidthOfPlane(surf, (uint32_t)plane)) why = "image larger than the plane";
+    else if ((pb - base) + row * (h - 1) + (size_t)w * bpp > alloc) why = "rows pass the allocation";
+    if (why) { static unsigned said; if (said++ < 8) nvlog("surface %u plane %lu %ux%u: no host import (%s; row %zu, offset %zu, alloc %zu)",
+                   (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, why, row, (size_t)(pb - base), alloc); return -1; }
+    const size_t span = (alloc + al - 1) & ~(al - 1);
+    nvk_buffer hb;
+    if (nvmtl_vk_buffer_import_host((void *)base, span, &hb)) return -1;
+    if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, rw && stex, rw, &hb, pb - base, row, &t->_i)) {
+        nvmtl_vk_buffer_destroy(&hb); return -1; }
+    t->_hostBuf = hb; t->_hostOn = YES; t->_hostRO = !rw; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+    t->_hostSL = nvmtl_vk_surface_list_mark(&t->_hostBuf) ? YES : NO;
+    g_plane_host++; g_plane_host_ro += !rw;
+    static unsigned said; if (said++ < 8 || g_plane_host % 2000 == 0)
+        nvlog("surface %u plane %lu %ux%u pitch %zu at +%zu (%zu plane(s), fmt '%.4s') -> its own pages (host import, %s; %llu planes, %llu read-only)",
+              (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, row, (size_t)(pb - base), IOSurfaceGetPlaneCount(surf),
+              (const char *)&(uint32_t){ OSSwapHostToBigInt32(IOSurfaceGetPixelFormat(surf)) }, rw ? "written back after each command buffer" : "read-only",
+              g_plane_host, g_plane_host_ro);
+    return 0;
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
-                                      uint32_t vkf, uint32_t bpp, int a8, int stex)
+                                      uint32_t vkf, uint32_t bpp, int a8, int stex, int rw)
 {
     // AMD APU (Radeon 780M): the GPU renders and samples the IOSurface's own pages, a linear image over the surface's
     // allocation imported as host memory (VK_EXT_external_memory_host), so nothing is copied in or out. Without it
@@ -826,6 +878,8 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             }
         }
     }
+    if (surf && (plane != 0 || IOSurfaceGetPlaneCount(surf) > 1) && nvmtl_plane_host_on()
+        && !nvmtl_plane_host_create(t, surf, plane, w, h, vkf, bpp, a8, stex, rw)) return 0;
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
@@ -1052,25 +1106,28 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL writable)
     // surface must share that image, just as successful family imports do,
     // whether a wrapper reads it or writes it (the image is made writable).
     // Weak entries do not pin the image after the application's last wrapper.
+    const int rw = d.usage == MTLTextureUsageUnknown || (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
+    // a read-only plane import never copies its rows back: a wrapper that may write gets its own (it replaces the entry)
+    if (backing && backing->_hostRO && rw) backing = nil;
     if (backing && !backing->_vramOn) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
             nvmtl_surface_touch(self, key);
             { static unsigned long long hits; if (++hits <= 4 || hits % 20000 == 0) nvlog("surface keep: hit #%llu (surface %u, %s)", hits,
                   (unsigned)IOSurfaceGetID(surf), backing->_hostOn ? "own pages" : "private image"); }
-            alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(alias)); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo; alias->_drawable = t->_drawable;
+            alias->_viewParent = nil; alias->_usage = backing->_hostRO ? d.usage : nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(alias)); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo; alias->_drawable = t->_drawable;
             nvmtl_texture_desc_swizzle(alias, d);
             return alias;
         }
     }
-    if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
+    if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex, rw)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
     t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage != 0;
-    t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(t));
+    t->_usage = t->_hostRO ? d.usage : nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(t));
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
     { static int keepOff = -1; if (keepOff < 0) { const char *e = getenv("NVMTL_KEEP_OFF"); keepOff = e && e[0] == '1'; }
