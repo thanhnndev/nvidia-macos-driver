@@ -190,6 +190,7 @@ static uint32_t g_timestamp_bits;
 static PFN_vkGetCalibratedTimestampsEXT pvkGetCalibratedTimestampsEXT;
 static nvmtl_gpu_clock g_gpu_clock;
 static char g_name[256];
+static int g_integrated;   // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: VRAM and system memory are the same DRAM
 static VkPhysicalDeviceLimits g_lim;
 static uint32_t g_sm_count;
 static _Atomic int g_state;
@@ -816,6 +817,7 @@ static int nvmtl_vk_initialize(void)
     VkPhysicalDevice pds[8]; if (n > 8) n = 8; pvkEnumeratePhysicalDevices(g_inst, &n, pds); g_pdev = pds[0];
     VkPhysicalDeviceProperties pp; pvkGetPhysicalDeviceProperties(g_pdev, &pp);
     snprintf(g_name, sizeof g_name, "%s", pp.deviceName);
+    g_integrated = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     g_lim = pp.limits;
     { VkPhysicalDeviceShaderSMBuiltinsPropertiesNV sm = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV };
       VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sm };
@@ -1117,6 +1119,7 @@ int nvmtl_vk_init(void) {
     return g_state == 1 ? 0 : -1;
 }
 const char *nvmtl_vk_device_name(void) { return g_state == 1 ? g_name : "(vulkan down)"; }
+int nvmtl_vk_integrated(void) { return g_state == 1 && g_integrated; }
 void nvmtl_vk_limits(uint32_t *layers, uint32_t *shared_bytes, uint32_t wg[3], uint32_t *wg_inv, uint32_t *sm) {
     int up = g_state == 1;
     if (layers) *layers = up ? g_lim.maxImageArrayLayers : 0;
@@ -1563,9 +1566,13 @@ static _Atomic unsigned long long g_bl_marked, g_bl_unmarked;
 static int nvmtl_bl_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_BUFFER_LIST"); on = !(e && e[0] == '0') && nvmtl_sl_on();
+    // OFF by default since 2026-11-06 14:07: the first boot with it on had one GPU permission fault (TCP read) in
+    // WindowServer, a hang, and WindowServer's restart (docs/890M-TRACE.md part 11). Some path uses a no-copy import
+    // without the command buffer naming it; a userptr BO left out of a submit is not revalidated, so it faults once
+    // its pages were invalidated. NVMTL_BUFFER_LIST=1 turns it on to hunt that path.
+    if (on < 0) { const char *e = getenv("NVMTL_BUFFER_LIST"); on = (e && e[0] == '1') && nvmtl_sl_on();
         nvlog("vk: buffer list %s (NVMTL_BUFFER_LIST=%s)", on ? "ON - a no-copy buffer import goes only to the submits that use it"
-              : "OFF - every no-copy buffer import rides every submit", e ? e : "unset"); }
+              : "OFF (default; NVMTL_BUFFER_LIST=1 turns it on) - every no-copy buffer import rides every submit", e ? e : "unset"); }
     return on;
 }
 int nvmtl_vk_buffer_list_mark(nvk_buffer *b)
@@ -5803,7 +5810,7 @@ int nvmtl_vk_cmd_abandon(nvk_cmdbuf *c)
 static pthread_mutex_t nvmtl_submit_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 void (*nvmtl_pre_submit_hook)(void);
 void (*nvmtl_pre_release_hook)(void *);
-typedef struct { nvk_cmdbuf cb; unsigned begun, n, fills, copies, nhold; unsigned long long bytes; void *hold[4]; } nvmtl_prologue;
+typedef struct { nvk_cmdbuf cb; unsigned begun, n, fills, copies, nhold, btsh; unsigned long long bytes, btsh_bytes; void *hold[4]; } nvmtl_prologue;
 static __thread nvmtl_prologue *g_pre_cur;
 static _Atomic unsigned long long g_pre_subs, g_pre_copies, g_pre_fills, g_pre_bytes, g_pre_fail;
 static int nvmtl_prologue_on(void)
@@ -5915,6 +5922,7 @@ static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
         const nvmtl_btsh *s = (const nvmtl_btsh *)c->btsh[i];
         nvmtl_btsh_rows(p->cb.cb, s, 1);
         p->n++; p->copies++; p->bytes += (unsigned long long)s->rowbytes * s->h;
+        p->btsh++; p->btsh_bytes += (unsigned long long)s->rowbytes * s->h;
     }
     atomic_fetch_add(&g_btsh_in, c->nbtsh);
     const unsigned long long k = atomic_fetch_add(&g_btsh_cbs, 1);
@@ -6098,10 +6106,15 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
     pt[6] = nvmtl_perf_now();
     if (pre->begun) {
         pre->cb.wseq = c->wseq; nvmtl_cmd_retire(&pre->cb); nvmtl_pre_drop(pre);
+        static unsigned long long g_pre_btsh, g_pre_btsh_bytes;
         const unsigned long long k = g_pre_subs++; g_pre_copies += pre->copies; g_pre_fills += pre->fills; g_pre_bytes += pre->bytes;
+        g_pre_btsh += pre->btsh; g_pre_btsh_bytes += pre->btsh_bytes;
         if (!k || ((k + 1) & 0xFFF) == 0)
-            nvlog("vk: pre-submit prologue census: %llu submits carried %llu managed uploads + %llu zero fills (%llu KB) - each WAS its own submit; %llu prologues failed",
-                  k + 1, (unsigned long long)g_pre_copies, (unsigned long long)g_pre_fills, (unsigned long long)(g_pre_bytes >> 10), (unsigned long long)g_pre_fail);
+            nvlog("vk: pre-submit prologue census: %llu submits carried %llu uploads + %llu zero fills (%llu KB) - each WAS its own submit; %llu prologues failed; "
+                  "of the uploads %llu managed buffer (%llu KB), %llu buffer-texture shadow (%llu KB)",
+                  k + 1, (unsigned long long)g_pre_copies, (unsigned long long)g_pre_fills, (unsigned long long)(g_pre_bytes >> 10), (unsigned long long)g_pre_fail,
+                  (unsigned long long)(g_pre_copies - g_pre_btsh), (unsigned long long)((g_pre_bytes - g_pre_btsh_bytes) >> 10),
+                  (unsigned long long)g_pre_btsh, (unsigned long long)(g_pre_btsh_bytes >> 10));
     }
     nvmtl_cmd_retire(c);
     pt[7] = nvmtl_perf_now();

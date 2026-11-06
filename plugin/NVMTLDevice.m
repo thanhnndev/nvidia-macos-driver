@@ -511,14 +511,27 @@ static void nvmtl_install_hw_resource_pools(id dev)
 
 static void nvmtl_zero_new_buffer(NVMTLBuffer *b, NSUInteger len);
 static __thread int gZeroSkip;
+// Managed buffers in one CPU-visible allocation, no VRAM copy: the default on an integrated GPU, where VRAM and system
+// memory are the same DRAM and the copy only costs bandwidth. WindowServer's CoreAnimation vertex buffers are Managed:
+// ~430k uploads (14 GB) in its first 4 minutes on the 890M, ~21 per submit (docs/890M-TRACE.md part 11).
+// NVMTL_MANAGED_SYSMEM=0 keeps the VRAM copy, =1 forces one allocation on a discrete GPU too.
+int nvmtl_managed_sysmem(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_MANAGED_SYSMEM"); const int igpu = nvmtl_vk_integrated();
+        on = e ? (e[0] != '0') : igpu;
+        nvlog("managed buffers: %s (NVMTL_MANAGED_SYSMEM=%s, %s GPU)", on ? "ONE CPU-visible allocation, no VRAM copy" : "VRAM copy + CPU shadow, uploaded by didModifyRange",
+              e ? e : "unset", igpu ? "integrated" : "discrete"); }
+    return on;
+}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt {
     if (nvmtl_vk_init()) return nil;
     if (nvmtl_alloc_blocked()) return nil;
     NVMTLBuffer *b = [NVMTLBuffer new];
     b->_storage = (MTLStorageMode)((opt >> MTLResourceStorageModeShift) & 0xF);
     b->_ropt = opt & ((MTLResourceOptions)0xF | ((MTLResourceOptions)0x3 << MTLResourceHazardTrackingModeShift));
-    int hv = (b->_storage == MTLStorageModeShared) || (b->_storage == MTLStorageModeManaged && getenv("NVMTL_MANAGED_SYSMEM"));
-    if (nvmtl_vk_buffer_create(len, (hv && b->_storage == MTLStorageModeShared) ? 2 : hv, &b->_b)) {
+    const int msys = b->_storage == MTLStorageModeManaged && nvmtl_managed_sysmem();
+    int hv = (b->_storage == MTLStorageModeShared) || msys;
+    if (nvmtl_vk_buffer_create(len, hv ? 2 : 0, &b->_b)) {
         if (hv) { nvmtl_alloc_failed("newBufferWithLength"); nvlog("newBufferWithLength: FAILED"); return nil; }
         nvlog("newBufferWithLength:%lu private: VRAM refused - placing it in system memory", (unsigned long)len);
         if (nvmtl_vk_buffer_create(len, 1, &b->_b)) { nvmtl_alloc_failed("newBufferWithLength"); nvlog("newBufferWithLength: FAILED"); return nil; }

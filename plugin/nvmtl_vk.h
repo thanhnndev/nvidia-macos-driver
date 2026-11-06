@@ -293,6 +293,8 @@ void nvmtl_vk_surface_list_unmark(nvk_buffer *b);
 void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b);
 void nvmtl_vk_cmd_exact(nvk_cmdbuf *c);
 int nvmtl_vk_buffer_list_mark(nvk_buffer *b);
+int nvmtl_vk_integrated(void);
+int nvmtl_managed_sysmem(void);
 void nvmtl_vk_buffer_list_unmark(nvk_buffer *b);
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);
 void nvmtl_vk_image_destroy(nvk_image *i);

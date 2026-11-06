@@ -43,7 +43,7 @@ static void nvbt(const char *tag, int *count, int max);
     // Horizon Detection hit the 60 s GPU watchdog). The caller's pages become the managed shadow, so contents is still
     // the caller's pointer, and the GPU side lives in VRAM. Under 1 MiB the transfer outweighs the win (the same
     // threshold the Shared pair uses), so small buffers stay zero-copy.
-    if (sm == MTLStorageModeManaged && a1 >= (1u << 20) && nvmtl_vk_buffer_import_host(a0, a1, &b->_shadow) == 0) {
+    if (sm == MTLStorageModeManaged && a1 >= (1u << 20) && !nvmtl_managed_sysmem() && nvmtl_vk_buffer_import_host(a0, a1, &b->_shadow) == 0) {
         if (nvmtl_vk_buffer_create(a1, 0, &b->_b) == 0) {
             [b didModifyRange:NSMakeRange(0, a1)];
             { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: managed %lu bytes -> VRAM copy, caller's pages are the shadow", (unsigned long)a1); }
