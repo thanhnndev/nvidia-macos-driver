@@ -9,6 +9,7 @@
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #include "nvmtl_vk.h"
+#include <stdatomic.h>
 
 static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     const NSUInteger stride = 2 * sizeof(uint32_t) + sizeof(void *) + 16;
@@ -283,6 +284,12 @@ typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_p
 @interface NVMTLTexture () { @public BOOL _subPlaced, _parkable; uint32_t _pkey[12]; NSUInteger _pkLen; } @end
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 @interface NVMTLBuffer () { @public nvmtl_park_t *_bpk; uint32_t _nbpk; os_unfair_lock _bpl; } @end
+/* _hostSL: _b is a no-copy import on RADV's surface list (nvmtl_vk_buffer_list_mark); nvmtl_buf_escape puts it back on
+   the global list once its address can reach the GPU without the command buffer retaining it */
+@interface NVMTLBuffer () { @public _Atomic BOOL _hostSL; } @end
+static inline void nvmtl_buf_escape(NVMTLBuffer *b) {
+    if (b && atomic_load_explicit(&b->_hostSL, memory_order_relaxed) && atomic_exchange(&b->_hostSL, NO)) nvmtl_vk_buffer_list_unmark(&b->_b);
+}
 @interface NVMTLTexture () { @public BOOL _bparkable, _dparkable; } @end
 static void nvmtl_heap_park(NVMTLHeap *h, nvk_image *img, const uint32_t *key, NSUInteger off, NSUInteger len);
 void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared);

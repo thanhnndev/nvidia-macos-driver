@@ -1554,6 +1554,37 @@ void nvmtl_vk_surface_list_unmark(nvk_buffer *b)
     if (!b || !b->mem || !nvmtl_sl_on()) return;
     if (g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_FALSE) == VK_SUCCESS) atomic_fetch_add(&g_sl_unmarked, 1);
 }
+/* Buffer list: newBufferWithBytesNoCopy imports are host-pointer BOs too, and after the surface list they were the whole
+   global list (WindowServer: ~500 of them, 45 MB, ~120 handles on every submit; docs/890M-TRACE.md part 8). They go
+   on the same RADV list; a part lists the ones its retained resources name. A buffer whose address leaves the command
+   buffer's tracking (gpuAddress, argument encoder) goes back to the global list. NVMTL_BUFFER_LIST=0 keeps them all
+   global. */
+static _Atomic unsigned long long g_bl_marked, g_bl_unmarked;
+static int nvmtl_bl_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_BUFFER_LIST"); on = !(e && e[0] == '0') && nvmtl_sl_on();
+        nvlog("vk: buffer list %s (NVMTL_BUFFER_LIST=%s)", on ? "ON - a no-copy buffer import goes only to the submits that use it"
+              : "OFF - every no-copy buffer import rides every submit", e ? e : "unset"); }
+    return on;
+}
+int nvmtl_vk_buffer_list_mark(nvk_buffer *b)
+{
+    if (!b || !b->mem || !b->imported || !nvmtl_bl_on()) return 0;
+    if (g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_TRUE) != VK_SUCCESS) return 0;
+    const unsigned long long m = atomic_fetch_add(&g_bl_marked, 1) + 1;
+    if ((m & 0x3FF) == 0) nvlog("vk: buffer list: %llu no-copy imports moved, %llu back to global (address escaped)",
+                                m, (unsigned long long)atomic_load(&g_bl_unmarked));
+    return 1;
+}
+void nvmtl_vk_buffer_list_unmark(nvk_buffer *b)
+{
+    if (!b || !b->mem || !g_sl_set) return;
+    if (g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_FALSE) == VK_SUCCESS) {
+        const unsigned long long u = atomic_fetch_add(&g_bl_unmarked, 1) + 1;
+        if (u <= 4 || (u & 0x3FF) == 0) nvlog("vk: buffer list: a no-copy import's address escaped (%llu so far) - it rides every submit again", u);
+    }
+}
 void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b)
 {
     if (!c || !c->cb || !b || !b->mem || !g_sl_use) return;

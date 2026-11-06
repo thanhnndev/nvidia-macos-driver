@@ -54,6 +54,7 @@ static void nvbt(const char *tag, int *count, int max);
         return b;
     }
     if (nvmtl_vk_buffer_import_host(a0, a1, &b->_b) == 0) {
+        b->_hostSL = nvmtl_vk_buffer_list_mark(&b->_b) ? YES : NO;
         static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: IMPORTED the caller's pages (%lu bytes at %p) \u2014 zero copy", (unsigned long)a1, a0);
         return b;
     }

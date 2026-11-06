@@ -853,7 +853,7 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
 - (id<MTLBuffer>)remoteStorageBuffer { return nil; }
 - (id<MTLBuffer>)newRemoteBufferViewForDevice:(id<MTLDevice>)d { return nil; }
 - (kern_return_t)setOwnerWithIdentity:(task_id_token_t)t { return nvmtl_owner_check(t); }
-- (uint64_t)gpuAddress { return nvmtl_vk_buffer_address(&_b); }
+- (uint64_t)gpuAddress { nvmtl_buf_escape(self); return nvmtl_vk_buffer_address(&_b); }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)s {
     if (_heap || _subHeap || _hostPtr) return MTLPurgeableStateNonVolatile;
     MTLPurgeableState prev = nvmtl_purge(&_purge, s);
@@ -1114,6 +1114,7 @@ unsigned long long nvmtl_tex_objs_released(void) { return nvmtl_tex_objs_gone; }
     // go back to the global BO list, which every submit carries.
     { NVMTLTexture *root = self; while (root->_parent) root = root->_parent;
       @synchronized (root) { if (root->_hostSL) { root->_hostSL = NO; nvmtl_vk_surface_list_unmark(&root->_hostBuf); } } }
+    for (NVMTLTexture *v = self; v; v = v->_parent) if (v->_backBuf) nvmtl_buf_escape(v->_backBuf);   // its buffer's pages too
     @synchronized (self) { if (!_resid) _resid = nvmtl_resid_for_texture(self); }
     MTLResourceID rid; rid._impl = _resid; return rid;
 }
@@ -2127,6 +2128,7 @@ NSDictionary *nvmtl_index_argument_fields(NSArray *fields) {
     if (!_dst || !nvmtl_buf_cpu(_dst)) { nvlog("argument encoder: no argument buffer set (or it is not host-visible)"); return; }
     NSDictionary *f = [self nvmtlFieldAt:index];
     if (!f) { nvlog("argument encoder: this function has no [[id(%lu)]] field — REFUSED", (unsigned long)index); return; }
+    if (nb && [(id)nb isKindOfClass:[NVMTLBuffer class]]) nvmtl_buf_escape(nb);
     uint64_t addr = nb ? nvmtl_vk_buffer_address(&nb->_b) + off : 0;
     const NSUInteger fieldOffset = [f[@"field_offset"] unsignedLongValue];
     const size_t size = _dst->_b.size;
