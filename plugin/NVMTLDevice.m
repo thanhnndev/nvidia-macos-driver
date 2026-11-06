@@ -363,7 +363,7 @@ static bool nvmtl_process_is_allowed(void)
 }
 
 // Surface-wrapper keys for -newTextureWithDescriptor:iosurface:plane: (see nvmtl_surface_keep).
-@interface NVMTLSurfKey : NSObject <NSCopying> { @public uint32_t _sid, _plane; uint64_t _w, _h, _fmt, _ropt, _fbo; NSUInteger _hash; }
+@interface NVMTLSurfKey : NSObject <NSCopying> { @public uint32_t _sid, _plane; uint64_t _w, _h, _fmt, _ropt, _fbo, _drawable; NSUInteger _hash; }
 @end
 @implementation NVMTLSurfKey
 - (id)copyWithZone:(NSZone *)zone { (void)zone; return self; }   // immutable
@@ -373,18 +373,18 @@ static bool nvmtl_process_is_allowed(void)
     if (!o || object_getClass(o) != object_getClass(self)) return NO;
     const NVMTLSurfKey *k = o;
     return k->_sid == _sid && k->_plane == _plane && k->_w == _w && k->_h == _h && k->_fmt == _fmt && k->_ropt == _ropt
-        && k->_fbo == _fbo;
+        && k->_fbo == _fbo && k->_drawable == _drawable;
 }
 @end
 static inline uint64_t nvmtl_mix64(uint64_t x) {   // splitmix64 finaliser
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
 static NVMTLSurfKey *nvmtl_surf_key(uint32_t sid, uint32_t plane, uint64_t w, uint64_t h, uint64_t fmt, uint64_t ropt,
-                                    uint64_t fbo) {
+                                    uint64_t fbo, uint64_t drawable) {
     NVMTLSurfKey *k = [NVMTLSurfKey new];
-    k->_sid = sid; k->_plane = plane; k->_w = w; k->_h = h; k->_fmt = fmt; k->_ropt = ropt; k->_fbo = fbo;
+    k->_sid = sid; k->_plane = plane; k->_w = w; k->_h = h; k->_fmt = fmt; k->_ropt = ropt; k->_fbo = fbo; k->_drawable = drawable;
     uint64_t x = nvmtl_mix64(((uint64_t)sid << 32) | plane);
     x = nvmtl_mix64(x ^ (w << 32 | (h & 0xffffffffull)));
-    x = nvmtl_mix64(x ^ fmt ^ (ropt << 20) ^ (fbo << 40));
+    x = nvmtl_mix64(x ^ fmt ^ (ropt << 20) ^ (fbo << 40) ^ (drawable << 41));
     k->_hash = (NSUInteger)x;
     return k;
 }
@@ -699,6 +699,11 @@ static NSData *nvmtl_varying_link(NVMTLFunction *vf, NVMTLFunction *ff) {
               vf->_fname.UTF8String ?: "?", ff->_fname.UTF8String ?: "?", moved, unmatched, told);
     return md;
 }
+// Core Image uses drawable identity to choose screen-oriented output coordinates (Photo Booth preview, upstream #471).
+static BOOL nvmtl_desc_drawable(MTLTextureDescriptor *d) {
+    SEL s = sel_registerName("isDrawable");
+    return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
+}
 static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     SEL s = sel_registerName("framebufferOnly");
     return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
@@ -717,7 +722,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     NVMTLTexture *t = [NVMTLTexture new];
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
-    t->_fbo = nvmtl_desc_fbo(d);
+    t->_fbo = nvmtl_desc_fbo(d); t->_drawable = nvmtl_desc_drawable(d);
     t->_fmt = d.pixelFormat;
     uint32_t dvk = 0, dasp = 0;
     if (nvmtl_depthfmt(d.pixelFormat, &dvk, &dasp) == 0) {
@@ -994,6 +999,31 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     nvmtl_sk.sweeps++; nvmtl_sk.sweepNsSum += dt; if (dt > nvmtl_sk.sweepNsMax) nvmtl_sk.sweepNsMax = dt;
     nvmtl_sk_report(keep, now);
 }
+// Whether a shader can write this surface texture: a storage image, or one nvmtl_storage_view_for (NVMTLObjects.m) can
+// write through an optimal-tiled storage twin. Same eligibility as that function, so Core Image sees what will work.
+static BOOL nvmtl_surface_can_shader_write(NVMTLTexture *t) {
+    if (t->_stex) return YES;
+    nvk_image *im = [t nvi];
+    if (t->_parent || !im || !im->img || !im->w || !im->h || (im->mips ? im->mips : 1) > 1 || (im->layers ? im->layers : 1) > 1
+        || im->mtl_type != 2 || (im->samples ? im->samples : 1) > 1 || im->bw > 1) return NO;
+    return nvmtl_vk_format_is_storage(im->fmt) != 0;
+}
+// A CAMetalLayer drawable with framebufferOnly=NO is, on real Metal, usable as a render target AND a compute/Core Image
+// destination. QuartzCore hands this driver a descriptor whose usage is only ShaderRead for it, so Core Image refuses the
+// texture ("texture usage must include MTLTextureUsageShaderWrite") and Photo Booth's preview stays black (upstream #433,
+// #471). WindowServer keeps the usage it asked for: it wraps hundreds of surfaces a second, none of them Core Image
+// targets. Unknown (0) is never narrowed to read/render-only: that would also forbid the storage twin ImageIO's linear
+// RGBA16Unorm outputs are written through.
+static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL writable) {
+    if (usage == MTLTextureUsageUnknown && !writable) return usage;
+    static int ws = -1;
+    if (ws < 0) { const char *me = getprogname(); ws = me && !strcmp(me, "WindowServer"); }
+    if (!fbo && !ws) {
+        usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        if (writable) usage |= MTLTextureUsageShaderWrite;
+    }
+    return usage;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
         NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
@@ -1010,12 +1040,12 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     NVMTLTexture *t = [NVMTLTexture new];
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
-    t->_fbo = nvmtl_desc_fbo(d);
+    t->_fbo = nvmtl_desc_fbo(d); t->_drawable = nvmtl_desc_drawable(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
     NVMTLSurfKey *key = surf ? nvmtl_surf_key((uint32_t)IOSurfaceGetID(surf), (uint32_t)plane, w, h, (uint64_t)d.pixelFormat,
-                                            (uint64_t)t->_ropt, (uint64_t)t->_fbo) : nil;
+                                            (uint64_t)t->_ropt, (uint64_t)t->_fbo, (uint64_t)t->_drawable) : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
@@ -1027,7 +1057,7 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
             nvmtl_surface_touch(self, key);
             { static unsigned long long hits; if (++hits <= 4 || hits % 20000 == 0) nvlog("surface keep: hit #%llu (surface %u, %s)", hits,
                   (unsigned)IOSurfaceGetID(surf), backing->_hostOn ? "own pages" : "private image"); }
-            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(alias)); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo; alias->_drawable = t->_drawable;
             nvmtl_texture_desc_swizzle(alias, d);
             return alias;
         }
@@ -1039,7 +1069,7 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage != 0;
-    t->_usage = d.usage;
+    t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(t));
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
     if (key && !t->_vramOn) nvmtl_surface_keep(self, key, t);
