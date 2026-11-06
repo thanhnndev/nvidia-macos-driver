@@ -1509,6 +1509,8 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
 static VkResult (*g_sl_set)(VkDevice, VkDeviceMemory, VkBool32);
 static void (*g_sl_use)(VkCommandBuffer, VkDeviceMemory);
 static void (*g_sl_exact)(VkCommandBuffer);
+static void (*g_sl_stats)(VkDevice, uint64_t *, uint32_t);
+static int (*g_sl_breakdown)(VkDevice, char *, size_t);
 static _Atomic unsigned long long g_sl_marked, g_sl_refused, g_sl_unmarked, g_sl_uses, g_sl_exacts;
 static int nvmtl_sl_on(void)
 {
@@ -1520,6 +1522,10 @@ static int nvmtl_sl_on(void)
             g_sl_set = (VkResult (*)(VkDevice, VkDeviceMemory, VkBool32))dlsym(g_lib, "radv_nvmtl_memory_set_surface");
             g_sl_use = (void (*)(VkCommandBuffer, VkDeviceMemory))dlsym(g_lib, "radv_nvmtl_cmd_use_memory");
             g_sl_exact = (void (*)(VkCommandBuffer))dlsym(g_lib, "radv_nvmtl_cmd_exact");
+        }
+        if (g_lib) {
+            g_sl_stats = (void (*)(VkDevice, uint64_t *, uint32_t))dlsym(g_lib, "radv_nvmtl_stats");
+            g_sl_breakdown = (int (*)(VkDevice, char *, size_t))dlsym(g_lib, "radv_nvmtl_global_breakdown");
         }
         on = !(e && e[0] == '0') && g_sl_set && g_sl_use && g_sl_exact;
         nvlog("vk: surface list %s (NVMTL_SURFACE_LIST=%s, driver %s)", on ? "ON - an IOSurface import goes only to the submits that use it"
@@ -1555,10 +1561,10 @@ void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b)
 }
 void nvmtl_vk_cmd_exact(nvk_cmdbuf *c)
 {
-    if (!c || !c->cb || !g_sl_exact || !nvmtl_sl_on()) return;
+    if (!c || !c->cb || !nvmtl_sl_on() || !g_sl_exact) return;
     g_sl_exact((VkCommandBuffer)c->cb); atomic_fetch_add(&g_sl_exacts, 1);
 }
-static void nvmtl_vk_cb_exact_raw(VkCommandBuffer cb) { if (cb && g_sl_exact && nvmtl_sl_on()) g_sl_exact(cb); }
+static void nvmtl_vk_cb_exact_raw(VkCommandBuffer cb) { if (cb && nvmtl_sl_on() && g_sl_exact) g_sl_exact(cb); }
 
 static pthread_key_t g_stage_key; static pthread_once_t g_stage_once = PTHREAD_ONCE_INIT;
 static void nvmtl_stage_free(void *p) { nvk_buffer *b = p; nvmtl_vk_buffer_destroy(b); free(b); }
@@ -5908,8 +5914,23 @@ int nvmtl_vk_submit_wait_at(nvk_cmdbuf *c, const char *who)
     const int r = nvmtl_vk_submit_begin_at(c, &f, who);
     return r ? r : nvmtl_vk_submit_finish(&f);
 }
+static void nvmtl_bo_list_census(void)
+{
+    static _Atomic unsigned long long n;
+    const unsigned long long k = atomic_fetch_add(&n, 1) + 1;
+    if (k == 1) (void)nvmtl_sl_on();
+    if (k == 256 && g_sl_breakdown) { char bl[1600]; g_sl_breakdown(g_dev, bl, sizeof bl); nvlog("vk: BO list: %s", bl); }
+    if ((k & 0xfff) == 0 && g_sl_stats) {
+        uint64_t st[7] = { 0 }; g_sl_stats(g_dev, st, 7);
+        nvlog("vk: BO list: %llu global + %llu surface BOs live; %llu submits sent %.1f handles each (global %.1f, most %llu), %llu carried the surface list",
+              (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2], st[2] ? (double)st[3] / st[2] : 0.0,
+              st[2] ? (double)st[6] / st[2] : 0.0, (unsigned long long)st[4], (unsigned long long)st[5]);
+        if ((k & 0x3fff) == 0x1000 && g_sl_breakdown) { char bl[1600]; g_sl_breakdown(g_dev, bl, sizeof bl); nvlog("vk: BO list: %s", bl); }
+    }
+}
 int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
 {
+    nvmtl_bo_list_census();
     nvmtl_subwho_note(who, 0);
     memset(f, 0, sizeof *f); f->c = c;
     uint64_t *const pt = f->pt;
