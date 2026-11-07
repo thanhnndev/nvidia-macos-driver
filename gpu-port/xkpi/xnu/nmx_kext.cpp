@@ -26,6 +26,7 @@
 #include <kern/thread_call.h>
 #include "nmx_port.h"
 #include "nmx_xnu.h"
+#include <IOKit/IODeviceTreeSupport.h>
 
 #define AMD_VENDOR 0x1002
 #define INTEL_VENDOR 0x8086
@@ -227,6 +228,122 @@ static void nmx_sysctl_install(void)
     installed = true;
 }
 
+/*
+ * ga403wm Step128 boot stage marks. The Step125 source build hung boots at ~12 s with the disk already stopped, so
+ * the kernel log of the hang never reached it. NVRAM survives: each stage is appended to "nmxgpu-stage" (the last
+ * ~180 bytes, "<uptime ms>:<stage>|" entries, rewritten whole) and forced to flash (IONVRAM-FORCESYNCNOW; the plain
+ * SYNCNOW is rate limited and an unsynced write stays in RAM). After NMXAMDFB is published a 1 s heartbeat writes
+ * "nmxgpu-alive" for 40 s (uptime, beats, 890M IRQs dispatched, NVRM's nvrm-nmx-wait), so the last one dates the hang.
+ * Both live in the Apple NVRAM GUID (7C436110-AB2A-4BBB-A880-FE41995C9F82). Boot-arg nmxstage=0 turns them off.
+ * Never from interrupt context or with interrupts off (NVRAM writes take locks and may sleep). No memchr and no
+ * ml_get_interrupts_enabled: no other kext here imports them, so their kext export is unproven (Step128 lesson).
+ */
+static IOLock *g_stage_lock;
+static char g_stage_buf[192];
+static size_t g_stage_len;
+static int g_stage_on = -1;
+extern "C" unsigned long nmx_irq_dispatched;
+
+static void nmx_nvram_put(const char *key, const char *val, size_t len)
+{
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (options == nullptr)
+        return;
+    if (OSData *d = OSData::withBytes(val, (unsigned)len)) {
+        options->setProperty(key, d);
+        d->release();
+    }
+    if (OSData *one = OSData::withBytes("1", 1)) {
+        options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", one);
+        one->release();
+    }
+    options->release();
+}
+
+static bool nmx_stage_enabled()
+{
+    if (g_stage_on < 0) {
+        int v = 1;
+        if (PE_parse_boot_argn("nmxstage", &v, sizeof(v)) && v == 0)
+            g_stage_on = 0;
+        else
+            g_stage_on = 1;
+    }
+    return g_stage_on == 1 && g_stage_lock != nullptr;
+}
+
+static uint64_t nmx_uptime_ms()
+{
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns / 1000000;
+}
+
+extern "C" void nmx_xnu_stage(const char *what)
+{
+    /* the call sites are all sleepable (attach thread, IOKit matching, thread_call); interrupt context is refused */
+    if (!nmx_stage_enabled() || ml_at_interrupt_context())
+        return;
+    char e[64], copy[sizeof(g_stage_buf)];
+    int n = snprintf(e, sizeof(e), "%llu:%s|", nmx_uptime_ms(), what);
+    if (n <= 0)
+        return;
+    if (n >= (int)sizeof(e))
+        n = sizeof(e) - 1;
+    IOLockLock(g_stage_lock);
+    /* drop the oldest entries until the new one fits */
+    while (g_stage_len + n > sizeof(g_stage_buf) - 1 && g_stage_len > 0) {
+        size_t cut = 0;
+        while (cut < g_stage_len && g_stage_buf[cut] != '|')
+            cut++;
+        cut = cut < g_stage_len ? cut + 1 : g_stage_len;
+        memmove(g_stage_buf, g_stage_buf + cut, g_stage_len - cut);
+        g_stage_len -= cut;
+    }
+    memcpy(g_stage_buf + g_stage_len, e, n);
+    g_stage_len += n;
+    size_t len = g_stage_len;
+    memcpy(copy, g_stage_buf, len);
+    nmx_nvram_put("nmxgpu-stage", copy, len);     /* under the lock: marks reach NVRAM in order */
+    IOLockUnlock(g_stage_lock);
+}
+
+static thread_call_t g_beat_call;
+static unsigned g_beats;
+
+static void nmx_beat(thread_call_param_t, thread_call_param_t)
+{
+    char nv[48] = "-", b[160];
+    OSDictionary *m = IOService::serviceMatching("NVRM");
+    if (m != nullptr) {
+        if (IOService *s = IOService::copyMatchingService(m)) {
+            if (OSString *w = OSDynamicCast(OSString, s->getProperty("nvrm-nmx-wait")))
+                strlcpy(nv, w->getCStringNoCopy(), sizeof(nv));
+            else
+                strlcpy(nv, "started, no wait yet", sizeof(nv));
+            s->release();
+        }
+        m->release();
+    }
+    int n = snprintf(b, sizeof(b), "%llu ms beat %u irq %lu nvrm %s", nmx_uptime_ms(), ++g_beats,
+                     nmx_irq_dispatched, nv);
+    nmx_nvram_put("nmxgpu-alive", b, n > 0 ? (size_t)n : 0);
+    if (g_beats < 40) {
+        uint64_t deadline;
+        clock_interval_to_deadline(1, kSecondScale, &deadline);
+        thread_call_enter_delayed(g_beat_call, deadline);
+    }
+}
+
+static void nmx_beat_start()
+{
+    if (!nmx_stage_enabled() || g_beat_call != nullptr)
+        return;
+    g_beat_call = thread_call_allocate(&nmx_beat, nullptr);   /* kept for the kext's life: the cap is 40 beats */
+    if (g_beat_call != nullptr)
+        thread_call_enter(g_beat_call);
+}
+
 class NMXGPU : public IOService {
     OSDeclareDefaultStructors(NMXGPU)
     void *dev_;
@@ -288,9 +405,14 @@ bool NMXGPU::start(IOService *provider)
     if (pci == nullptr || g_lock == nullptr || !IOService::start(provider))
         return false;
     nmx_sysctl_install();
+    if (g_stage_lock == nullptr)
+        g_stage_lock = IOLockAlloc();
+    nmx_xnu_stage("start");
     IOLockLock(g_lock);
     if (!g_started) {
+        nmx_xnu_stage("port_start");
         int err = nmx_port_start();
+        nmx_xnu_stage(err ? "port_start FAILED" : "port_started");
         if (err) {
             IOLockUnlock(g_lock);
             IOLog("NullMoth GPU: the driver layer did not start (%d)\n", err);
@@ -390,7 +512,9 @@ void NMXGPU::attachNow()
         return;
     }
     holdArm();
+    nmx_xnu_stage("fw ok, hold, attach");
     dev_ = nmx_port_attach(pci_);
+    nmx_xnu_stage(dev_ ? "attached" : "attach FAILED");
     if (dev_ == nullptr) {
         IOLog("NullMoth GPU: no driver took %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
               pci_->configRead16(kIOPCIConfigDeviceID));
@@ -413,8 +537,12 @@ void NMXGPU::attachNow()
     pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
     pci_->registerService();
     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
+    nmx_xnu_stage("registered, fb publish");
     fb_ = nmx_fb_publish(this, dev_);
+    nmx_xnu_stage(fb_ ? "fb published" : "fb FAILED");
     holdRelease(fb_ != nullptr ? "NMXAMDFB published" : "no framebuffer");
+    nmx_xnu_stage("hold released");
+    nmx_beat_start();
     IOLog("NullMoth GPU: driving %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
           pci_->configRead16(kIOPCIConfigDeviceID));
     OSSynchronizeIO();

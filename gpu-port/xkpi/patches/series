@@ -27,3 +27,4 @@ amdgpu-userptr-amdgpu_bo_list.patch
 amdgpu-userptr-cstrace-cs.patch
 amdgpu-irqwatch-fence.patch
 amdgpu-irqwatch-irq.patch
+amdgpu-stage-marks.patch

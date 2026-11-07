@@ -37,6 +37,8 @@ void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cache, void **
 void nmx_xnu_unmap(void *handle);
 /* physical address at a prepared IOMemoryDescriptor offset, and the segment length (ga403wm Step99 imports) */
 uint64_t nmx_xnu_md_phys(void *md, uint64_t offset, uint64_t *len);
+/* ga403wm Step128: a boot stage mark in NVRAM (nmxgpu-stage); sleepable contexts only */
+void nmx_xnu_stage(const char *what);
 
 /* ---- another process's memory (nmx_mm.cpp) -------------------------------------------------------------------------- */
 

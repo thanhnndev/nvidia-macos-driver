@@ -301,7 +301,9 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
         if (ms->mode != NULL)
             ms->fb = fb->buffer->fb;
     mutex_unlock(&fb->client.modeset_mutex);
+    nmx_xnu_stage("fb modeset");
     err = -drm_client_modeset_commit(&fb->client);
+    nmx_xnu_stage(err ? "fb modeset FAILED" : "fb modeset done");
     if (err) {
         printf("NullMoth display: the mode set failed (%d)\n", err);
         goto fail;
@@ -906,6 +908,13 @@ long long nmx_fb_flip_call(const char *name, void *req)
          !strcmp(name, "nmxFlipImport") ? 1 : -1;
     if (fn < 0)
         return -1;
+    {
+        static int marked;          /* ga403wm Step128: the first flip call of the boot */
+        if (!marked) {
+            marked = 1;
+            nmx_xnu_stage(name);
+        }
+    }
     if (!r || r->version != 1)
         return FLIP_R_BADARG;
     if (!flip_init())
