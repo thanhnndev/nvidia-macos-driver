@@ -382,6 +382,8 @@ int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out)
  */
 #include <linux/scatterlist.h>
 #include <drm/drm_atomic.h>
+#include <drm/drm_atomic_uapi.h>
+#include <drm/ttm/ttm_tt.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_modeset_lock.h>
@@ -404,7 +406,7 @@ struct nmx_flipbuf { uint64_t phys; void *kva; uint64_t size; uint64_t gpu; uint
 struct nmx_flipreq {
     uint32_t version, flags, handle, format, width, height, pitch, caps, maxImports, nbuffers;
     void *md; uint64_t offset, gpuAddr, seq, seqSubmitted, seqLatched;
-    uint32_t current, pending, generation; int err;
+    uint32_t cur, pending, generation; int err;   /* NMXAccel: current */
     uint64_t vblankCount, vblankNs;
     struct nmx_flipbuf buf[FLIP_NBUF];
 };
@@ -423,7 +425,7 @@ struct nmx_flip_import {
 static struct {
     spinlock_t lock;
     int lock_ready;
-    uint32_t inited, gen, current, pending, nbuf, logs, tried;
+    uint32_t inited, gen, cur, pending, nbuf, logs, tried;
     uint64_t seq_sub, seq_lat;
     struct drm_crtc_commit *commit;     /* the pending flip's commit (one reference held) */
     struct nmx_fb *nfb;
@@ -521,7 +523,7 @@ static int flip_init(void)
     flip.phys[0] = nfb->info.phys;
     flip.size[0] = nfb->info.size;
     flip.pitch[0] = nfb->info.pitch;
-    flip.current = 0;
+    flip.cur = 0;
     flip.pending = FLIP_NONE;
     flip.nbuf = 1;
     /* the home buffer must stay in VRAM whatever is on screen: DC unpins it when a flip moves away from it */
@@ -602,7 +604,7 @@ static void flip_refresh(void)
     if (flip.commit && __atomic_load_n(&flip.commit->flip_done.done, __ATOMIC_ACQUIRE)) {
         drm_crtc_commit_put(flip.commit);
         flip.commit = NULL;
-        flip.current = flip.pending;
+        flip.cur = flip.pending;
         flip.pending = FLIP_NONE;
         flip.seq_lat = flip.seq_sub;
     }
@@ -610,7 +612,7 @@ static void flip_refresh(void)
         struct drm_plane_state *ps = flip.plane->state;
         struct drm_framebuffer *fb = ps ? ps->fb : NULL;
 
-        if (fb && fb != flip_fb_of(flip.current)) {
+        if (fb && fb != flip_fb_of(flip.cur)) {
             uint32_t h = FLIP_NONE;
 
             for (uint32_t i = 0; i < FLIP_IMP0 + FLIP_NIMP; i++)
@@ -618,8 +620,8 @@ static void flip_refresh(void)
                     h = i;
             flip.gen++;
             FLIP_LOG("NMX flip: on screen is fb %p (handle %d), not handle %u: generation %u\n", fb, (int)h,
-                     flip.current, flip.gen);
-            flip.current = h == FLIP_NONE ? 0 : h;
+                     flip.cur, flip.gen);
+            flip.cur = h == FLIP_NONE ? 0 : h;
         }
     }
 }
@@ -704,7 +706,7 @@ static uint32_t flip_status(struct nmx_flipreq *r)
     flip_refresh();
     r->seqSubmitted = flip.seq_sub;
     r->seqLatched = flip.seq_lat;
-    r->current = flip.current;
+    r->cur = flip.cur;
     r->pending = flip.pending;
     r->generation = flip.gen;
     spin_unlock(&flip.lock);
@@ -931,7 +933,7 @@ long long nmx_fb_flip_call(const char *name, void *req)
 
         spin_lock(&flip.lock);
         flip_refresh();
-        busy = r->handle == flip.current || r->handle == flip.pending;
+        busy = r->handle == flip.cur || r->handle == flip.pending;
         spin_unlock(&flip.lock);
         if (busy)
             return FLIP_R_BUSY;

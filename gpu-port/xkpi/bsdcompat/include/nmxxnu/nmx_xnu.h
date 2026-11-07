@@ -35,6 +35,8 @@ void *nmx_xnu_map_phys(uint64_t pa, size_t size, int cache, void **handle);
 /* maps an array of single physical pages contiguously into the kernel (vmap) */
 void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cache, void **handle);
 void nmx_xnu_unmap(void *handle);
+/* physical address at a prepared IOMemoryDescriptor offset, and the segment length (ga403wm Step99 imports) */
+uint64_t nmx_xnu_md_phys(void *md, uint64_t offset, uint64_t *len);
 
 /* ---- another process's memory (nmx_mm.cpp) -------------------------------------------------------------------------- */
 
