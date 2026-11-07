@@ -236,6 +236,16 @@ fail:
     return nullptr;
 }
 
+/* ga403wm Step99 flip imports: physical address of a prepared descriptor's byte offset (and the segment length) */
+extern "C" uint64_t nmx_xnu_md_phys(void *md, uint64_t offset, uint64_t *len)
+{
+    IOByteCount l = 0;
+    addr64_t pa = ((IOMemoryDescriptor *)md)->getPhysicalSegment((IOByteCount)offset, &l, kIOMemoryMapperNone);
+    if (len)
+        *len = l;
+    return pa;
+}
+
 extern "C" void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cache, void **handle)
 {
     *handle = nullptr;

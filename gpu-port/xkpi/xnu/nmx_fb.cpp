@@ -12,6 +12,8 @@
 #include <IOKit/IODeviceMemory.h>
 #include <kern/thread_call.h>
 #include "nmx_port.h"
+
+extern "C" long long nmx_fb_flip_call(const char *name, void *req);
 #include "../../../kexts/NVRM/nvrm_vram_abi.h"
 
 #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
@@ -21,8 +23,11 @@ static IOPMPowerState kFbPowerStates[2] = {
     { kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
 };
 
-class NMXGPUFB : public IOFramebuffer {
-    OSDeclareDefaultStructors(NMXGPUFB)
+/* ga403wm Step74: CoreDisplay tells the GPU vendor from the framebuffer's class name ("Intel", "AMD",
+ * "AppleParavirt"); any other name gives vendor 1, IOPresentment off and a software compositor that asserts at every
+ * WindowServer start. NMXAccel and NMXAGDC match this name. */
+class NMXAMDFB : public IOFramebuffer {
+    OSDeclareDefaultStructors(NMXAMDFB)
     void *fDev = nullptr;
     nmx_fb_info fInfo = {};
     nmx_fb_display_info fDisplay = {};
@@ -50,7 +55,7 @@ class NMXGPUFB : public IOFramebuffer {
     }
 
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
-        NMXGPUFB *me = (NMXGPUFB *)p0;
+        NMXAMDFB *me = (NMXAMDFB *)p0;
         if (me->fStopping) return;
         if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
         uint64_t period;
@@ -183,12 +188,20 @@ public:
                 return kIOReturnNotReady;
             }
             r->kva = reinterpret_cast<void *>(fInfo.kva);
-            r->phys = 0;
+            /* ga403wm Step75: NMXAccel's initFramebufferResource needs the scan-out's physical range, or it makes no
+             * framebuffer resource and IOAcceleratorFamily never marks the display pipe active */
+            r->phys = fInfo.phys;
             r->handle = nullptr;
             r->actualSize = fInfo.size;
             r->width = fInfo.width; r->height = fInfo.height; r->pitch = fInfo.pitch;
             trace("scanout ok", fInfo.width, fInfo.pitch);
             return kIOReturnSuccess;
+        }
+        /* ga403wm Step98/99: the NMXAccel page-flip API (nmx_fb_bridge.c) */
+        if (fn && !fStopping) {
+            long long fr = nmx_fb_flip_call(fn->getCStringNoCopy(), p1);
+            if (fr >= 0)
+                return (IOReturn)fr;
         }
         return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
     }
@@ -341,7 +354,7 @@ public:
         }
     }
 };
-OSDefineMetaClassAndStructors(NMXGPUFB, IOFramebuffer)
+OSDefineMetaClassAndStructors(NMXAMDFB, IOFramebuffer)
 
 /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
 IOService *nmx_fb_publish(IOService *gpu, void *dev)
@@ -352,7 +365,7 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev)
         FBLOG("no framebuffer (%d)", err);
         return nullptr;
     }
-    NMXGPUFB *fb = OSTypeAlloc(NMXGPUFB);
+    NMXAMDFB *fb = OSTypeAlloc(NMXAMDFB);
     if (fb == nullptr || !fb->initWith(dev, info) || !fb->attach(gpu)) {
         OSSafeReleaseNULL(fb);
         nmx_fb_close(dev);

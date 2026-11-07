@@ -711,6 +711,14 @@ static void nmx_acpica_init(void *arg)
 }
 SYSINIT(nmx_acpica, SI_SUB_DRIVERS, SI_ORDER_FIRST, nmx_acpica_init, NULL);
 
+/* before a system-sleep suspend (nmx_port_power): the FADT may have been published after this kext started */
+void nmx_acpica_reread(void)
+{
+    nmx_acpica_init(NULL);
+    printf("NullMoth xkpi: FADT re-read before suspend, LOW_POWER_S0 %d\n",
+           (AcpiGbl_FADT.Flags & ACPI_FADT_LOW_POWER_S0) ? 1 : 0);
+}
+
 static void nmx_acpica_uninit(void *arg)
 {
     struct nmx_acpi_handle *h;

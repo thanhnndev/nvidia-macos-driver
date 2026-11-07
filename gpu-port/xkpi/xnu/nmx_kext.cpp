@@ -23,6 +23,7 @@
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include "nmx_port.h"
 #include "nmx_xnu.h"
 
@@ -233,8 +234,14 @@ class NMXGPU : public IOService {
     IOPCIDevice *pci_;
     volatile int attach_;   /* 0 = attach pending on its thread, 1 = attached, -1 = not attached */
     bool pm_;
+    volatile SInt32 hold_;          /* 1 while the boot hold keeps this service busy */
+    uint64_t holdT0_;
+    thread_call_t holdCall_;
     static void attachThread(void *arg, wait_result_t);
+    static void holdCap(thread_call_param_t self, thread_call_param_t);
     void attachNow();
+    void holdArm();
+    void holdRelease(const char *why);
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
@@ -305,6 +312,9 @@ bool NMXGPU::start(IOService *provider)
     dev_ = nullptr;
     fb_ = nullptr;
     pm_ = false;
+    hold_ = 0;
+    holdT0_ = 0;
+    holdCall_ = nullptr;
     attach_ = 0;
     retain();
     thread_t t = THREAD_NULL;
@@ -325,6 +335,52 @@ void NMXGPU::attachThread(void *arg, wait_result_t)
     self->release();
 }
 
+/*
+ * Boot hold: from the moment the firmware folder is there until NMXAMDFB is published, this service stays busy, so
+ * whatever waits for the GPU's branch of the registry to settle (WindowServer's display discovery, NVRM's
+ * waitQuiet) does not take the boot firmware framebuffer for the only display. Not in start(): the attach thread
+ * first waits for the root volume, and a busy service before that would hold up the mount (the logo hang). Capped at
+ * 30 s; released on every exit of attachNow. The outcome is in the "nmxgpu-boot-hold" property.
+ */
+void NMXGPU::holdArm()
+{
+    holdT0_ = mach_absolute_time();
+    hold_ = 1;
+    adjustBusy(1);
+    holdCall_ = thread_call_allocate(&NMXGPU::holdCap, this);
+    if (holdCall_ != nullptr) {
+        uint64_t deadline;
+        retain();                   /* dropped by holdCap, or by holdRelease when it cancels the cap */
+        clock_interval_to_deadline(30, kSecondScale, &deadline);
+        thread_call_enter_delayed(holdCall_, deadline);
+    }
+    setProperty("nmxgpu-boot-hold", "held");
+}
+
+void NMXGPU::holdCap(thread_call_param_t p, thread_call_param_t)
+{
+    NMXGPU *self = (NMXGPU *)p;
+    self->holdRelease("30 s cap");
+    self->release();
+}
+
+void NMXGPU::holdRelease(const char *why)
+{
+    uint64_t ns;
+    char text[96];
+
+    if (!OSCompareAndSwap(1, 0, &hold_))
+        return;
+    adjustBusy(-1);
+    absolutetime_to_nanoseconds(mach_absolute_time() - holdT0_, &ns);
+    snprintf(text, sizeof(text), "released: %s after %llu ms", why, ns / 1000000);
+    setProperty("nmxgpu-boot-hold", text);
+    IOLog("NullMoth GPU: boot hold %s\n", text);
+    /* the thread_call itself is kept (one per device per boot): freeing it here could race a cap that is running */
+    if (holdCall_ != nullptr && thread_call_cancel(holdCall_))
+        release();
+}
+
 void NMXGPU::attachNow()
 {
     int err = nmx_xnu_wait_firmware_root(300);
@@ -333,11 +389,13 @@ void NMXGPU::attachNow()
         attach_ = -1;
         return;
     }
+    holdArm();
     dev_ = nmx_port_attach(pci_);
     if (dev_ == nullptr) {
         IOLog("NullMoth GPU: no driver took %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
               pci_->configRead16(kIOPCIConfigDeviceID));
         attach_ = -1;
+        holdRelease("no driver");
         return;
     }
 
@@ -356,6 +414,7 @@ void NMXGPU::attachNow()
     pci_->registerService();
     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
     fb_ = nmx_fb_publish(this, dev_);
+    holdRelease(fb_ != nullptr ? "NMXAMDFB published" : "no framebuffer");
     IOLog("NullMoth GPU: driving %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
           pci_->configRead16(kIOPCIConfigDeviceID));
     OSSynchronizeIO();

@@ -49,10 +49,16 @@ static struct { void *dev; struct nmx_fb *fb; } fbs[MAX_FB];
  */
 extern int amdgpu_sg_display;
 
+/*
+ * ga403wm Step99: DC is brought up with GPU VM (amdgpu_sg_display keeps its default -1), so it can scan out GTT
+ * buffers (flip imports). The bridge's own buffers still go to contiguous VRAM through fb_create_vram.
+ */
 void nmx_fb_before_attach(void)
 {
-    amdgpu_sg_display = 0;
 }
+
+struct drm_client_buffer;
+static struct drm_client_buffer *fb_create_vram(struct nmx_fb *nfb, uint32_t w, uint32_t h, uint32_t fmt);
 
 /* the DRM device of the driver attached to the PCI function 'dev' (amdgpu keeps it as the PCI driver data) */
 static struct drm_device *drm_of(device_t dev)
@@ -254,7 +260,7 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
         goto fail;
     }
 
-    fb->buffer = drm_client_framebuffer_create(&fb->client, out->width, out->height, DRM_FORMAT_XRGB8888);
+    fb->buffer = fb_create_vram(fb, out->width, out->height, DRM_FORMAT_XRGB8888);   /* VRAM even with GPU VM */
     if (IS_ERR(fb->buffer)) {
         err = -PTR_ERR(fb->buffer);
         fb->buffer = NULL;
@@ -357,4 +363,583 @@ int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out)
             return 0;
         }
     return ENODEV;
+}
+
+/* ---- page flips (ga403wm Step98/99) -----------------------------------------------------------------------------
+ *
+ * NMXAccel (ci/nmxaccel-flip) calls NMXAMDFB::callPlatformFunction(name, false, req, ...) with these names:
+ *   nmxFlipCaps     SUBMIT | VRAM_CHAIN | XRGB8888 (+ IMPORT | XRGB2101010 when DC runs with GPU VM), the lit mode
+ *   nmxFlipBuffers  home (handle 0) + up to 2 more XRGB8888 VRAM buffers from the bridge's DRM client, all pinned
+ *   nmxFlipImport   mode 1: the caller's IOSurface pages as a GTT scan-out buffer (zero copy), handles 8..11
+ *   nmxFlipSubmit   non-blocking atomic commit of the primary plane's fb (DC fast update, latched at vblank)
+ *   nmxFlipStatus   latched = the commit's flip_done; never sleeps
+ *   nmxFlipRelease  busy while on screen or pending; frees an import
+ * Pinning: amdgpu GEM objects have no .pin, so a buffer is pinned only while DC scans it. Flipping away from the home
+ * buffer would let TTM evict it under the kva that IOFramebuffer and the K6 copy publish, so every chain buffer, home
+ * included, is pinned in VRAM once and never unpinned.
+ * Generation: the bridge commits its home fb itself (restore, hotplug, display power). Status notices the plane's fb
+ * is not the one it last latched and bumps generation; current then names whatever is really on screen.
+ */
+#include <linux/scatterlist.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_gem.h>
+#include <drm/drm_vblank.h>
+#include <drm/drm_modeset_lock.h>
+#include "drm_crtc_internal.h"
+#include "amdgpu.h"
+
+#define FLIP_R_OK          0
+#define FLIP_R_UNSUPPORTED 0xe00002c7u
+#define FLIP_R_BADARG      0xe00002c2u
+#define FLIP_R_BUSY        0xe00002d5u
+#define FLIP_R_NOTREADY    0xe00002d8u
+#define FLIP_R_ERROR       0xe00002bcu
+#define FLIP_NONE          0xffffffffu
+#define FLIP_NBUF          3
+#define FLIP_IMP0          8u
+#define FLIP_NIMP          4u
+
+/* the NMXAccel request (NMXFlipRequest, version 1) */
+struct nmx_flipbuf { uint64_t phys; void *kva; uint64_t size; uint64_t gpu; uint32_t handle, pitch; };
+struct nmx_flipreq {
+    uint32_t version, flags, handle, format, width, height, pitch, caps, maxImports, nbuffers;
+    void *md; uint64_t offset, gpuAddr, seq, seqSubmitted, seqLatched;
+    uint32_t current, pending, generation; int err;
+    uint64_t vblankCount, vblankNs;
+    struct nmx_flipbuf buf[FLIP_NBUF];
+};
+_Static_assert(__builtin_offsetof(struct nmx_flipreq, buf) == 120, "NMXFlipRequest layout");
+_Static_assert(sizeof(struct nmx_flipbuf) == 40, "NMXFlipBuffer layout");
+
+struct nmx_flip_import {
+    struct drm_framebuffer *fb;
+    struct drm_gem_object *gem;
+    struct sg_table *sgt;
+    void *md;
+    uint64_t gpu;
+    uint32_t fbid, gemh, fmt, used;     /* used: 0 free, 1 live, 2 being built or torn down */
+};
+
+static struct {
+    spinlock_t lock;
+    int lock_ready;
+    uint32_t inited, gen, current, pending, nbuf, logs, tried;
+    uint64_t seq_sub, seq_lat;
+    struct drm_crtc_commit *commit;     /* the pending flip's commit (one reference held) */
+    struct nmx_fb *nfb;
+    struct drm_crtc *crtc;
+    struct drm_plane *plane;
+    struct drm_framebuffer *drmfb[FLIP_NBUF];
+    struct drm_client_buffer *buffer[FLIP_NBUF];   /* [0] = the bridge's home buffer */
+    uint64_t kva[FLIP_NBUF], phys[FLIP_NBUF], size[FLIP_NBUF], gpu[FLIP_NBUF];
+    uint32_t pitch[FLIP_NBUF];
+    struct nmx_flip_import imp[FLIP_NIMP];
+    uint32_t nimports, import_fail;
+} flip;
+
+#define FLIP_LOG(...) do { if (flip.logs < 40) { flip.logs++; printf(__VA_ARGS__); } } while (0)
+
+static struct amdgpu_device *flip_adev(struct nmx_fb *nfb)
+{
+    return drm_to_adev(nfb->client.dev);
+}
+
+/* DC scans GTT buffers only when it was brought up with GPU VM (Step99: amdgpu_sg_display stays -1) */
+static int flip_gpu_vm(struct nmx_fb *nfb)
+{
+    return flip_adev(nfb)->mode_info.gpu_vm_support ? 1 : 0;
+}
+
+/*
+ * With GPU VM, amdgpu offers GTT for scan-out buffers and an APU may place a dumb buffer there. The bridge's own
+ * buffers must stay one contiguous VRAM range (the IOFramebuffer aperture and the K6 copy depend on it), so GPU VM
+ * support is hidden from amdgpu_display while they are made.
+ */
+static struct drm_client_buffer *fb_create_vram(struct nmx_fb *nfb, uint32_t w, uint32_t h, uint32_t fmt)
+{
+    struct amdgpu_device *adev = flip_adev(nfb);
+    bool was = adev->mode_info.gpu_vm_support;
+    struct drm_client_buffer *b;
+
+    adev->mode_info.gpu_vm_support = false;
+    b = drm_client_framebuffer_create(&nfb->client, w, h, fmt);
+    adev->mode_info.gpu_vm_support = was;
+    return b;
+}
+
+static struct drm_framebuffer *flip_fb_of(uint32_t h)
+{
+    if (h < flip.nbuf)
+        return flip.drmfb[h];
+    if (h >= FLIP_IMP0 && h < FLIP_IMP0 + FLIP_NIMP && flip.imp[h - FLIP_IMP0].used == 1)
+        return flip.imp[h - FLIP_IMP0].fb;
+    return NULL;
+}
+
+/* pin a client buffer's BO in VRAM (never unpinned); its MC address goes to gpu */
+static int flip_pin(struct drm_client_buffer *buffer, uint64_t *gpu)
+{
+    struct amdgpu_bo *bo = gem_to_amdgpu_bo(buffer->gem);
+    int e = amdgpu_bo_reserve(bo, false);
+
+    if (e)
+        return e;
+    e = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_VRAM);
+    if (!e)
+        *gpu = amdgpu_bo_gpu_offset(bo);
+    amdgpu_bo_unreserve(bo);
+    return e;
+}
+
+static int flip_init(void)
+{
+    struct nmx_fb *nfb = fbs[0].fb;
+    struct drm_mode_set *ms;
+    struct drm_crtc *crtc = NULL;
+    int e;
+
+    if (flip.inited)
+        return 1;
+    if (!nfb || !nfb->info.kva || !nfb->info.size || !nfb->buffer)
+        return 0;
+    mutex_lock(&nfb->client.modeset_mutex);
+    drm_client_for_each_modeset(ms, &nfb->client)
+        if (ms->mode != NULL && ms->crtc != NULL) { crtc = ms->crtc; break; }
+    mutex_unlock(&nfb->client.modeset_mutex);
+    if (!crtc || !crtc->primary)
+        return 0;
+    if (!flip.lock_ready) {
+        spin_lock_init(&flip.lock);
+        flip.lock_ready = 1;
+    }
+    flip.nfb = nfb;
+    flip.crtc = crtc;
+    flip.plane = crtc->primary;
+    flip.buffer[0] = nfb->buffer;
+    flip.drmfb[0] = nfb->buffer->fb;
+    flip.kva[0] = nfb->info.kva;
+    flip.phys[0] = nfb->info.phys;
+    flip.size[0] = nfb->info.size;
+    flip.pitch[0] = nfb->info.pitch;
+    flip.current = 0;
+    flip.pending = FLIP_NONE;
+    flip.nbuf = 1;
+    /* the home buffer must stay in VRAM whatever is on screen: DC unpins it when a flip moves away from it */
+    e = flip_pin(flip.buffer[0], &flip.gpu[0]);
+    if (e) {
+        FLIP_LOG("NMX flip: home buffer would not pin (%d), no flips\n", e);
+        return 0;
+    }
+    __atomic_store_n(&flip.inited, 1, __ATOMIC_RELEASE);
+    FLIP_LOG("NMX flip: API up, crtc %p plane %p home fb %p %ux%u pitch %u\n", crtc, flip.plane, flip.drmfb[0],
+             nfb->info.width, nfb->info.height, flip.pitch[0]);
+    return 1;
+}
+
+static uint32_t flip_buffers(struct nmx_flipreq *r)
+{
+    if (!flip.tried) {
+        uint32_t w = flip.nfb->info.width, h = flip.nfb->info.height;
+
+        flip.tried = 1;
+        for (uint32_t i = 1; i < FLIP_NBUF; i++) {
+            struct drm_client_buffer *b = fb_create_vram(flip.nfb, w, h, DRM_FORMAT_XRGB8888);
+            struct iosys_map map;
+            const char *va;
+            uint64_t size, base, off;
+            int e;
+
+            if (IS_ERR_OR_NULL(b)) {
+                FLIP_LOG("NMX flip: buffer %u not created (%ld)\n", i, (long)PTR_ERR(b));
+                break;
+            }
+            if ((e = flip_pin(b, &flip.gpu[i]))) {
+                FLIP_LOG("NMX flip: buffer %u would not pin (%d)\n", i, e);
+                drm_client_framebuffer_delete(b);
+                break;
+            }
+            if ((e = drm_client_buffer_vmap(b, &map))) {    /* stays pinned: never freed */
+                FLIP_LOG("NMX flip: buffer %u would not map (%d)\n", i, e);
+                break;
+            }
+            va = map.is_iomem ? (const char *)map.vaddr_iomem : (const char *)map.vaddr;
+            size = (uint64_t)b->pitch * h;
+            base = nmx_xnu_kva_to_phys(va);
+            for (off = PAGE_SIZE; off < size; off += PAGE_SIZE)
+                if (nmx_xnu_kva_to_phys(va + off) != base + off)
+                    break;
+            if (!base || off < size) {
+                FLIP_LOG("NMX flip: buffer %u not contiguous (page %llu)\n", i, (unsigned long long)(off / PAGE_SIZE));
+                break;
+            }
+            flip.buffer[i] = b;
+            flip.drmfb[i] = b->fb;
+            flip.kva[i] = (uint64_t)(uintptr_t)va;
+            flip.phys[i] = base;
+            flip.size[i] = round_page(size);
+            flip.pitch[i] = b->pitch;
+            flip.nbuf = i + 1;
+            FLIP_LOG("NMX flip: buffer %u fb %p phys %llx gpu %llx pitch %u\n", i, flip.drmfb[i],
+                     (unsigned long long)base, (unsigned long long)flip.gpu[i], b->pitch);
+        }
+        FLIP_LOG("NMX flip: chain of %u (home gpu %llx)\n", flip.nbuf, (unsigned long long)flip.gpu[0]);
+    }
+    r->nbuffers = flip.nbuf;
+    for (uint32_t i = 0; i < flip.nbuf; i++) {
+        r->buf[i].phys = flip.phys[i];
+        r->buf[i].kva = (void *)(uintptr_t)flip.kva[i];
+        r->buf[i].size = flip.size[i];
+        r->buf[i].gpu = flip.gpu[i];
+        r->buf[i].handle = i;
+        r->buf[i].pitch = flip.pitch[i];
+    }
+    return flip.nbuf > 1 ? FLIP_R_OK : FLIP_R_ERROR;
+}
+
+/* lock held. Retire a pending flip whose commit has signalled flip_done; notice a bridge commit. */
+static void flip_refresh(void)
+{
+    if (flip.commit && __atomic_load_n(&flip.commit->flip_done.done, __ATOMIC_ACQUIRE)) {
+        drm_crtc_commit_put(flip.commit);
+        flip.commit = NULL;
+        flip.current = flip.pending;
+        flip.pending = FLIP_NONE;
+        flip.seq_lat = flip.seq_sub;
+    }
+    if (flip.pending == FLIP_NONE) {
+        struct drm_plane_state *ps = flip.plane->state;
+        struct drm_framebuffer *fb = ps ? ps->fb : NULL;
+
+        if (fb && fb != flip_fb_of(flip.current)) {
+            uint32_t h = FLIP_NONE;
+
+            for (uint32_t i = 0; i < FLIP_IMP0 + FLIP_NIMP; i++)
+                if (flip_fb_of(i) == fb)
+                    h = i;
+            flip.gen++;
+            FLIP_LOG("NMX flip: on screen is fb %p (handle %d), not handle %u: generation %u\n", fb, (int)h,
+                     flip.current, flip.gen);
+            flip.current = h == FLIP_NONE ? 0 : h;
+        }
+    }
+}
+
+static uint32_t flip_submit(struct nmx_flipreq *r)
+{
+    uint32_t h = r->handle;
+    struct drm_framebuffer *nfbp = flip_fb_of(h);
+    struct drm_modeset_acquire_ctx ctx;
+    struct drm_atomic_state *state;
+    struct drm_crtc_commit *commit = NULL;
+    int e = -ENOMEM;
+
+    if (!nfbp)
+        return FLIP_R_BADARG;
+    spin_lock(&flip.lock);
+    flip_refresh();
+    if (flip.pending != FLIP_NONE) {
+        spin_unlock(&flip.lock);
+        return FLIP_R_BUSY;
+    }
+    flip.pending = h;           /* reserved; status reports it pending from here */
+    spin_unlock(&flip.lock);
+
+    drm_modeset_acquire_init(&ctx, 0);
+    state = drm_atomic_state_alloc(flip.nfb->client.dev);
+    if (state) {
+        state->acquire_ctx = &ctx;
+        for (;;) {
+            struct drm_plane_state *ps = drm_atomic_get_plane_state(state, flip.plane);
+            struct drm_crtc_state *cs;
+
+            if (IS_ERR(ps)) {
+                e = PTR_ERR(ps);
+                goto deadlk;
+            }
+            drm_atomic_set_fb_for_plane(ps, nfbp);
+            cs = drm_atomic_get_crtc_state(state, flip.crtc);
+            if (IS_ERR(cs)) {
+                e = PTR_ERR(cs);
+                goto deadlk;
+            }
+            e = drm_atomic_nonblocking_commit(state);
+            if (!e) {
+                commit = cs->commit;    /* locks still held: nothing can swap the CRTC state yet */
+                if (commit)
+                    drm_crtc_commit_get(commit);
+                break;
+            }
+deadlk:
+            if (e != -EDEADLK)
+                break;
+            drm_atomic_state_clear(state);
+            drm_modeset_backoff(&ctx);
+        }
+        drm_atomic_state_put(state);
+    }
+    drm_modeset_drop_locks(&ctx);
+    drm_modeset_acquire_fini(&ctx);
+
+    spin_lock(&flip.lock);
+    if (e || !commit) {
+        flip.pending = FLIP_NONE;
+        if (commit)
+            drm_crtc_commit_put(commit);
+        spin_unlock(&flip.lock);
+        FLIP_LOG("NMX flip: submit of handle %u failed (%d%s)\n", h, e, e ? "" : ", no commit");
+        r->err = e ? e : -EINVAL;
+        return e == -EBUSY ? FLIP_R_BUSY : FLIP_R_ERROR;
+    }
+    flip.commit = commit;
+    r->seq = ++flip.seq_sub;
+    spin_unlock(&flip.lock);
+    return FLIP_R_OK;
+}
+
+static uint32_t flip_status(struct nmx_flipreq *r)
+{
+    ktime_t t = 0;
+
+    spin_lock(&flip.lock);
+    flip_refresh();
+    r->seqSubmitted = flip.seq_sub;
+    r->seqLatched = flip.seq_lat;
+    r->current = flip.current;
+    r->pending = flip.pending;
+    r->generation = flip.gen;
+    spin_unlock(&flip.lock);
+    r->vblankCount = drm_crtc_vblank_count_and_time(flip.crtc, &t);
+    r->vblankNs = (uint64_t)ktime_to_ns(t);
+    return FLIP_R_OK;
+}
+
+static uint32_t flip_import_fail(struct nmx_flipreq *r, struct nmx_flip_import *m, const char *what, int e)
+{
+    if (m)
+        m->used = 0;
+    flip.import_fail++;
+    FLIP_LOG("NMX flip: import failed at %s (%d)\n", what, e);
+    r->err = e;
+    return FLIP_R_ERROR;
+}
+
+/*
+ * An import makes a scan-out buffer out of the caller's memory (CoreDisplay's IOSurface, a prepared descriptor):
+ *   1. the descriptor's physical pages -> a flat sg_table (dma address = physical address, xkpi maps 1:1)
+ *   2. amdgpu_gem_object_create(CPU domain, CPU_GTT_USWC, ttm_bo_type_sg), the sg_table set on the BO and its ttm_tt
+ *      (TTM created the tt already, with TTM_TT_FLAG_EXTERNAL, so amdgpu binds the dma addresses from it)
+ *   3. pinned in GTT, a GART range bound: gpu address = what DCN fetches
+ *   4. a GEM handle on the bridge's DRM file, drm_mode_addfb2 (linear, the surface's pitch)
+ * The descriptor stays prepared by the caller until release. Release unpins and drops the fb and the handle; the
+ * sg_table is not freed (the BO may outlive the call until DRM drops its last fb reference).
+ */
+static uint32_t flip_import(struct nmx_flipreq *r)
+{
+    struct amdgpu_device *adev;
+    struct nmx_flip_import *m = NULL;
+    struct drm_gem_object *gem = NULL;
+    struct drm_framebuffer *fb;
+    struct drm_mode_fb_cmd2 c;
+    struct drm_file *file = flip.nfb->client.file;
+    struct drm_device *dev = flip.nfb->client.dev;
+    struct sg_table *sgt;
+    struct scatterlist *sg;
+    struct amdgpu_bo *bo;
+    uint64_t size, n, i, runs = 0, gpu = 0, prev = 0, len, pa;
+    uint32_t fmt, slot = FLIP_NONE, h = 0;
+    int err;
+
+    if (!flip_gpu_vm(flip.nfb))
+        return FLIP_R_UNSUPPORTED;
+    if (!r->md || !r->width || !r->height || r->pitch < 4 * r->width || (r->pitch & 255))
+        return FLIP_R_BADARG;
+    fmt = r->format == 1 ? DRM_FORMAT_XRGB8888 : r->format == 2 ? DRM_FORMAT_XRGB2101010 : 0;
+    if (!fmt)
+        return FLIP_R_BADARG;
+    spin_lock(&flip.lock);
+    for (i = 0; i < FLIP_NIMP; i++)
+        if (!flip.imp[i].used) { slot = (uint32_t)i; flip.imp[i].used = 2; break; }
+    spin_unlock(&flip.lock);
+    if (slot == FLIP_NONE)
+        return FLIP_R_BUSY;
+    m = &flip.imp[slot];
+
+    size = round_page((uint64_t)r->pitch * r->height);
+    n = size / PAGE_SIZE;
+    for (i = 0; i < n; i++) {               /* runs of physically adjacent pages */
+        len = 0;
+        pa = nmx_xnu_md_phys(r->md, r->offset + i * PAGE_SIZE, &len);
+        if (!pa || (pa & PAGE_MASK))
+            return flip_import_fail(r, m, "descriptor page", (int)i);
+        if (i == 0 || pa != prev + PAGE_SIZE)
+            runs++;
+        prev = pa;
+    }
+    sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+    if (!sgt || sg_alloc_table(sgt, (unsigned int)runs, GFP_KERNEL)) {
+        kfree(sgt);
+        return flip_import_fail(r, m, "sg alloc", -ENOMEM);
+    }
+    sg = NULL;
+    for (i = 0; i < n; i++) {
+        len = 0;
+        pa = nmx_xnu_md_phys(r->md, r->offset + i * PAGE_SIZE, &len);
+        if (sg && sg_dma_address(sg) + sg_dma_len(sg) == pa) {
+            sg_dma_len(sg) += PAGE_SIZE;
+            sg->length += PAGE_SIZE;
+            continue;
+        }
+        sg = sg ? sg_next(sg) : sgt->sgl;
+        sg_dma_address(sg) = pa;
+        sg_dma_len(sg) = PAGE_SIZE;
+        sg->length = PAGE_SIZE;
+    }
+
+    adev = flip_adev(flip.nfb);
+    err = amdgpu_gem_object_create(adev, size, PAGE_SIZE, AMDGPU_GEM_DOMAIN_CPU, AMDGPU_GEM_CREATE_CPU_GTT_USWC,
+                                   ttm_bo_type_sg, NULL, &gem, 0);
+    if (err || !gem)
+        return flip_import_fail(r, m, "gem create", err);   /* sg_table leaked */
+    bo = gem_to_amdgpu_bo(gem);
+    bo->tbo.sg = sgt;
+    if (!bo->tbo.ttm || !(bo->tbo.ttm->page_flags & TTM_TT_FLAG_EXTERNAL)) {
+        int f = bo->tbo.ttm ? (int)bo->tbo.ttm->page_flags : -1;
+
+        drm_gem_object_put(gem);
+        return flip_import_fail(r, m, "no external tt", f);
+    }
+    bo->tbo.ttm->sg = sgt;
+
+    err = amdgpu_bo_reserve(bo, false);
+    if (!err) {
+        err = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_GTT);
+        if (!err && (err = amdgpu_ttm_alloc_gart(&bo->tbo)))
+            amdgpu_bo_unpin(bo);
+        if (!err)
+            gpu = amdgpu_bo_gpu_offset(bo);
+        amdgpu_bo_unreserve(bo);
+    }
+    if (err) {
+        drm_gem_object_put(gem);
+        return flip_import_fail(r, m, "pin gtt", err);
+    }
+    if ((err = drm_gem_handle_create(file, gem, &h))) {
+        if (!amdgpu_bo_reserve(bo, false)) {
+            amdgpu_bo_unpin(bo);
+            amdgpu_bo_unreserve(bo);
+        }
+        drm_gem_object_put(gem);
+        return flip_import_fail(r, m, "handle", err);
+    }
+    drm_gem_object_put(gem);                /* the handle holds the object now */
+    memset(&c, 0, sizeof(c));
+    c.width = r->width;
+    c.height = r->height;
+    c.pixel_format = fmt;
+    c.handles[0] = h;
+    c.pitches[0] = r->pitch;
+    if ((err = drm_mode_addfb2(dev, &c, file)) || !(fb = drm_framebuffer_lookup(dev, file, c.fb_id))) {
+        if (!amdgpu_bo_reserve(bo, false)) {
+            amdgpu_bo_unpin(bo);
+            amdgpu_bo_unreserve(bo);
+        }
+        drm_gem_handle_delete(file, h);
+        return flip_import_fail(r, m, "addfb2", err ? err : -ENOENT);
+    }
+    drm_framebuffer_put(fb);                /* the file's fb list holds it */
+    m->fb = fb;
+    m->gem = gem;
+    m->sgt = sgt;
+    m->md = r->md;
+    m->gpu = gpu;
+    m->fbid = c.fb_id;
+    m->gemh = h;
+    m->fmt = fmt;
+    __atomic_store_n(&m->used, 1, __ATOMIC_RELEASE);
+    flip.nimports++;
+    r->handle = FLIP_IMP0 + slot;
+    r->gpuAddr = gpu;
+    FLIP_LOG("NMX flip: import %u: %ux%u pitch %u fmt %x, %llu pages in %llu runs, gpu %llx, fb %p\n",
+             FLIP_IMP0 + slot, r->width, r->height, r->pitch, fmt, (unsigned long long)n, (unsigned long long)runs,
+             (unsigned long long)gpu, fb);
+    return FLIP_R_OK;
+}
+
+/* the caller has checked the handle is neither on screen nor pending */
+static uint32_t flip_release_import(uint32_t h)
+{
+    struct nmx_flip_import *m;
+    struct amdgpu_bo *bo;
+
+    if (h < FLIP_IMP0 || h >= FLIP_IMP0 + FLIP_NIMP || flip.imp[h - FLIP_IMP0].used != 1)
+        return FLIP_R_BADARG;
+    m = &flip.imp[h - FLIP_IMP0];
+    bo = gem_to_amdgpu_bo(m->gem);
+    spin_lock(&flip.lock);
+    m->used = 2;
+    spin_unlock(&flip.lock);
+    if (!amdgpu_bo_reserve(bo, false)) {
+        amdgpu_bo_unpin(bo);
+        amdgpu_bo_unreserve(bo);
+    }
+    drm_mode_rmfb(flip.nfb->client.dev, m->fbid, flip.nfb->client.file);
+    drm_gem_handle_delete(flip.nfb->client.file, m->gemh);
+    m->fb = NULL;
+    m->gem = NULL;
+    __atomic_store_n(&m->used, 0, __ATOMIC_RELEASE);
+    FLIP_LOG("NMX flip: released import %u\n", h);
+    return FLIP_R_OK;
+}
+
+/* -1: not a flip call (IOFramebuffer handles it); otherwise the IOReturn */
+long long nmx_fb_flip_call(const char *name, void *req)
+{
+    struct nmx_flipreq *r = req;
+    int fn;
+
+    if (strncmp(name, "nmxFlip", 7) != 0)
+        return -1;
+    fn = !strcmp(name, "nmxFlipStatus") ? 5 : !strcmp(name, "nmxFlipSubmit") ? 4 : !strcmp(name, "nmxFlipCaps") ? 0 :
+         !strcmp(name, "nmxFlipBuffers") ? 2 : !strcmp(name, "nmxFlipRelease") ? 3 :
+         !strcmp(name, "nmxFlipImport") ? 1 : -1;
+    if (fn < 0)
+        return -1;
+    if (!r || r->version != 1)
+        return FLIP_R_BADARG;
+    if (!flip_init())
+        return FLIP_R_NOTREADY;
+    r->err = 0;
+    switch (fn) {
+    case 0:
+        r->caps = 1u | 4u | 0x100u;
+        r->maxImports = 0;
+        if (flip_gpu_vm(flip.nfb)) {
+            r->caps |= 2u | 0x200u;
+            r->maxImports = FLIP_NIMP;
+        }
+        r->width = flip.nfb->info.width;
+        r->height = flip.nfb->info.height;
+        r->pitch = flip.pitch[0];
+        r->generation = flip.gen;
+        return FLIP_R_OK;
+    case 1:
+        return flip_import(r);
+    case 2:
+        return flip_buffers(r);
+    case 3: {
+        uint32_t busy;
+
+        spin_lock(&flip.lock);
+        flip_refresh();
+        busy = r->handle == flip.current || r->handle == flip.pending;
+        spin_unlock(&flip.lock);
+        if (busy)
+            return FLIP_R_BUSY;
+        return r->handle >= FLIP_IMP0 ? flip_release_import(r->handle) : FLIP_R_OK;
+    }
+    case 4:
+        return flip_submit(r);
+    default:
+        return flip_status(r);
+    }
 }

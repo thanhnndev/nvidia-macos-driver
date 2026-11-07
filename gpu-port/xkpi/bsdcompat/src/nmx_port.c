@@ -15,6 +15,7 @@
 #include "nmx_port.h"
 
 int nmx_kernel_init(void);
+void nmx_acpica_reread(void);
 void nmx_kernel_fini(void);
 int nmx_malloc_init(void);
 void nmx_malloc_fini(void);
@@ -128,8 +129,16 @@ int nmx_port_power(void *dev, int on)
         EVENTHANDLER_INVOKE(power_resume, POWER_STYPE_AWAKE);
         return err;
     }
-    EVENTHANDLER_INVOKE(power_suspend_early, POWER_STYPE_FW_SUSPEND);
-    EVENTHANDLER_INVOKE(power_suspend, POWER_STYPE_FW_SUSPEND);
+    /*
+     * ga403wm Step112c: StrixS0ix publishes FACP in "ACPI Tables" at about the same time this kext starts, so the
+     * FADT copied at start may be missing; read it again so amdgpu sees ACPI_FADT_LOW_POWER_S0.
+     * ga403wm Step107: GA403WM is Modern Standby only (no _S3) and keeps the GPU powered through sleep, so suspend
+     * through s2idle: SUSPEND_TO_IDLE maps to PM_SUSPEND_TO_IDLE and amdgpu takes its s0ix path (PSP/GFX/SDMA kept,
+     * SMU D3Entry) instead of the S3 teardown and cold re-init.
+     */
+    nmx_acpica_reread();
+    EVENTHANDLER_INVOKE(power_suspend_early, POWER_STYPE_SUSPEND_TO_IDLE);
+    EVENTHANDLER_INVOKE(power_suspend, POWER_STYPE_SUSPEND_TO_IDLE);
     return nmx_bus_call_children(dev, "device_suspend");
 }
 
