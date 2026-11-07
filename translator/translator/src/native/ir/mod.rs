@@ -2013,4 +2013,57 @@ join:
             Some(&LlType::Array(Box::new(LlType::Int(8)), 4))
         );
     }
+
+    #[test]
+    fn struct_alloca_read_by_bytes_in_a_helper_uses_bounded_byte_storage() {
+        // MTLSimDriver's `astc` kernel: the union lives in the kernel, the byte reads in a helper (one more level
+        // down through a forwarded pointer and an identity bitcast).
+        let air = concat!(
+            "%union.E = type { <4 x i32> }\n",
+            "define internal i8 @leaf(ptr %q, i64 %n) {\n",
+            "entry:\n",
+            "  %c = bitcast ptr %q to ptr\n",
+            "  %p = getelementptr inbounds i8, ptr %c, i64 %n\n",
+            "  %b = load i8, ptr %p, align 1\n",
+            "  ret i8 %b\n",
+            "}\n",
+            "define internal i8 @mid(ptr %u, i64 %n) {\n",
+            "entry:\n",
+            "  %b = call i8 @leaf(ptr %u, i64 %n)\n",
+            "  ret i8 %b\n",
+            "}\n",
+            "define void @k(i64 %n) {\n",
+            "entry:\n",
+            "  %u = alloca %union.E, align 16\n",
+            "  %b = call i8 @mid(ptr %u, i64 %n)\n",
+            "  ret void\n",
+            "}\n",
+        );
+        assert_eq!(
+            parsed(air)
+                .local_alloca_pointees
+                .get(&("k".to_string(), "%u".to_string())),
+            Some(&LlType::Array(Box::new(LlType::Int(8)), 16))
+        );
+    }
+
+    #[test]
+    fn struct_alloca_read_by_type_in_a_helper_keeps_its_type() {
+        let air = concat!(
+            "%union.E = type { <4 x i32> }\n",
+            "define internal i32 @lane(ptr %u) {\n",
+            "entry:\n",
+            "  %p = getelementptr inbounds %union.E, ptr %u, i64 0, i32 0, i64 2\n",
+            "  %v = load i32, ptr %p, align 8\n",
+            "  ret i32 %v\n",
+            "}\n",
+            "define void @k() {\n",
+            "entry:\n",
+            "  %u = alloca %union.E, align 16\n",
+            "  %v = call i32 @lane(ptr %u)\n",
+            "  ret void\n",
+            "}\n",
+        );
+        assert!(parsed(air).local_alloca_pointees.is_empty());
+    }
 }

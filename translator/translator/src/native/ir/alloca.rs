@@ -153,6 +153,23 @@ impl LlModule {
                             .insert(param_pointee.clone());
                     }
                 }
+                // A helper that reads the object through byte GEPs on the parameter is the same byte view as an
+                // `i8` GEP in this function, so the alloca gets byte storage here too. Without it the object
+                // keeps its struct type and a dynamic byte offset becomes a dynamic struct member index once the
+                // helper is inlined (MTLSimDriver's `astc` kernel: `DecodeASTC_RGBA(ptr %union.Everything, ...)`).
+                for (arg, (param_name, _)) in call.args.iter().zip(callee.params.iter()) {
+                    let LlValue::Local(arg_name) = &arg.value else {
+                        continue;
+                    };
+                    let Some(root) = alias_roots.get(arg_name) else {
+                        continue;
+                    };
+                    if allocas.contains_key(root)
+                        && self.param_has_byte_gep(callee, param_name, &mut HashSet::default())
+                    {
+                        sources.entry(root.clone()).or_default().insert(LlType::Int(8));
+                    }
+                }
             }
 
             for (name, seen) in sources {
@@ -222,6 +239,61 @@ impl LlModule {
                 }
             }
         }
+    }
+
+    /// Does `function` address the object behind pointer parameter `param` with an `i8` GEP, directly, through
+    /// identity bitcasts, or in a helper it forwards the pointer to? `visited` stops recursion.
+    pub(in crate::native) fn function_param_has_byte_gep(&self, function: &str, param: &str) -> bool {
+        self.functions
+            .iter()
+            .find(|f| f.name == function)
+            .is_some_and(|f| self.param_has_byte_gep(f, param, &mut HashSet::default()))
+    }
+
+    fn param_has_byte_gep(
+        &self,
+        function: &LlFunction,
+        param: &str,
+        visited: &mut HashSet<(String, String)>,
+    ) -> bool {
+        if !visited.insert((function.name.clone(), param.to_string())) {
+            return false;
+        }
+        let mut aliases: HashSet<String> = HashSet::default();
+        aliases.insert(param.to_string());
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for inst in function.carrier_insts() {
+                if let Some((res, base)) = inst.identity_ptr_bitcast() {
+                    if aliases.contains(base) && aliases.insert(res.to_string()) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for inst in function.carrier_insts() {
+            if let Some(gep) = inst.gep() {
+                if matches!(&gep.base.value, LlValue::Local(base) if aliases.contains(base))
+                    && self.resolve_known_type(&gep.source_ty) == LlType::Int(8)
+                {
+                    return true;
+                }
+            }
+            if let Some(call) = inst.call().as_deref() {
+                let Some(callee) = self.functions.iter().find(|g| g.name == call.callee) else {
+                    continue;
+                };
+                for (arg, (callee_param, _)) in call.args.iter().zip(callee.params.iter()) {
+                    if matches!(&arg.value, LlValue::Local(name) if aliases.contains(name))
+                        && self.param_has_byte_gep(callee, callee_param, visited)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     pub(in crate::native) fn local_allocas(&self, f: &LlFunction) -> HashMap<String, LlType> {

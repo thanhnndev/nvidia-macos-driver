@@ -414,6 +414,7 @@ impl LlModule {
                 }
             }
         }
+        let source_alloca_views = self.local_alloca_pointees.clone();
         let source_raw_buffers = self.raw_buffer_params.clone();
         let source_data_buffers = self.metadata_data_buffer_params.clone();
         let mut cloned_pointees = Vec::new();
@@ -471,10 +472,15 @@ impl LlModule {
                                                 .get(&(helper.name.clone(), parameter.clone()));
                                             let caller_pointee = source_value_pointees
                                                 .get(&(caller_name.clone(), argument_name.clone()));
-                                            if matches!(
-                                                (helper_pointee, caller_pointee),
-                                                (Some(helper), Some(caller)) if helper != caller
-                                            ) {
+                                            // a byte-storage alloca serves every view the helper takes of it
+                                            let byte_storage = source_alloca_views
+                                                .contains_key(&(caller_name.clone(), argument_name.clone()));
+                                            if !byte_storage
+                                                && matches!(
+                                                    (helper_pointee, caller_pointee),
+                                                    (Some(helper), Some(caller)) if helper != caller
+                                                )
+                                            {
                                                 return None;
                                             }
                                         }
@@ -513,11 +519,15 @@ impl LlModule {
                         // proxy (a pointer-chasing buffer relies on it: the loop-carried device address case).
                         if let (LlType::Ptr(_), LlValue::Local(argument_name)) = (parameter_type, &argument.value) {
                             let key = (caller_name.clone(), argument_name.clone());
-                            if source_data_buffers.contains(&key)
+                            // Same for a local alloca that got byte storage (a byte view somewhere): the proxy
+                            // would carry the helper's struct pointee, so the helper's struct GEPs became typed
+                            // chains into the byte array (MTLSimDriver `astc`: `%union.Everything` lane GEPs).
+                            if (source_data_buffers.contains(&key)
                                 && matches!(
                                     source_value_pointees.get(&key),
                                     Some(LlType::Struct(_)) | Some(LlType::Named(_))
-                                )
+                                ))
+                                || source_alloca_views.contains_key(&key)
                             {
                                 local_rename.insert(parameter.clone(), argument_name.clone());
                                 continue;
@@ -600,6 +610,12 @@ impl LlModule {
                     for ((function, local), pointee) in &source_pointees {
                         if function == &helper.name {
                             if let Some(renamed) = local_rename.get(local) {
+                                // the caller's own byte view stays the alloca's pointee
+                                if source_alloca_views
+                                    .contains_key(&(caller_name.clone(), renamed.clone()))
+                                {
+                                    continue;
+                                }
                                 cloned_pointees.push((
                                     (caller_name.clone(), renamed.clone()),
                                     pointee.clone(),

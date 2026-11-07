@@ -516,6 +516,26 @@ impl Emitter {
     }
 
     fn infer_function_param_pointees(&mut self, functions: &[LlFunction]) -> Result<(), String> {
+        // A byte-storage object passed down a call chain (alloca -> helper -> helper) reaches each level only
+        // once the level above has its parameter's byte view, so repeat until the views stop changing.
+        let mut seeds = HashMap::default();
+        for _ in 0..8 {
+            let inferred = self.infer_function_param_pointees_once(functions, &seeds)?;
+            let changed = inferred != seeds;
+            seeds = inferred;
+            if !changed {
+                break;
+            }
+        }
+        self.function_param_pointees = seeds;
+        Ok(())
+    }
+
+    fn infer_function_param_pointees_once(
+        &self,
+        functions: &[LlFunction],
+        seeds: &HashMap<(String, usize), LlType>,
+    ) -> Result<HashMap<(String, usize), LlType>, String> {
         let functions_by_name: HashMap<String, &LlFunction> = functions
             .iter()
             .map(|function| (function.name.clone(), function))
@@ -523,7 +543,7 @@ impl Emitter {
         let mut inferred = HashMap::default();
         let mut ambiguous = HashSet::default();
         for function in functions {
-            let local_pointees = self.local_call_arg_pointees(function)?;
+            let local_pointees = self.local_call_arg_pointees(function, seeds)?;
             for inst in function.carrier_insts() {
                 let Some(call_result) = inst.emit_scan_call() else {
                     continue;
@@ -568,8 +588,7 @@ impl Emitter {
                 }
             }
         }
-        self.function_param_pointees = inferred;
-        Ok(())
+        Ok(inferred)
     }
 
     pub(super) fn infer_function_param_nonnull(
@@ -771,10 +790,25 @@ impl Emitter {
     fn local_call_arg_pointees(
         &self,
         function: &LlFunction,
+        seeds: &HashMap<(String, usize), LlType>,
     ) -> Result<HashMap<String, LlType>, String> {
         let mut pointees = HashMap::default();
-        for (param, ty) in &function.params {
+        // local objects that got byte storage pass that storage, not their declared type
+        for ((owner, name), view) in &self.ir.local_alloca_pointees {
+            if owner == &function.name && self.ir.is_pure_byte_image(view) {
+                pointees.insert(name.clone(), view.clone());
+            }
+        }
+        for (index, (param, ty)) in function.params.iter().enumerate() {
             if !matches!(ty, LlType::Ptr(_)) {
+                continue;
+            }
+            // a parameter that receives byte storage from its callers forwards that storage
+            if let Some(view) = seeds
+                .get(&(function.name.clone(), index))
+                .filter(|view| self.ir.is_pure_byte_image(view))
+            {
+                pointees.insert(param.clone(), view.clone());
                 continue;
             }
             if let Some(pointee) = self
@@ -854,6 +888,9 @@ impl Emitter {
                 types_compatible(local_pointee, call_pointee)
                     || padding_widened_vector(local_pointee, call_pointee)
                     || self.byte_image_receives_param_view(local_pointee, call_pointee)
+                    // a helper that addresses its parameter by bytes takes the caller's byte storage as is
+                    || (self.ir.is_pure_byte_image(call_pointee)
+                        && self.ir.function_param_has_byte_gep(callee_name, callee_param))
             })
     }
 

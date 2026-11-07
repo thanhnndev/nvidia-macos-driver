@@ -5437,6 +5437,11 @@ pub(crate) fn owned_module_failures(
         .all_inst_iter()
         .find_map(|instruction| owned_access_chain_error(instruction, &definitions, &value_types))
     {
+        if let Some(path) = crate::env_vars::owned_dump() {
+            let words = module.assemble();
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = std::fs::write(&path, bytes);
+        }
         record!(if failure.raw_buffer_eligible {
             OwnedModuleFailure::RawBufferConstruction(failure.error)
         } else {
