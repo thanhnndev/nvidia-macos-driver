@@ -940,7 +940,11 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // Miss accounting, so a boot log says why WindowServer imports a surface again (a new surface, the same surface
 // under another key, or a surface whose entry the sweep dropped, and why). Under @synchronized(device) like the rest.
 enum { NVMTL_GONE_UNHELD = 1, NVMTL_GONE_EXPIRED = 2, NVMTL_GONE_CAP = 3 };
-static struct { uint64_t hits, misses, fresh, otherKey, gone[4], sweeps, sweepNsMax, sweepNsSum, logged, lastLogMs, drops, idleBytes, maxSweepDrops; } nvmtl_sk;
+static struct { uint64_t hits, misses, fresh, otherKey, gone[4], sweeps, sweepNsMax, sweepNsSum, logged, lastLogMs, drops, idleBytes, maxSweepDrops,
+                expBack[4], expLogged, heldRefresh; } nvmtl_sk;
+// surface ID -> (drop time ms << 20) | idle ms at the drop (clamped), so an expired miss says how long the entry had been
+// idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
+static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropAt;
 static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_gone;   // surface ID -> why its last entry went
 static NSCountedSet<NSNumber *> *nvmtl_sk_live;                      // surface IDs with an entry in keep
 static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull; }
@@ -949,11 +953,13 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
     if (now - nvmtl_sk.lastLogMs < 30000) return;
     nvlog("surface keep: %llu s: hits %llu, misses %llu (new surface %llu, same surface other key %llu, after drop: "
           "unheld %llu, expired %llu, idle cap %llu), %lu entries, sweep avg %llu us max %llu us; %llu dropped (released off the "
-          "main thread), idle %llu MB at the last sweep, slowest sweep dropped %llu",
+          "main thread), idle %llu MB at the last sweep, slowest sweep dropped %llu; expired came back < 250 ms %llu, < 1 s %llu, "
+          "< 3 s %llu, later %llu; held entries refreshed %llu",
           (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.hits, nvmtl_sk.misses, nvmtl_sk.fresh,
           nvmtl_sk.otherKey, nvmtl_sk.gone[NVMTL_GONE_UNHELD], nvmtl_sk.gone[NVMTL_GONE_EXPIRED], nvmtl_sk.gone[NVMTL_GONE_CAP],
           (unsigned long)keep.count, nvmtl_sk.sweeps ? nvmtl_sk.sweepNsSum / nvmtl_sk.sweeps / 1000 : 0,
-          nvmtl_sk.sweepNsMax / 1000, nvmtl_sk.drops, nvmtl_sk.idleBytes >> 20, nvmtl_sk.maxSweepDrops);
+          nvmtl_sk.sweepNsMax / 1000, nvmtl_sk.drops, nvmtl_sk.idleBytes >> 20, nvmtl_sk.maxSweepDrops,
+          nvmtl_sk.expBack[0], nvmtl_sk.expBack[1], nvmtl_sk.expBack[2], nvmtl_sk.expBack[3], nvmtl_sk.heldRefresh);
     const uint64_t logged = nvmtl_sk.logged;
     memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
 }
@@ -964,7 +970,16 @@ static void nvmtl_sk_miss(NVMTLSurfKey *key) {
     if ([nvmtl_sk_live countForObject:sid]) { nvmtl_sk.otherKey++; why = "same surface, other key"; }
     else {
         const unsigned g = [nvmtl_sk_gone[sid] unsignedIntValue];
-        if (g >= 1 && g <= 3) { nvmtl_sk.gone[g]++; why = g == NVMTL_GONE_UNHELD ? "dropped: unheld" : g == NVMTL_GONE_EXPIRED ? "dropped: expired" : "dropped: idle cap"; }
+        if (g >= 1 && g <= 3) { nvmtl_sk.gone[g]++; why = g == NVMTL_GONE_UNHELD ? "dropped: unheld" : g == NVMTL_GONE_EXPIRED ? "dropped: expired" : "dropped: idle cap";
+            const uint64_t at = [nvmtl_sk_dropAt[sid] unsignedLongLongValue], now = nvmtl_keep_now_ms();
+            const uint64_t back = at ? now - (at >> 20) : 0, idleAtDrop = at & 0xfffff;
+            if (g == NVMTL_GONE_EXPIRED) {
+                nvmtl_sk.expBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
+                if (nvmtl_sk.expLogged++ < 6)   // per 30 s report: which surfaces come back after expiring
+                    nvlog("surface keep: expired miss: surface %u plane %u %llux%llu fmt %llu fbo %llu, idle %llu ms at the drop, back after %llu ms",
+                          key->_sid, key->_plane, (unsigned long long)key->_w, (unsigned long long)key->_h, (unsigned long long)key->_fmt,
+                          (unsigned long long)key->_fbo, (unsigned long long)idleAtDrop, (unsigned long long)back);
+            } }
         else { nvmtl_sk.fresh++; why = "new surface"; }
     }
     if (nvmtl_sk.logged < 12) { nvmtl_sk.logged++;
@@ -985,6 +1000,9 @@ static void nvmtl_sk_drop(NSMutableDictionary *keep, NVMTLSurfKey *k, unsigned w
     [nvmtl_sk_live removeObject:sid];
     if (nvmtl_sk_gone.count > 4096) [nvmtl_sk_gone removeAllObjects];
     nvmtl_sk_gone[sid] = @(why);
+    if (!nvmtl_sk_dropAt || nvmtl_sk_dropAt.count > 4096) nvmtl_sk_dropAt = [NSMutableDictionary new];
+    const uint64_t now = nvmtl_keep_now_ms(), idle = old ? MIN(now - old->_last, (uint64_t)0xfffff) : 0;
+    nvmtl_sk_dropAt[sid] = @((now << 20) | idle);
 }
 static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
@@ -1023,7 +1041,9 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new];
     [keep enumerateKeysAndObjectsUsingBlock:^(NVMTLSurfKey *k, NVMTLSurfKeep *e, BOOL *stop) {
         (void)stop; NVMTLTexture *b = e->_tex;
-        if (b->_surf && CFGetRetainCount(b->_surf) > 1) return;
+        // Held elsewhere (WindowServer layer contents): in use now, so its idle time starts when it is released. Without
+        // this, a surface on screen for > NVMTL_KEEP_MS without a new wrap expired at the first sweep after its release.
+        if (b->_surf && CFGetRetainCount(b->_surf) > 1) { if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; } return; }
         if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)keepMs) { [idle addObject:k]; return; }
         [gone addObject:k];
     }];
