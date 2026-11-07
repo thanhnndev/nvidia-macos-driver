@@ -94,7 +94,12 @@ public:
          * transaction submission failed"), so the owned path is the one with a future. */
         const bool internalPanel = fDisplay.internal && fInfo.width == 2880 && fInfo.height == 1800;
         const bool foreign = internalPanel && provider->getProperty("NMXNvidiaDisplayBridge") == kOSBooleanTrue;
-        const bool owned = internalPanel && !foreign && provider->getProperty("NMXOwnsDisplay") == kOSBooleanTrue;
+        /* ga403wm Step128: the owned path is the default for the internal panel. A framebuffer that is neither foreign
+         * nor owned has no IOFBDependentID, so IOFramebuffer::start() makes no controller (fPrivate->controller NULL):
+         * NMXAccel's first mode change then faults in getAttributeExt (CR2 0x120, 10 s into the boot), and without it
+         * WindowServer's pipe never goes active (black panel). The source build lost the personality key that the
+         * Step80 installer had written into Info.plist, which is exactly that. Opt out only with an explicit false. */
+        const bool owned = internalPanel && !foreign && provider->getProperty("NMXOwnsDisplay") != kOSBooleanFalse;
         fForeign = foreign;
         setProperty("IOFBDependentIndex", foreign ? 4ULL : 0ULL, 32);
         if (foreign) {
@@ -129,6 +134,8 @@ public:
                 if (o != this && OSDynamicCast(IOFramebuffer, o)) fBeside = true;
             it->release();
         }
+        if (internalPanel && !foreign && !owned)
+            FBLOG("internal panel is neither owned nor foreign (NMXOwnsDisplay false): no controller group, no display pipe");
         if (!IOFramebuffer::start(provider)) return false;
         setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);

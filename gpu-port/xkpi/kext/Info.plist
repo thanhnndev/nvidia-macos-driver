@@ -18,6 +18,9 @@
       <key>IOPCIPrimaryMatch</key><string>0x00001002&amp;0x0000ffff</string>
       <key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
       <key>IOProbeScore</key><integer>60000</integer>
+      <!-- ga403wm Step80/Step128: the panel's framebuffer is head 0 of this GPU's own controller group (NMXAMDFB gets
+           IOFBDependentID). Without it IOFramebuffer::start() makes no controller: panic at 10 s or a black panel. -->
+      <key>NMXOwnsDisplay</key><true/>
     </dict>
     <key>NMXGPUIntel</key><dict>
       <key>CFBundleIdentifier</key><string>com.nullmoth.NMXGPU</string>
