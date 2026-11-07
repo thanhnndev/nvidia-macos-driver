@@ -750,9 +750,13 @@ void pmap_copy_page(vm_page_t src, vm_page_t dst)
     memcpy(dst->nmx_kva, src->nmx_kva, PAGE_SIZE);
 }
 
+/* ga403wm Step84: TTM clears pool pages through the write-back kernel alias (nmx_kva) while the GPU may read them
+ * unsnooped (WC/UC pages). Without a flush the zeros stay as dirty lines and are later written back over what RADV
+ * or the GPU put in the page (IBs, descriptors). Linux has no such alias (set_pages_array_wc makes it WC too). */
 void pmap_zero_page(vm_page_t m)
 {
     bzero(m->nmx_kva, PAGE_SIZE);
+    pmap_invalidate_cache_range((vm_offset_t)m->nmx_kva, (vm_offset_t)m->nmx_kva + PAGE_SIZE);
 }
 
 /* ---- accounting --------------------------------------------------------------------------------------------------- */

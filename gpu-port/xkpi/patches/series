@@ -15,3 +15,6 @@ amdgpu-zz-ibprepare-b15.patch
 amdgpu-vmid-trace.patch
 amdgpu-job-timeout-hook.patch
 amdgpu-wbinvd-knob.patch
+drm-syncobj-etime.patch
+amdgpu-ibprep-optin.patch
+ttm-pool-order0.patch

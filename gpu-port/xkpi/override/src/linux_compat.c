@@ -128,9 +128,11 @@ SYSCTL_INT(_compat_linuxkpi, OID_AUTO, debug, CTLFLAG_RWTUN,
     &linuxkpi_debug, 0, "Set to enable pr_debug() prints. Clear to disable.");
 
 /* NullMoth: A/B switch for the GTT cache mode, read when a TTM buffer is created (see amdgpu-ttm-force-wc.patch) */
-int nmx_gtt_wc = 1;
+/* ga403wm Step88: default 0 = upstream APU model (cached + snooped GTT). This CPU has no self-snoop, and forced WC
+ * GTT left every page with a write-back kernel alias next to an unsnooped GPU view. */
+int nmx_gtt_wc = 0;
 SYSCTL_INT(_compat_linuxkpi, OID_AUTO, nmx_wc, CTLFLAG_RWTUN,
-    &nmx_gtt_wc, 1, "1: GTT buffers write-combined (not snooped); 0: write-back snooped (stock)");
+    &nmx_gtt_wc, 0, "1: GTT buffers write-combined (not snooped); 0: write-back snooped (stock, default)");
 
 int linuxkpi_rcu_debug;
 SYSCTL_INT(_compat_linuxkpi, OID_AUTO, rcu_debug, CTLFLAG_RWTUN,

@@ -201,9 +201,11 @@ extern "C" int nmx_wbinvd_before_submit = 0;
 SYSCTL_INT(_debug, OID_AUTO, nmx_wbinvd, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_wbinvd_before_submit, 0,
            "flush all CPU caches before each submission: 0 off (default), 1 on");
 
-extern "C" int nmx_umap_cache = 1;
+/* ga403wm Step91: default 0 = the driver's own attribute. With snooped GTT (Step88) a cached BO maps write-back and
+ * a USWC BO maps WC; forced UC/WC made every CPU read of a BO run at ~108 MB/s. */
+extern "C" int nmx_umap_cache = 0;
 SYSCTL_INT(_debug, OID_AUTO, nmx_umap_cache, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_umap_cache, 0,
-           "user BO mapping cache: 0 driver default, 1 uncached (default), 2 write-combined");
+           "user BO mapping cache: 0 driver default (default), 1 uncached, 2 write-combined");
 
 static void nmx_sysctl_install(void)
 {
