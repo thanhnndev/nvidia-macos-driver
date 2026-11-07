@@ -154,11 +154,22 @@ static unsigned bucket_of(const void *p, unsigned n)
     return (unsigned)((v >> 4) ^ (v >> 12)) & (n - 1);
 }
 
-/* a process's start time in microseconds: with its pid, what tells the owners of one recycled proc_t apart */
+/*
+ * A process's start time in microseconds: with its pid, what tells the owners of one recycled proc_t apart.
+ * proc_starttime is in the 26.5 SDK but not exported to kexts by every kernel (25G332 has no kext export for it),
+ * so it is imported weak; where it is missing the start reads 0 and the pid alone tells owners apart (a recycled
+ * proc_t with the same pid needs a full pid wrap while the record lives).
+ */
+extern int nmx_weak_proc_starttime(void *p, struct timeval *tv) __asm("_proc_starttime") __attribute__((weak_import));
+extern const void *const gOSKextUnresolved;
+
 static uint64_t nmx_proc_start(void *xnu)
 {
     struct timeval tv = { 0, 0 };
-    proc_starttime(xnu, &tv);
+    if ((const void *)&nmx_weak_proc_starttime == NULL ||
+        (const void *)&nmx_weak_proc_starttime == gOSKextUnresolved)
+        return 0;
+    nmx_weak_proc_starttime(xnu, &tv);
     return (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
 }
 
