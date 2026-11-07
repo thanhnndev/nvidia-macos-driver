@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c	2026-11-07 15:10:54
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c	2026-11-07 15:11:22
+@@ -1207,6 +1207,18 @@
+ 	amdgpu_ttm_backend_unbind(bdev, ttm);
+ 
+ 	if (gtt->userptr) {
++#ifdef NMXKPI
++		/* ga403wm Step92: the pages were pinned when the BO was made; put them */
++		{
++			pgoff_t k;
++
++			for (k = 0; k < ttm->num_pages; k++)
++				if (ttm->pages[k]) {
++					release_pages(&ttm->pages[k], 1);
++					ttm->pages[k] = NULL;
++				}
++		}
++#endif
+ 		amdgpu_ttm_tt_set_user_pages(ttm, NULL);
+ 		kfree(ttm->sg);
+ 		ttm->sg = NULL;

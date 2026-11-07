@@ -1,0 +1,391 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c	2026-11-07 15:10:36
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c	2026-11-07 15:12:53
+@@ -41,6 +41,24 @@
+ #include "amdgpu_gem.h"
+ #include "amdgpu_ras.h"
+ 
++
++/*
++ * ga403wm Step95: every failing stage of a command submission says which one failed and with what. A CS rejected
++ * from deep inside amdgpu_cs_ioctl reaches user space as one errno (the Step96/97b WindowServer crash loops were
++ * "CS rejected (-1)" with no other line). -EAGAIN, -ERESTARTSYS and -EINTR are normal and not logged. Budgets: 96
++ * lines for -EPERM, 48 for other errors.
++ */
++void nmx_cs_report_name(const char *what, int r, bool always)
++{
++	static atomic_t eperm, other;
++
++	if (!always && (r == 0 || r == -EAGAIN || r == -ERESTARTSYS || r == -EINTR || r == -EDEADLK))
++		return;
++	if (atomic_inc_return(r == -EPERM ? &eperm : &other) > (r == -EPERM ? 96 : 48))
++		return;
++	printf("NMX cs-trace: %s -> %d\n", what, r);
++}
++
+ static int amdgpu_cs_parser_init(struct amdgpu_cs_parser *p,
+ 				 struct amdgpu_device *adev,
+ 				 struct drm_file *filp,
+@@ -80,6 +98,7 @@
+ 	r = amdgpu_ctx_get_entity(p->ctx, chunk_ib->ip_type,
+ 				  chunk_ib->ip_instance,
+ 				  chunk_ib->ring, &entity);
++	nmx_cs_report_name("ctx_get_entity", r, false);
+ 	if (r)
+ 		return r;
+ 
+@@ -159,6 +178,7 @@
+ 
+ 	r = amdgpu_bo_list_create(p->adev, p->filp, info, data->bo_number,
+ 				  &p->bo_list);
++	nmx_cs_report_name("bo_list_create", r, false);
+ 	if (r)
+ 		goto error_free;
+ 
+@@ -245,6 +265,7 @@
+ 				goto free_partial_kdata;
+ 
+ 			ret = amdgpu_cs_p1_ib(p, p->chunks[i].kdata, num_ibs);
++			nmx_cs_report_name("cs_p1_ib", ret, false);
+ 			if (ret)
+ 				goto free_partial_kdata;
+ 			break;
+@@ -255,6 +276,7 @@
+ 
+ 			ret = amdgpu_cs_p1_user_fence(p, p->chunks[i].kdata,
+ 						      &uf_offset);
++			nmx_cs_report_name("cs_p1_user_fence", ret, false);
+ 			if (ret)
+ 				goto free_partial_kdata;
+ 			break;
+@@ -268,6 +290,7 @@
+ 				goto free_partial_kdata;
+ 
+ 			ret = amdgpu_cs_p1_bo_handles(p, p->chunks[i].kdata);
++			nmx_cs_report_name("cs_p1_bo_handles", ret, false);
+ 			if (ret)
+ 				goto free_partial_kdata;
+ 			break;
+@@ -294,6 +317,7 @@
+ 	for (i = 0; i < p->gang_size; ++i) {
+ 		ret = amdgpu_job_alloc(p->adev, vm, p->entities[i], vm,
+ 				       num_ibs[i], &p->jobs[i]);
++		nmx_cs_report_name("job_alloc", ret, false);
+ 		if (ret)
+ 			goto free_all_kdata;
+ 		p->jobs[i]->enforce_isolation = p->adev->enforce_isolation[fpriv->xcp_id];
+@@ -372,6 +396,7 @@
+ 	r =  amdgpu_ib_get(p->adev, vm, ring->funcs->parse_cs ?
+ 			   chunk_ib->ib_bytes : 0,
+ 			   AMDGPU_IB_POOL_DELAYED, ib);
++	nmx_cs_report_name("ib_get", r, false);
+ 	if (r) {
+ 		DRM_ERROR("Failed to get ib !\n");
+ 		return r;
+@@ -406,6 +431,7 @@
+ 		r = amdgpu_ctx_get_entity(ctx, deps[i].ip_type,
+ 					  deps[i].ip_instance,
+ 					  deps[i].ring, &entity);
++		nmx_cs_report_name("ctx_get_entity#2", r, false);
+ 		if (r) {
+ 			amdgpu_ctx_put(ctx);
+ 			return r;
+@@ -429,6 +455,7 @@
+ 		}
+ 
+ 		r = amdgpu_sync_fence(&p->sync, fence);
++		nmx_cs_report_name("sync_fence", r, false);
+ 		dma_fence_put(fence);
+ 		if (r)
+ 			return r;
+@@ -451,6 +478,7 @@
+ 	}
+ 
+ 	r = amdgpu_sync_fence(&p->sync, fence);
++	nmx_cs_report_name("sync_fence#2", r, false);
+ 	dma_fence_put(fence);
+ 	return r;
+ }
+@@ -609,11 +637,13 @@
+ 		case AMDGPU_CHUNK_ID_DEPENDENCIES:
+ 		case AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES:
+ 			r = amdgpu_cs_p2_dependencies(p, chunk);
++			nmx_cs_report_name("cs_p2_dependencies", r, false);
+ 			if (r)
+ 				return r;
+ 			break;
+ 		case AMDGPU_CHUNK_ID_SYNCOBJ_IN:
+ 			r = amdgpu_cs_p2_syncobj_in(p, chunk);
++			nmx_cs_report_name("cs_p2_syncobj_in", r, false);
+ 			if (r)
+ 				return r;
+ 			break;
+@@ -624,6 +654,7 @@
+ 			break;
+ 		case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT:
+ 			r = amdgpu_cs_p2_syncobj_timeline_wait(p, chunk);
++			nmx_cs_report_name("cs_p2_syncobj_timeline_wait", r, false);
+ 			if (r)
+ 				return r;
+ 			break;
+@@ -821,6 +852,7 @@
+ retry:
+ 	amdgpu_bo_placement_from_domain(bo, domain);
+ 	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++	nmx_cs_report_name("ttm_bo_validate", r, false);
+ 
+ 	p->bytes_moved += ctx.bytes_moved;
+ 	if (!amdgpu_gmc_vram_full_visible(&adev->gmc) &&
+@@ -854,12 +886,14 @@
+ 
+ 		r = amdgpu_bo_list_get(fpriv, cs->in.bo_list_handle,
+ 				       &p->bo_list);
++		nmx_cs_report_name("bo_list_get", r, false);
+ 		if (r)
+ 			return r;
+ 	} else if (!p->bo_list) {
+ 		/* Create a empty bo_list when no handle is provided */
+ 		r = amdgpu_bo_list_create(p->adev, p->filp, NULL, 0,
+ 					  &p->bo_list);
++		nmx_cs_report_name("bo_list_create#2", r, false);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -870,6 +904,11 @@
+ 	 * in amdgpu_gem_userptr_ioctl(), amdgpu_cs_list_validate() will do
+ 	 * amdgpu_ttm_backend_bind() to flush and invalidate new pages
+ 	 */
++#ifdef NMXKPI
++	/* ga403wm Step92: userptr pages are pinned when the BO is made and stay for its life (no HMM, no notifier):
++	 * nothing to fetch or compare here. */
++	if (0)
++#endif
+ 	amdgpu_bo_list_for_each_userptr_entry(e, p->bo_list) {
+ 		bool userpage_invalidated = false;
+ 		struct amdgpu_bo *bo = e->bo;
+@@ -902,6 +941,7 @@
+ 
+ 	drm_exec_until_all_locked(&p->exec) {
+ 		r = amdgpu_vm_lock_pd(&fpriv->vm, &p->exec, 1 + p->gang_size);
++		nmx_cs_report_name("vm_lock_pd", r, false);
+ 		drm_exec_retry_on_contention(&p->exec);
+ 		if (unlikely(r))
+ 			goto out_free_user_pages;
+@@ -910,6 +950,7 @@
+ 			/* One fence for TTM and one for each CS job */
+ 			r = drm_exec_prepare_obj(&p->exec, &e->bo->tbo.base,
+ 						 1 + p->gang_size);
++			nmx_cs_report_name("drm_exec_prepare_obj", r, false);
+ 			drm_exec_retry_on_contention(&p->exec);
+ 			if (unlikely(r))
+ 				goto out_free_user_pages;
+@@ -920,6 +961,7 @@
+ 		if (p->uf_bo) {
+ 			r = drm_exec_prepare_obj(&p->exec, &p->uf_bo->tbo.base,
+ 						 1 + p->gang_size);
++			nmx_cs_report_name("drm_exec_prepare_obj#2", r, false);
+ 			drm_exec_retry_on_contention(&p->exec);
+ 			if (unlikely(r))
+ 				goto out_free_user_pages;
+@@ -930,6 +972,9 @@
+ 		struct mm_struct *usermm;
+ 
+ 		usermm = amdgpu_ttm_tt_get_usermm(e->bo->tbo.ttm);
++#ifdef NMXKPI
++		usermm = NULL;	/* Step92: pinned per process at creation; the CS does not use the mm */
++#endif
+ 		if (usermm && usermm != current->mm) {
+ 			r = -EPERM;
+ 			goto out_free_user_pages;
+@@ -941,6 +986,7 @@
+ 							AMDGPU_GEM_DOMAIN_CPU);
+ 			r = ttm_bo_validate(&e->bo->tbo, &e->bo->placement,
+ 					    &ctx);
++			nmx_cs_report_name("ttm_bo_validate#2", r, false);
+ 			if (r)
+ 				goto out_free_user_pages;
+ 
+@@ -959,6 +1005,7 @@
+ 
+ 	r = amdgpu_vm_validate(p->adev, &fpriv->vm, NULL,
+ 			       amdgpu_cs_bo_validate, p);
++	nmx_cs_report_name("vm_validate", r, false);
+ 	if (r) {
+ 		DRM_ERROR("amdgpu_vm_validate() failed.\n");
+ 		goto out_free_user_pages;
+@@ -966,12 +1013,14 @@
+ 
+ 	drm_exec_for_each_locked_object(&p->exec, index, obj) {
+ 		r = amdgpu_cs_bo_validate(p, gem_to_amdgpu_bo(obj));
++		nmx_cs_report_name("cs_bo_validate", r, false);
+ 		if (unlikely(r))
+ 			goto out_free_user_pages;
+ 	}
+ 
+ 	if (p->uf_bo) {
+ 		r = amdgpu_ttm_alloc_gart(&p->uf_bo->tbo);
++		nmx_cs_report_name("ttm_alloc_gart", r, false);
+ 		if (unlikely(r))
+ 			goto out_free_user_pages;
+ 
+@@ -1206,14 +1255,17 @@
+ 	}
+ 
+ 	r = amdgpu_vm_clear_freed(adev, vm, NULL);
++	nmx_cs_report_name("vm_clear_freed", r, false);
+ 	if (r)
+ 		return r;
+ 
+ 	r = amdgpu_vm_bo_update(adev, fpriv->prt_va, false);
++	nmx_cs_report_name("vm_bo_update", r, false);
+ 	if (r)
+ 		return r;
+ 
+ 	r = amdgpu_sync_fence(&p->sync, fpriv->prt_va->last_pt_update);
++	nmx_cs_report_name("sync_fence#3", r, false);
+ 	if (r)
+ 		return r;
+ 
+@@ -1221,10 +1273,12 @@
+ 		bo_va = fpriv->csa_va;
+ 		BUG_ON(!bo_va);
+ 		r = amdgpu_vm_bo_update(adev, bo_va, false);
++		nmx_cs_report_name("vm_bo_update#2", r, false);
+ 		if (r)
+ 			return r;
+ 
+ 		r = amdgpu_sync_fence(&p->sync, bo_va->last_pt_update);
++		nmx_cs_report_name("sync_fence#4", r, false);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -1240,23 +1294,28 @@
+ 			continue;
+ 
+ 		r = amdgpu_vm_bo_update(adev, bo_va, false);
++		nmx_cs_report_name("vm_bo_update#3", r, false);
+ 		if (r)
+ 			return r;
+ 
+ 		r = amdgpu_sync_fence(&p->sync, bo_va->last_pt_update);
++		nmx_cs_report_name("sync_fence#5", r, false);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+ 	r = amdgpu_vm_handle_moved(adev, vm, &p->exec.ticket);
++	nmx_cs_report_name("vm_handle_moved", r, false);
+ 	if (r)
+ 		return r;
+ 
+ 	r = amdgpu_vm_update_pdes(adev, vm, false);
++	nmx_cs_report_name("vm_update_pdes", r, false);
+ 	if (r)
+ 		return r;
+ 
+ 	r = amdgpu_sync_fence(&p->sync, vm->last_update);
++	nmx_cs_report_name("sync_fence#6", r, false);
+ 	if (r)
+ 		return r;
+ 
+@@ -1296,6 +1355,7 @@
+ 	int r;
+ 
+ 	r = amdgpu_ctx_wait_prev_fence(p->ctx, p->entities[p->gang_leader_idx]);
++	nmx_cs_report_name("ctx_wait_prev_fence", r, false);
+ 	if (r) {
+ 		if (r != -ERESTARTSYS)
+ 			DRM_ERROR("amdgpu_ctx_wait_prev_fence failed.\n");
+@@ -1312,6 +1372,7 @@
+ 			AMDGPU_SYNC_EXPLICIT : AMDGPU_SYNC_NE_OWNER;
+ 		r = amdgpu_sync_resv(p->adev, &p->sync, resv, sync_mode,
+ 				     &fpriv->vm);
++		nmx_cs_report_name("sync_resv", r, false);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -1338,6 +1399,7 @@
+ 		}
+ 
+ 		r = amdgpu_sync_fence(&p->gang_leader->explicit_sync, fence);
++		nmx_cs_report_name("sync_fence#7", r, false);
+ 		dma_fence_put(fence);
+ 		if (r)
+ 			return r;
+@@ -1408,8 +1470,10 @@
+ 	 */
+ 	r = 0;
+ 	amdgpu_bo_list_for_each_userptr_entry(e, p->bo_list) {
++#ifndef NMXKPI	/* Step92: pinned pages cannot be invalidated (no HMM range to check) */
+ 		r |= !amdgpu_ttm_tt_get_user_pages_done(e->bo->tbo.ttm,
+ 							e->range);
++#endif
+ 		e->range = NULL;
+ 	}
+ 	if (r) {
+@@ -1515,14 +1579,17 @@
+ 	}
+ 
+ 	r = amdgpu_cs_pass1(&parser, data);
++	nmx_cs_report_name("cs_pass1", r, false);
+ 	if (r)
+ 		goto error_fini;
+ 
+ 	r = amdgpu_cs_pass2(&parser);
++	nmx_cs_report_name("cs_pass2", r, false);
+ 	if (r)
+ 		goto error_fini;
+ 
+ 	r = amdgpu_cs_parser_bos(&parser, data);
++	nmx_cs_report_name("cs_parser_bos", r, false);
+ 	if (r) {
+ 		if (r == -ENOMEM)
+ 			DRM_ERROR("Not enough memory for command submission!\n");
+@@ -1532,20 +1599,24 @@
+ 	}
+ 
+ 	r = amdgpu_cs_patch_jobs(&parser);
++	nmx_cs_report_name("cs_patch_jobs", r, false);
+ 	if (r)
+ 		goto error_backoff;
+ 
+ 	r = amdgpu_cs_vm_handling(&parser);
++	nmx_cs_report_name("cs_vm_handling", r, false);
+ 	if (r)
+ 		goto error_backoff;
+ 
+ 	r = amdgpu_cs_sync_rings(&parser);
++	nmx_cs_report_name("cs_sync_rings", r, false);
+ 	if (r)
+ 		goto error_backoff;
+ 
+ 	trace_amdgpu_cs_ibs(&parser);
+ 
+ 	r = amdgpu_cs_submit(&parser, data);
++	nmx_cs_report_name("cs_submit", r, false);
+ 	if (r)
+ 		goto error_backoff;
+ 
+@@ -1585,6 +1656,7 @@
+ 
+ 	r = amdgpu_ctx_get_entity(ctx, wait->in.ip_type, wait->in.ip_instance,
+ 				  wait->in.ring, &entity);
++	nmx_cs_report_name("ctx_get_entity#3", r, false);
+ 	if (r) {
+ 		amdgpu_ctx_put(ctx);
+ 		return r;
+@@ -1633,6 +1705,7 @@
+ 
+ 	r = amdgpu_ctx_get_entity(ctx, user->ip_type, user->ip_instance,
+ 				  user->ring, &entity);
++	nmx_cs_report_name("ctx_get_entity#4", r, false);
+ 	if (r) {
+ 		amdgpu_ctx_put(ctx);
+ 		return ERR_PTR(r);
+@@ -1899,6 +1972,7 @@
+ 		for (i = 0; i < (*bo)->placement.num_placement; i++)
+ 			(*bo)->placements[i].flags |= TTM_PL_FLAG_CONTIGUOUS;
+ 		r = ttm_bo_validate(&(*bo)->tbo, &(*bo)->placement, &ctx);
++		nmx_cs_report_name("ttm_bo_validate#3", r, false);
+ 		if (r)
+ 			return r;
+ 	}

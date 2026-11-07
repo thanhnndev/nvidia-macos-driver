@@ -807,6 +807,13 @@ linux_file_ioctl_sub(struct file *fp, struct linux_file *filp,
 			error = ENOTTY;
 		}
 	}
+	if (error == EPERM) {
+		/* ga403wm Step95: every -EPERM from a driver ioctl (the CS crash loops returned only this) */
+		static volatile u_int nmx_eperm_budget;
+
+		if (atomic_fetchadd_int(&nmx_eperm_budget, 1) < 96)
+			printf("NMX cs-trace: ioctl %lx -> -1\n", (unsigned long)cmd);
+	}
 	if (error == 0 && size > 0 && (cmd & IOC_OUT) != 0 && direct) {
 		void *xdata;
 		int error1;

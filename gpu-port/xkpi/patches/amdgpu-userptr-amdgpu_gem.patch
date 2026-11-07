@@ -1,0 +1,120 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-07 15:10:56
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-07 15:12:53
+@@ -408,8 +408,103 @@
+ 
+ 	memset(args, 0, sizeof(*args));
+ 	args->out.handle = handle;
++	return 0;
++}
++
++#ifdef NMXKPI
++void nmx_cs_report_name(const char *what, int r, bool always);	/* amdgpu_cs.c, Step95 */
++
++/*
++ * macOS port (ga403wm Step92): userptr without HMM. This build has no CONFIG_HMM_MIRROR, so amdgpu_hmm_register() is
++ * the -ENODEV stub and every RADV host-pointer import failed (NVMTL then copied every IOSurface with the CPU). There
++ * is no MMU notifier here: the user pages are pinned once when the BO is made (xkpi's get_user_pages wires them on the
++ * task) and held for the BO's lifetime; amdgpu_ttm_tt_unpopulate drops them. What the GPU sees is always the pages the
++ * process had when it imported the range, which is what NVMTL wants (it keeps the IOSurface alive with the texture).
++ */
++static void nmx_userptr_say(const char *what, u64 addr, u64 size, long v)
++{
++	static atomic_t budget;
++
++	if (atomic_inc_return(&budget) <= 24)
++		printf("NMX userptr: %s addr %llx size %llx -> %ld\n", what, (unsigned long long)addr,
++		       (unsigned long long)size, v);
++}
++
++static void nmx_userptr_drop(struct page **pages, u32 n)
++{
++	u32 i;
++
++	for (i = 0; i < n; i++)
++		if (pages[i]) {
++			release_pages(&pages[i], 1);
++			pages[i] = NULL;
++		}
++}
++
++static int nmx_userptr_pin(struct amdgpu_bo *bo, struct drm_amdgpu_gem_userptr *args, struct drm_file *filp,
++			   uint32_t *handle)
++{
++	struct ttm_operation_ctx ctx = { true, false };
++	struct ttm_tt *ttm = bo->tbo.ttm;
++	u32 n = ttm->num_pages;
++	long got;
++	int r;
++
++	/* pinned even without AMDGPU_GEM_USERPTR_VALIDATE: nothing else fills the page array in this model */
++	got = get_user_pages(args->addr, n, (args->flags & AMDGPU_GEM_USERPTR_READONLY) ? 0 : FOLL_WRITE, ttm->pages);
++	if (got != (long)n) {
++		if (got > 0)
++			nmx_userptr_drop(ttm->pages, (u32)got);
++		nmx_userptr_say("pin FAILED", args->addr, args->size, got);
++		return got < 0 ? (int)got : -EFAULT;
++	}
++	if (args->flags & AMDGPU_GEM_USERPTR_VALIDATE) {
++		r = amdgpu_bo_reserve(bo, true);
++		if (r) {
++			nmx_userptr_drop(ttm->pages, n);
++			nmx_userptr_say("reserve FAILED", args->addr, args->size, r);
++			return r;
++		}
++		amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
++		r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++		amdgpu_bo_unreserve(bo);
++		if (r) {
++			/* not bound; unpopulate skips the NULL entries if the TT was populated */
++			nmx_userptr_drop(ttm->pages, n);
++			nmx_userptr_say("validate FAILED", args->addr, args->size, r);
++			return r;
++		}
++	}
++	r = drm_gem_handle_create(filp, &bo->tbo.base, handle);
++	if (r) {
++		/* the pages stay with the BO; the caller's put destroys it and unpopulate drops them */
++		nmx_userptr_say("handle FAILED", args->addr, args->size, r);
++		return r;
++	}
++	nmx_userptr_say("pinned", args->addr, args->size, (long)n);
+ 	return 0;
++}
++
++/*
++ * Step96: a writable pin of a read-only mapping fails with -EFAULT (WindowServer maps client CoreAnimation surfaces
++ * r--/r--, and libdrm always asks for a writable userptr). Retry once read-only and mark the TT read-only, so the GPU
++ * maps the pages without WRITEABLE (upstream AMDGPU_GEM_USERPTR_READONLY): a GPU write then faults instead of landing
++ * in someone else's pages.
++ */
++static int nmx_userptr_tail(struct amdgpu_bo *bo, struct drm_amdgpu_gem_userptr *args, struct drm_file *filp,
++			    uint32_t *handle)
++{
++	int r = nmx_userptr_pin(bo, args, filp, handle);
++
++	if (r != -EFAULT || (args->flags & AMDGPU_GEM_USERPTR_READONLY) || !bo->tbo.ttm)
++		return r;
++	args->flags |= AMDGPU_GEM_USERPTR_READONLY;
++	ttm_to_amdgpu_ttm_tt(bo->tbo.ttm)->userflags |= AMDGPU_GEM_USERPTR_READONLY;
++	r = nmx_userptr_pin(bo, args, filp, handle);
++	nmx_cs_report_name("userptr_ro_retry", r, true);	/* "-> 0" when the read-only pin worked */
++	return r;
+ }
++#endif
+ 
+ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
+ 			     struct drm_file *filp)
+@@ -457,6 +552,13 @@
+ 	if (r)
+ 		goto release_object;
+ 
++#ifdef NMXKPI
++	r = nmx_userptr_tail(bo, args, filp, &handle);
++	nmx_cs_report_name("userptr_tail", r, false);
++	if (!r)
++		args->handle = handle;
++	goto release_object;
++#endif
+ 	r = amdgpu_hmm_register(bo, args->addr);
+ 	if (r)
+ 		goto release_object;

@@ -20,3 +20,7 @@ amdgpu-ibprep-optin.patch
 ttm-pool-order0.patch
 amdgpu-ibprobe.patch
 amdgpu-dm-ips-trace.patch
+amdgpu-userptr-amdgpu_gem.patch
+amdgpu-userptr-amdgpu_ttm.patch
+amdgpu-userptr-amdgpu_bo_list.patch
+amdgpu-userptr-cstrace-cs.patch
