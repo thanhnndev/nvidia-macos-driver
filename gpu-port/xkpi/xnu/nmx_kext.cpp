@@ -466,6 +466,13 @@ void NMXGPU::attachThread(void *arg, wait_result_t)
  */
 void NMXGPU::holdArm()
 {
+    int v = 1;
+    /* ga403wm Step128: boot-arg nmxhold=0 skips the hold (bisects the ~12 s boot hang without a rebuild) */
+    if (PE_parse_boot_argn("nmxhold", &v, sizeof(v)) && v == 0) {
+        setProperty("nmxgpu-boot-hold", "off (nmxhold=0)");
+        nmx_xnu_stage("hold off");
+        return;
+    }
     holdT0_ = mach_absolute_time();
     hold_ = 1;
     adjustBusy(1);
