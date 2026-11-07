@@ -472,6 +472,18 @@ vm_fault_t nmx_umap_insert(struct vm_area_struct *vma, unsigned long addr, unsig
         return VM_FAULT_SIGBUS;
     size_t idx = (addr - vma->vm_start) >> PAGE_SHIFT;
     int cache = (int)pgprot2cachemode(prot);
+    /*
+     * This GPU is integrated: it reads system memory without snooping the CPU caches, and a write-combining user
+     * mapping leaves the CPU's stores in this core's WC buffers until something drains them. A descriptor buffer
+     * written on one thread was then read as zeros by the GPU on the submit thread (page fault at VA 0 from client
+     * TCP, the shader's first descriptor load). Map BOs uncached by default; debug.nmx_umap_cache overrides:
+     * 0 = the driver's own attribute, 1 = uncached, 2 = write-combined.
+     */
+    extern int nmx_umap_cache;
+    if (nmx_umap_cache == 1)
+        cache = NMX_CACHE_UC;
+    else if (nmx_umap_cache == 2)
+        cache = NMX_CACHE_WC;
     if (!u->have_cache) {
         u->cache = cache;
         u->have_cache = 1;
@@ -600,6 +612,19 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
 
     if (err == 0) {
         int writable = (vma->vm_flags & VM_WRITE) != 0;
+        /*
+         * The pages were zeroed through the kernel's write-back view, so they can still carry dirty lines when userland
+         * gets its uncached mapping. Those lines are written back later, on top of what userland stored, and the GPU
+         * (which does not snoop the CPU caches) then reads zeros. Drop them before the mapping is used;
+         * debug.nmx_umap_flush picks it.
+         */
+        {
+            extern int nmx_umap_flush_on_map;
+            extern void pmap_invalidate_cache(void);
+
+            if (nmx_umap_flush_on_map)
+                pmap_invalidate_cache();
+        }
         err = nmx_xnu_map_user(u->pages, u->npages, u->cache, writable, fixed, &u->uaddr, &u->xmap);
     }
     if (err) {
