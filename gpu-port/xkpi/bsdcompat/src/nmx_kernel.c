@@ -162,14 +162,16 @@ static unsigned bucket_of(const void *p, unsigned n)
  */
 extern int nmx_weak_proc_starttime(void *p, struct timeval *tv) __asm("_proc_starttime") __attribute__((weak_import));
 extern const void *const gOSKextUnresolved;
+/* kmutil binds weak symbols only through data pointers (a weak reference in __text is "Unexpected bind type: 3") */
+static int (*volatile nmx_proc_starttime_fn)(void *, struct timeval *) = nmx_weak_proc_starttime;
 
 static uint64_t nmx_proc_start(void *xnu)
 {
     struct timeval tv = { 0, 0 };
-    if ((const void *)&nmx_weak_proc_starttime == NULL ||
-        (const void *)&nmx_weak_proc_starttime == gOSKextUnresolved)
+    int (*fn)(void *, struct timeval *) = nmx_proc_starttime_fn;
+    if (fn == NULL || (const void *)fn == gOSKextUnresolved)
         return 0;
-    nmx_weak_proc_starttime(xnu, &tv);
+    fn(xnu, &tv);
     return (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
 }
 
