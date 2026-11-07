@@ -293,11 +293,16 @@ static IOOptionBits cache_option(int cache)
  * the task and removes the range itself before releasing the map.
  */
 struct UserMap {
-    IOMemoryMap *map;
+    void *map;              /* nmx_xnu_map_ranges handle */
     task_t task;            /* fixed mappings only: the task whose range is removed at unmap */
     uint64_t addr;
     uint64_t size;
 };
+
+/* nmx_vm.cpp: physical page list -> mapping, one single-range mapping per range for WC/UC (ga403wm Step90) */
+extern "C" void *nmx_xnu_map_ranges(task_t task, const uint64_t *pages, size_t npages, IOOptionBits opts, uint64_t fixed,
+                                    uint64_t *addr);
+extern "C" void nmx_xnu_map_release(void *handle);
 
 extern "C" int nmx_xnu_map_user(const uint64_t *pages, size_t npages, int cache, int writable, uint64_t fixed,
                                 uint64_t *uaddr, void **handle)
@@ -306,38 +311,18 @@ extern "C" int nmx_xnu_map_user(const uint64_t *pages, size_t npages, int cache,
     *uaddr = 0;
     if (npages == 0 || (fixed & PAGE_MASK) != 0)
         return EINVAL;
-    IOAddressRange *ranges = (IOAddressRange *)IOMalloc(sizeof(IOAddressRange) * npages);
-    if (ranges == nullptr)
-        return ENOMEM;
-    size_t n = 0;
-    for (size_t i = 0; i < npages; i++) {
-        if (n > 0 && ranges[n - 1].address + ranges[n - 1].length == pages[i]) {
-            ranges[n - 1].length += PAGE_SIZE;
-        } else {
-            ranges[n].address = pages[i];
-            ranges[n].length = PAGE_SIZE;
-            n++;
-        }
-    }
-    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRanges(ranges, (UInt32)n,
-                                 kIODirectionInOut | kIOMemoryTypePhysical64, nullptr);
-    IOFree(ranges, sizeof(IOAddressRange) * npages);
-    if (md == nullptr)
-        return ENOMEM;
     UserMap *um = IONew(UserMap, 1);
-    if (um == nullptr) {
-        md->release();
+    if (um == nullptr)
         return ENOMEM;
-    }
-    IOOptionBits opts = cache_option(cache) | (writable ? 0 : kIOMapReadOnly) | (fixed ? kIOMapOverwrite : kIOMapAnywhere);
-    IOMemoryMap *map = md->createMappingInTask(current_task(), fixed, opts);
-    md->release();
+    IOOptionBits opts = cache_option(cache) | (writable ? 0 : kIOMapReadOnly);
+    uint64_t addr = 0;
+    void *map = nmx_xnu_map_ranges(current_task(), pages, npages, opts, fixed, &addr);
     if (map == nullptr) {
         IODelete(um, UserMap, 1);
         return fixed ? EINVAL : ENOMEM;
     }
     um->map = map;
-    um->addr = map->getAddress();
+    um->addr = addr;
     um->size = (uint64_t)npages * PAGE_SIZE;
     um->task = nullptr;
     if (fixed) {
@@ -359,6 +344,6 @@ extern "C" void nmx_xnu_unmap_user(void *handle)
         vm_deallocate(get_task_map(um->task), (vm_offset_t)um->addr, (vm_size_t)um->size);
         task_deallocate(um->task);
     }
-    um->map->release();
+    nmx_xnu_map_release(um->map);
     IODelete(um, UserMap, 1);
 }

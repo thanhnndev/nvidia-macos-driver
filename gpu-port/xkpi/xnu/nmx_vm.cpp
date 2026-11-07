@@ -87,11 +87,66 @@ extern "C" void *nmx_xnu_map_phys(uint64_t pa, size_t size, int cache, void **ha
     return (void *)(uintptr_t)(map->getVirtualAddress() + (pa - base));
 }
 
-extern "C" void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cache, void **handle)
+/*
+ * ga403wm Step90: map write-combined / uncached memory one physically contiguous range at a time.
+ *
+ * A multi-range kIOMemoryTypePhysical64 descriptor is backed by a non-contiguous device pager, and xnu enters each of
+ * its pages as a private vm_page: vm_page_insert_internal calls pmap_set_cache_attributes() on the PHYSICAL page with
+ * the object's mode (rewriting the cache bits of every existing PTE of that page) and vm_page_remove() resets the page
+ * to write-back when any such object dies. So the last mapping made or torn down decided the cache mode of every
+ * mapping of the page: a vunmap or another process's munmap turned a live WC mapping write-back, and with no self-snoop
+ * the GPU read stale memory (RADV descriptors read as 0). TTM order 0 (Step89) makes every multi-page BO multi-range.
+ *
+ * A single-range descriptor gets a contiguous device pager: no vm_page, no physical attribute change, and the fault
+ * path block-maps it with the WC/UC mode in the PTE. So a WC/UC page list with more than one range is mapped as a
+ * reservation of the whole size, then one single-range descriptor per range mapped over it with kIOMapOverwrite.
+ * Cached page lists and single ranges keep one mapping. The reservation never inserts a vm_page of the buffer:
+ *  - user task: a read-only map of one NMXGPU text page repeated (faulted lazily, never touched in practice);
+ *  - kernel: IOKit prefaults kernel maps, and a repeated page would grow that page's pv list by one per page, so it
+ *    is ONE contiguous read-only uncached range of the size starting at the first range (no vm_page either), and it
+ *    is replaced by the overwrite maps before anything can use it.
+ * A fixed user mapping has no reservation: the ranges go straight over the caller's range.
+ * Releasing the reservation first deallocates the whole range (overwrite maps never deallocate), then the subs go.
+ * The handle of a split mapping is (struct NmxSplitMap *) | 1.
+ */
+struct NmxSplitMap {
+    size_t count;
+    IOMemoryMap *reservation;
+    IOMemoryMap *subs[];
+};
+
+static IOMemoryDescriptor *phys_ranges(IOAddressRange *ranges, size_t n)
 {
-    *handle = nullptr;
-    if (npages == 0)
-        return nullptr;
+    return IOMemoryDescriptor::withAddressRanges(ranges, (UInt32)n, kIODirectionInOut | kIOMemoryTypePhysical64, nullptr);
+}
+
+extern "C" void nmx_xnu_map_release(void *handle)
+{
+    if (handle == nullptr)
+        return;
+    if (((uintptr_t)handle & 1) == 0) {
+        ((IOMemoryMap *)handle)->release();
+        return;
+    }
+    NmxSplitMap *sm = (NmxSplitMap *)((uintptr_t)handle & ~(uintptr_t)1);
+    if (sm->reservation)
+        sm->reservation->release();
+    for (size_t i = 0; i < sm->count; i++)
+        if (sm->subs[i])
+            sm->subs[i]->release();
+    IOFree(sm, sizeof(NmxSplitMap) + sm->count * sizeof(IOMemoryMap *));
+}
+
+extern "C" {
+vm_map_t get_task_map(task_t task);
+kern_return_t vm_deallocate(vm_map_t target, vm_offset_t address, vm_size_t size);
+}
+
+/* opts = cache bits | kIOMapReadOnly. Returns the unmap handle (nullptr on failure) and the address in *addr. */
+extern "C" void *nmx_xnu_map_ranges(task_t task, const uint64_t *pages, size_t npages, IOOptionBits opts, uint64_t fixed,
+                                    uint64_t *addr)
+{
+    *addr = 0;
     IOAddressRange *ranges = (IOAddressRange *)IOMalloc(sizeof(IOAddressRange) * npages);
     if (ranges == nullptr)
         return nullptr;
@@ -106,22 +161,95 @@ extern "C" void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cac
             n++;
         }
     }
-    IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRanges(ranges, (UInt32)n,
-                                 kIODirectionInOut | kIOMemoryTypePhysical64, nullptr);
+    void *handle = nullptr;
+    if (n == 1 || (opts & kIOMapCacheMask) == kIOMapDefaultCache) {
+        IOMemoryDescriptor *md = phys_ranges(ranges, n);
+        IOFree(ranges, sizeof(IOAddressRange) * npages);
+        if (md == nullptr)
+            return nullptr;
+        IOMemoryMap *map = md->createMappingInTask(task, fixed, opts | (fixed ? kIOMapOverwrite : kIOMapAnywhere));
+        md->release();
+        if (map == nullptr)
+            return nullptr;
+        *addr = map->getAddress();
+        return map;
+    }
+    size_t smsize = sizeof(NmxSplitMap) + n * sizeof(IOMemoryMap *);
+    NmxSplitMap *sm = (NmxSplitMap *)IOMalloc(smsize);
+    if (sm == nullptr) {
+        IOFree(ranges, sizeof(IOAddressRange) * npages);
+        return nullptr;
+    }
+    bzero(sm, smsize);
+    sm->count = n;
+    handle = (void *)((uintptr_t)sm | 1);
+    uint64_t base = fixed;
+    if (!fixed) {
+        IOMemoryDescriptor *rmd;
+        IOOptionBits ropts = kIOMapAnywhere | kIOMapReadOnly;
+        if (task == kernel_task) {
+            IOAddressRange whole = { ranges[0].address, (mach_vm_size_t)npages * PAGE_SIZE };
+            rmd = phys_ranges(&whole, 1);
+            ropts |= kIOMapInhibitCache;
+        } else {
+            uint64_t anchor = nmx_xnu_kva_to_phys((const void *)&nmx_xnu_map_ranges) & ~(uint64_t)PAGE_MASK;
+            IOAddressRange *rr = anchor ? (IOAddressRange *)IOMalloc(sizeof(IOAddressRange) * npages) : nullptr;
+            rmd = nullptr;
+            if (rr != nullptr) {
+                for (size_t i = 0; i < npages; i++) {
+                    rr[i].address = anchor;
+                    rr[i].length = PAGE_SIZE;
+                }
+                rmd = phys_ranges(rr, npages);
+                IOFree(rr, sizeof(IOAddressRange) * npages);
+            }
+        }
+        if (rmd != nullptr) {
+            sm->reservation = rmd->createMappingInTask(task, 0, ropts);
+            rmd->release();
+        }
+        if (sm->reservation == nullptr)
+            goto fail;
+        base = sm->reservation->getAddress();
+    }
+    {
+        uint64_t off = 0;
+        for (size_t i = 0; i < n; i++) {
+            IOMemoryDescriptor *md = phys_ranges(&ranges[i], 1);
+            if (md == nullptr)
+                goto fail;
+            sm->subs[i] = md->createMappingInTask(task, base + off, opts | kIOMapOverwrite);
+            md->release();
+            if (sm->subs[i] == nullptr)
+                goto fail;
+            off += ranges[i].length;
+        }
+    }
     IOFree(ranges, sizeof(IOAddressRange) * npages);
-    if (md == nullptr)
+    *addr = base;
+    return handle;
+fail:
+    if (fixed)  /* drop what was already entered over the caller's range */
+        vm_deallocate(get_task_map(task), (vm_offset_t)fixed, (vm_size_t)npages * PAGE_SIZE);
+    nmx_xnu_map_release(handle);
+    IOFree(ranges, sizeof(IOAddressRange) * npages);
+    return nullptr;
+}
+
+extern "C" void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cache, void **handle)
+{
+    *handle = nullptr;
+    if (npages == 0)
         return nullptr;
-    IOMemoryMap *map = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | cache_option(cache));
-    md->release();
-    if (map == nullptr)
+    uint64_t addr;
+    void *h = nmx_xnu_map_ranges(kernel_task, pages, npages, cache_option(cache), 0, &addr);
+    if (h == nullptr)
         return nullptr;
-    *handle = map;
-    return (void *)(uintptr_t)map->getVirtualAddress();
+    *handle = h;
+    return (void *)(uintptr_t)addr;
 }
 
 extern "C" void nmx_xnu_unmap(void *handle)
 {
-    IOMemoryMap *map = (IOMemoryMap *)handle;
-    if (map)
-        map->release();
+    nmx_xnu_map_release(handle);
 }

@@ -1,0 +1,133 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-11-07 15:05:40
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-11-07 15:07:17
+@@ -43,6 +43,121 @@
+ 		printf("NullMoth ipdump: %s\n", line);
+ }
+ 
++/*
++ * ga403wm Step86/89 ibprobe: on a GFX ring timeout, read the hung IB1 (CP_IB1_BASE) twice - through the BO's kernel
++ * vmap (view A, what the GPU sees in memory) and through each TT page's write-back kernel alias (view B, what the CPU
++ * cache holds) - parse both as PM4, count the dwords where they differ and print the dwords around the parse stops and
++ * around the CP's fetch position. It only reads: no flush, no kmap, no lock but the pasid xarray lock.
++ */
++struct nmx_ibprobe {
++	u32 *vmap;		/* view A, NULL if the BO has no kernel map */
++	struct page **pages;	/* view B, NULL unless the BO is in TT */
++	u64 off;		/* byte offset of the IB in the BO */
++	u32 limit;		/* dwords readable in both views */
++};
++
++static u32 nmx_ibprobe_a(const struct nmx_ibprobe *pr, u32 i)
++{
++	return pr->vmap && i < pr->limit ? pr->vmap[i] : 0xdeadbeef;
++}
++
++static u32 nmx_ibprobe_b(const struct nmx_ibprobe *pr, u32 i)
++{
++	u64 at = pr->off + (u64)i * 4;
++	char *va;
++
++	if (!pr->pages || i >= pr->limit || !pr->pages[at >> PAGE_SHIFT])
++		return 0xdeadbeef;
++	va = page_address(pr->pages[at >> PAGE_SHIFT]);
++	return va ? *(u32 *)(va + (at & (PAGE_SIZE - 1))) : 0xdeadbeef;
++}
++
++/* index where PM4 parsing stopped; *hdr = the header there (0 if it ran to the limit) */
++static u32 nmx_ibprobe_parse(const struct nmx_ibprobe *pr, u32 (*rd)(const struct nmx_ibprobe *, u32), u32 *hdr)
++{
++	u32 i = 0;
++
++	while (i < pr->limit) {
++		u32 h = rd(pr, i);
++
++		if (h == 0xffff1000 || (h >> 30) == 2) {	/* NOP filler, type-2 */
++			i++;
++		} else if ((h >> 30) == 3) {
++			i += ((h >> 16) & 0x3fff) + 2;
++		} else {
++			*hdr = h;
++			return i;
++		}
++	}
++	*hdr = 0;
++	return i;
++}
++
++static void nmx_ibprobe_dump(const struct nmx_ibprobe *pr, u32 at)
++{
++	u32 start = at >= 8 ? at - 8 : 0, k;
++
++	for (k = 0; k < 16; k += 4)
++		printf("NullMoth ibprobe A[%05x]: %08x %08x %08x %08x\n", start + k, nmx_ibprobe_a(pr, start + k),
++		       nmx_ibprobe_a(pr, start + k + 1), nmx_ibprobe_a(pr, start + k + 2), nmx_ibprobe_a(pr, start + k + 3));
++	for (k = 0; k < 16; k += 4)
++		printf("NullMoth ibprobe B[%05x]: %08x %08x %08x %08x\n", start + k, nmx_ibprobe_b(pr, start + k),
++		       nmx_ibprobe_b(pr, start + k + 1), nmx_ibprobe_b(pr, start + k + 2), nmx_ibprobe_b(pr, start + k + 3));
++}
++
++static void nmx_ibprobe(struct amdgpu_device *adev, struct amdgpu_job *job, u32 ib_lo, u32 ib_hi, u32 left)
++{
++	u64 va = (((u64)ib_hi << 32) | ib_lo) & 0xffffffffffffULL;
++	u32 cmd = RREG32_SOC15(GC, 0, regCP_IB1_CMD_BUFSZ);
++	struct nmx_ibprobe pr = { 0 };
++	struct amdgpu_bo_va_mapping *m = NULL;
++	struct amdgpu_bo *bo = NULL;
++	struct amdgpu_vm *vm;
++	unsigned long flags;
++	long long mem_type = -1;
++	u32 a_at, a_hdr, b_at, b_hdr, ndiff = 0, first = ~0u, i;
++
++	xa_lock_irqsave(&adev->vm_manager.pasids, flags);
++	vm = xa_load(&adev->vm_manager.pasids, job->pasid);
++	xa_unlock_irqrestore(&adev->vm_manager.pasids, flags);
++	if (vm)
++		m = amdgpu_vm_bo_lookup_mapping(vm, va >> PAGE_SHIFT);
++	if (m && m->bo_va && m->bo_va->base.bo) {
++		bo = m->bo_va->base.bo;
++		pr.off = m->offset + va - (m->start << PAGE_SHIFT);
++		if (amdgpu_bo_size(bo) > pr.off) {
++			u64 in_map = ((m->last + 1) << PAGE_SHIFT) - va, in_bo = amdgpu_bo_size(bo) - pr.off;
++
++			pr.limit = min3(in_map, in_bo, (u64)cmd * 4) / 4;
++			if (bo->tbo.resource)
++				mem_type = bo->tbo.resource->mem_type;
++			if (bo->kmap.virtual)
++				pr.vmap = (u32 *)((char *)bo->kmap.virtual + pr.off);
++			if (mem_type == TTM_PL_TT && bo->tbo.ttm)
++				pr.pages = bo->tbo.ttm->pages;
++		}
++	}
++	printf("NullMoth ibprobe: va=%llx cmd_bufsz=%x left=%x pasid=%x vm=%p\n",
++	       (unsigned long long)va, cmd, left, job->pasid, vm);
++	printf("NullMoth ibprobe: mapping=%p bo=%p mem_type=%lld off=%llx limit=%x\n",
++	       m, bo, mem_type, (unsigned long long)pr.off, pr.limit);
++	printf("NullMoth ibprobe: vmapA=%p pagesB=%p\n", pr.vmap, pr.pages);
++	if (!pr.limit)
++		return;
++	a_at = nmx_ibprobe_parse(&pr, nmx_ibprobe_a, &a_hdr);
++	b_at = nmx_ibprobe_parse(&pr, nmx_ibprobe_b, &b_hdr);
++	for (i = 0; i < pr.limit; i++)
++		if (nmx_ibprobe_a(&pr, i) != nmx_ibprobe_b(&pr, i) && ndiff++ == 0)
++			first = i;
++	printf("NullMoth ibprobe: pm4 A stops at %x (hdr %08x), B stops at %x (hdr %08x); A!=B in %x dwords\n",
++	       a_at, a_hdr, b_at, b_hdr, ndiff);
++	printf("NullMoth ibprobe: first A!=B at %x\n", first);
++	nmx_ibprobe_dump(&pr, a_at);
++	if (first != ~0u)
++		nmx_ibprobe_dump(&pr, first);
++	nmx_ibprobe_dump(&pr, cmd - left);	/* around the CP fetch position */
++}
++
+ void amdgpu_coredump(struct amdgpu_device *adev, bool skip_vram_check,
+ 		     bool vram_lost, struct amdgpu_job *job)
+ {
+@@ -94,6 +209,8 @@
+ 				    rp, RREG32_SOC15(GC, 0, regCP_RB0_BASE), RREG32_SOC15(GC, 0, regCP_RB0_BASE_HI),
+ 				    RREG32_SOC15(GC, 0, regCP_RB0_CNTL), ib_hi, ib_lo, RREG32_SOC15(GC, 0, regCP_IB1_BUFSZ),
+ 				    (unsigned long long)ring->gpu_addr);
++				if (job)
++					nmx_ibprobe(adev, job, ib_lo, ib_hi, RREG32_SOC15(GC, 0, regCP_IB1_BUFSZ));
+ 				if (job && job->num_ibs && job->ibs[0].ptr) {
+ 					struct amdgpu_ib *ib = &job->ibs[0];
+ 					u32 q, nd = ib->length_dw < 96 ? ib->length_dw : 96;
