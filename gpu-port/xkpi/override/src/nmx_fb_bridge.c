@@ -1,11 +1,12 @@
 /*
  * The display bridge, DRM side: lights the GPU's outputs with one scan-out buffer that macOS draws into.
  *
- * It is an in-kernel DRM client, the same mechanism Linux's fbdev emulation uses: probe the connectors, pick each
- * output's preferred mode, create one XRGB8888 buffer as large as the largest mode, point every lit CRTC at it and
- * commit. The buffer's CPU view is the GPU aperture (a CPU-visible, contiguous VRAM buffer read through the BAR), so
- * the kext publishes its physical range as the IOFramebuffer's VRAM and WindowServer draws straight into what the
- * display engine scans out. Smaller outputs show the top-left of the buffer (mirrored), as fbdev does.
+ * It is an in-kernel DRM client, the same mechanism Linux's fbdev emulation uses: probe the connectors, take the
+ * internal panel's preferred mode, create an XRGB8888 buffer that size, point the panel's CRTC at it and commit.
+ * External outputs are left off: the console bridge drives the panel, and a monitor attached at boot must not be able
+ * to change the panel's mode (see bridge_restrict_to_panel). The buffer's CPU view is the GPU aperture (a CPU-visible,
+ * contiguous VRAM buffer read through the BAR), so the kext publishes its physical range as the IOFramebuffer's VRAM
+ * and WindowServer draws straight into what the display engine scans out.
  *
  * Any step that fails leaves no client behind and reports why; the kext then publishes no framebuffer.
  */
@@ -72,7 +73,57 @@ static struct drm_device *drm_of(device_t dev)
     return drm;
 }
 
-/* a monitor plugged or unplugged: probe again and light what is there now with the same buffer */
+/* the connector behind a mode set, or NULL when the set has none */
+static struct drm_connector *modeset_connector(const struct drm_mode_set *ms)
+{
+    return (ms->num_connectors > 0 && ms->connectors != NULL) ? ms->connectors[0] : NULL;
+}
+
+static int connector_is_panel(const struct drm_connector *conn)
+{
+    if (conn == NULL)
+        return 0;
+    return conn->connector_type == DRM_MODE_CONNECTOR_eDP || conn->connector_type == DRM_MODE_CONNECTOR_LVDS;
+}
+
+/*
+ * The console bridge lights the panel only.
+ *
+ * It used to point every lit CRTC at one buffer as large as the largest connected mode, which is what fbdev does.
+ * That works while the panel is alone; with an HDMI monitor plugged in at boot the panel's CRTC was programmed for
+ * the monitor's mode (or a second CRTC on the same buffer failed the commit) and the machine never reached the
+ * desktop. An external output is now left disabled (mode = NULL makes the atomic commit turn that CRTC off) so a
+ * boot with a monitor attached behaves exactly like one without, and the panel always gets its own mode.
+ *
+ * Caller holds client->modeset_mutex. Returns the panel's mode set with a mode, or NULL when no panel is connected.
+ */
+static struct drm_mode_set *bridge_restrict_to_panel(struct drm_client_dev *client)
+{
+    struct drm_mode_set *ms, *panel = NULL;
+    int have_panel = 0;
+
+    drm_client_for_each_modeset(ms, client)
+        if (ms->mode != NULL && connector_is_panel(modeset_connector(ms)))
+            have_panel = 1;
+
+    drm_client_for_each_modeset(ms, client) {
+        if (ms->mode == NULL)
+            continue;
+        if (have_panel && !connector_is_panel(modeset_connector(ms))) {
+            struct drm_connector *conn = modeset_connector(ms);
+            printf("NullMoth display: leaving external output %s off (the panel owns the console bridge)\n",
+                   conn != NULL && conn->name[0] != '\0' ? conn->name : "?");
+            ms->mode = NULL;
+            continue;
+        }
+        if (panel == NULL || (u64)ms->mode->hdisplay * ms->mode->vdisplay >
+                             (u64)panel->mode->hdisplay * panel->mode->vdisplay)
+            panel = ms;
+    }
+    return panel;
+}
+
+/* a monitor plugged or unplugged: probe again and put the panel back on the same buffer */
 static int bridge_hotplug(struct drm_client_dev *client)
 {
     struct nmx_fb *fb = container_of(client, struct nmx_fb, client);
@@ -82,6 +133,7 @@ static int bridge_hotplug(struct drm_client_dev *client)
     if (drm_client_modeset_probe(client, fb->info.width, fb->info.height) != 0)
         return 0;
     mutex_lock(&client->modeset_mutex);
+    bridge_restrict_to_panel(client);
     drm_client_for_each_modeset(ms, client)
         if (ms->mode != NULL)
             ms->fb = fb->buffer->fb;
@@ -161,12 +213,11 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
         printf("NullMoth display: probing the outputs failed (%d)\n", err);
         goto fail;
     }
-    /* the buffer is as large as the largest mode any connected output asked for */
+    /* the panel's mode; external outputs are disabled before the commit (see bridge_restrict_to_panel) */
     mutex_lock(&fb->client.modeset_mutex);
-    drm_client_for_each_modeset(ms, &fb->client)
-        if (ms->mode != NULL && (best == NULL ||
-            (u64)ms->mode->hdisplay * ms->mode->vdisplay > (u64)best->hdisplay * best->vdisplay))
-            { best = ms->mode; best_ms = ms; }
+    best_ms = bridge_restrict_to_panel(&fb->client);
+    if (best_ms != NULL)
+        best = best_ms->mode;
     if (best != NULL) {
         out->width = best->hdisplay;
         out->height = best->vdisplay;
