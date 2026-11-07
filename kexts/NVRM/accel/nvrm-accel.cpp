@@ -581,6 +581,32 @@ public:
         ALOG("  debug.nvaccelfb now reads 1 -- armed-only Metal clients may have a device THIS BOOT ONLY "
              "(heads published 0x%x, registered 0x%x, piped 0x%x)", gNvHeadsPublished, gNvHeadsRegistered, gNvHeadsPiped);
     }
+    // true when every reconstructed family class has the size IOAcceleratorFamily2 registered for it (OSMetaClass)
+    bool familyLayoutMatches() {
+        UInt32 gate = 1;
+        PE_parse_boot_argn("nmxaccel_gate", &gate, sizeof gate);
+        if (gate == 0) { ALOG("family layout gate skipped (nmxaccel_gate=0)"); return true; }
+        if (gate == 2) { ALOG("family layout gate forced off (nmxaccel_gate=2)"); return false; }
+        static const struct { const char *name; size_t size; } kWant[] = {
+            { "IOGraphicsAccelerator2", kIOGraphicsAccelerator2Size },
+            { "IOAccelDisplayMachine", kIOAccelDisplayMachineSize },
+            { "IOAccelLegacyDisplayMachine", kIOAccelLegacyDisplayMachineSize },
+            { "IOAccelEventMachineFast2", kIOAccelEventMachineFast2Size },
+            { "IOAccelTask", kIOAccelTaskSize },
+        };
+        bool ok = true;
+        for (auto &w : kWant) {
+            const OSSymbol *sym = OSSymbol::withCString(w.name);
+            const OSMetaClass *mc = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
+            unsigned have = mc ? mc->getClassSize() : 0;
+            if (sym) sym->release();
+            bool m = have == w.size;
+            ok = ok && m;
+            ALOG("family layout: %s size %u, headers %u%s", w.name, have, unsigned(w.size), m ? "" : "  <-- MISMATCH");
+        }
+        setProperty("NMXFamilyLayoutOK", ok ? kOSBooleanTrue : kOSBooleanFalse);
+        return ok;
+    }
     void registerFramebuffer(int how) {
         if (fRegLock) IOLockLock(fRegLock);
         registerFramebufferLocked(how);
@@ -793,14 +819,18 @@ public:
             OSDictionary *fbm = nullptr;
             auto root = IORegistryEntry::getRegistryRoot();
             auto build = root ? OSDynamicCast(OSString, root->getProperty("IOKitBuildVersion")) : nullptr;
-            // This path uses reviewed private family offsets; no automatic OS migration.
+            // This path uses private IOAcceleratorFamily2 layouts (the reconstructed iofam/re headers). It used to
+            // run only on the exact 25G241 kernel string, so every macOS point update (25G332: same family 487.4.4)
+            // lost the display pipe. Gate on the family itself instead: each reconstructed class must have the size
+            // the family registered for it at run time. Boot-arg nmxaccel_gate=0 skips the check, =2 forces it off.
             const bool displayEnabled = getProperty("NMXDisplayPipeEnabled") != kOSBooleanFalse;
-            if (displayEnabled && fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && build &&
-                build->isEqualTo("Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64")) {
+            const bool layoutOk = familyLayoutMatches();
+            if (displayEnabled && fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && layoutOk) {
                 fNmxArmCall = thread_call_allocate(&NVAccel::nmxArm, this);
                 if (fNmxArmCall) fbm = serviceMatching("NMXAMDFB");
             }
-            ALOG("AMD display adapter: native framebuffer watch %s", fbm ? "enabled" : "not on reviewed kernel profile");
+            ALOG("AMD display adapter: native framebuffer watch %s (kernel %s)", fbm ? "enabled" : "OFF: IOAcceleratorFamily2 layout differs from the reconstructed headers",
+                 build ? build->getCStringNoCopy() : "?");
 #else
             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
 #endif
