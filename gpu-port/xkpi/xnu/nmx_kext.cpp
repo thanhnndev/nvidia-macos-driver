@@ -34,24 +34,38 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev);
 void nmx_fb_unpublish(IOService *fb, IOService *gpu, void *dev);
 
 /* ---- M2 job trace ------------------------------------------------------------------------------------------------
- * No kernel message from any kext reaches the system log on this machine (log show returns nothing for NMXGPU,
- * NVAccel or kernel[0]), so a printf trace was unreadable. The first version of this trace was also wrong in two ways:
- * it recorded only the gfx ring (RADV can dispatch on comp_*, so the failing job never appeared) and it kept only the
- * last submission (a probe's upload/blit overwrote the dispatch it was meant to explain). debug.nmx_trace now keeps
- * the last 16 submissions of every ring type, with the raw job->vm_needs_flush kept apart from the flush emitted.
- * A timed-out job is recorded as ring "TIME" so it is never confused with a submission.
+ * No kernel message from any kext is dependable in the system log on this machine, and the answer is needed inside
+ * the probing process's lifetime, so the driver publishes what it decided on sysctl instead of printf:
+ *
+ *   debug.nmx_trace  the last 16 submissions of every ring: ring, VM hub, ring type, vmid, pasid, page directory,
+ *                    the raw job->vm_needs_flush and the flush the call actually emitted.
+ *   debug.nmx_grab   the last 16 VMID assignments: hub, vmid, the flush decision, the VM's fence context, the VMID's
+ *                    owner before the update and its cached page directory before and after. "stray" marks a job that
+ *                    skips the flush while the VMID still belongs to another VM - the state that leaves the hardware
+ *                    reading the other VM's page table.
+ *   debug.nmx_timeouts  scheduler timeouts, also recorded as a row whose ring is TIME.
  */
 #include <sys/sysctl.h>
 
 struct nmx_tr_rec {
     unsigned long long seq, pd;
-    unsigned type, vmid, pasid, needs_flush, flush, pasid_map, pipe_sync, gpu_reset, gds;
+    unsigned hub, type, vmid, pasid, needs_flush, flush, pasid_map, pipe_sync, gpu_reset, gds;
     char ring[12];
 };
 static nmx_tr_rec gTr[16];
 static unsigned gTrN;
 static unsigned long long gTrSeq;
+
+struct nmx_gr_rec {
+    unsigned long long seq, vm_ctx, owner, pd_new, pd_old;
+    unsigned hub, vmid, needs_flush, stray;
+};
+static nmx_gr_rec gGr[16];
+static unsigned gGrN;
+static unsigned long long gGrSeq;
+
 static volatile SInt64 gNmxJobs, gNmxJobsFlushed, gNmxJobsNoFlush, gNmxTimeouts;
+static volatile SInt64 gNmxGrabFlushed, gNmxGrabSkipped, gNmxGrabStray;
 
 static void nmx_tr_ring(nmx_tr_rec *r, const char *name)
 {
@@ -60,12 +74,13 @@ static void nmx_tr_ring(nmx_tr_rec *r, const char *name)
     r->ring[i] = 0;
 }
 
-extern "C" void nmx_vm_trace(const char *ring, unsigned type, unsigned vmid, unsigned pasid,
+extern "C" void nmx_vm_trace(const char *ring, unsigned hub, unsigned type, unsigned vmid, unsigned pasid,
                              unsigned long long pd, unsigned needs_flush, unsigned flags)
 {
     nmx_tr_rec *r = &gTr[gTrN % 16];
     r->seq = ++gTrSeq;
     r->pd = pd;
+    r->hub = hub;
     r->type = type;
     r->vmid = vmid;
     r->pasid = pasid;
@@ -82,11 +97,32 @@ extern "C" void nmx_vm_trace(const char *ring, unsigned type, unsigned vmid, uns
     else gNmxJobsNoFlush = gNmxJobsNoFlush + 1;
 }
 
+extern "C" void nmx_grab_trace(unsigned hub, unsigned vmid, unsigned needs_flush,
+                               unsigned long long vm_ctx, unsigned long long id_owner,
+                               unsigned long long pd_new, unsigned long long pd_old)
+{
+    nmx_gr_rec *r = &gGr[gGrN % 16];
+    r->seq = ++gGrSeq;
+    r->hub = hub;
+    r->vmid = vmid;
+    r->needs_flush = needs_flush ? 1u : 0u;
+    r->vm_ctx = vm_ctx;
+    r->owner = id_owner;
+    r->pd_new = pd_new;
+    r->pd_old = pd_old;
+    r->stray = (!needs_flush && id_owner != vm_ctx) ? 1u : 0u;
+    gGrN++;
+    if (needs_flush) gNmxGrabFlushed = gNmxGrabFlushed + 1;
+    else gNmxGrabSkipped = gNmxGrabSkipped + 1;
+    if (r->stray) gNmxGrabStray = gNmxGrabStray + 1;
+}
+
 extern "C" void nmx_job_timeout(unsigned vmid)
 {
     nmx_tr_rec *r = &gTr[gTrN % 16];
     r->seq = ++gTrSeq;
     r->pd = 0;
+    r->hub = 0xff;
     r->type = 0xff;
     r->vmid = vmid;
     r->pasid = 0;
@@ -99,13 +135,31 @@ extern "C" void nmx_job_timeout(unsigned vmid)
 static int nmx_trace_sysctl SYSCTL_HANDLER_ARGS
 {
     char buf[2048];
-    int n = snprintf(buf, sizeof buf, "seq ring type vmid pasid pd needs_flush flush pasid_map pipe_sync gpu_reset gds\n");
+    int n = snprintf(buf, sizeof buf,
+                     "seq ring hub type vmid pasid pd needs_flush flush pasid_map pipe_sync gpu_reset gds\n");
     unsigned count = gTrN < 16 ? gTrN : 16;
     for (unsigned k = 0; k < count && n > 0 && (size_t)n < sizeof buf - 1; k++) {
         const nmx_tr_rec *r = &gTr[(gTrN - count + k) % 16];
-        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu %s %u %u %u %llx %u %u %u %u %u %u\n",
-                      r->seq, r->ring, r->type, r->vmid, r->pasid, r->pd,
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu %s %u %u %u %u %llx %u %u %u %u %u %u\n",
+                      r->seq, r->ring, r->hub, r->type, r->vmid, r->pasid, r->pd,
                       r->needs_flush, r->flush, r->pasid_map, r->pipe_sync, r->gpu_reset, r->gds);
+        if ((size_t)n >= sizeof buf) { n = (int)sizeof buf - 1; break; }
+    }
+    if (n < 0) n = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+
+static int nmx_grab_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[2048];
+    int n = snprintf(buf, sizeof buf,
+                     "seq hub vmid needs_flush vm_ctx owner pd_new pd_old stray\n");
+    unsigned count = gGrN < 16 ? gGrN : 16;
+    for (unsigned k = 0; k < count && n > 0 && (size_t)n < sizeof buf - 1; k++) {
+        const nmx_gr_rec *r = &gGr[(gGrN - count + k) % 16];
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu %u %u %u %llx %llx %llx %llx %u\n",
+                      r->seq, r->hub, r->vmid, r->needs_flush, r->vm_ctx, r->owner,
+                      r->pd_new, r->pd_old, r->stray);
         if ((size_t)n >= sizeof buf) { n = (int)sizeof buf - 1; break; }
     }
     if (n < 0) n = 0;
@@ -114,7 +168,10 @@ static int nmx_trace_sysctl SYSCTL_HANDLER_ARGS
 
 SYSCTL_PROC(_debug, OID_AUTO, nmx_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             0, 0, nmx_trace_sysctl, "A",
-            "last 16 AMD submissions: ring, VMID, page directory, job->vm_needs_flush and the flush actually emitted");
+            "last 16 AMD submissions: ring, VM hub, vmid, page directory, job->vm_needs_flush and the flush emitted");
+SYSCTL_PROC(_debug, OID_AUTO, nmx_grab, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_grab_sysctl, "A",
+            "last 16 VMID assignments: hub, vmid, flush decision, VM context, VMID owner, page directory");
 
 #define NMX_CNT(nm, var, desc) \
     SYSCTL_QUAD(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (SInt64 *)&var, desc)
@@ -122,19 +179,48 @@ NMX_CNT(nmx_jobs, gNmxJobs, "AMD submissions whose VM/flush decision was recorde
 NMX_CNT(nmx_jobs_flushed, gNmxJobsFlushed, "of those, submissions that emitted a VM flush");
 NMX_CNT(nmx_jobs_no_flush, gNmxJobsNoFlush, "of those, submissions with no VM flush");
 NMX_CNT(nmx_timeouts, gNmxTimeouts, "AMD submissions the scheduler reported as timed out");
+NMX_CNT(nmx_grab_flushed, gNmxGrabFlushed, "VMID assignments that asked for a flush");
+NMX_CNT(nmx_grab_skipped, gNmxGrabSkipped, "VMID assignments that skipped the flush");
+NMX_CNT(nmx_grab_stray, gNmxGrabStray,
+        "VMID assignments that skipped the flush while the VMID still belonged to another VM");
 
 /* A kext's SYSCTL_* entries are not registered automatically: sys/sysctl.h says so plainly ("UNLESS they are defined in
  * I/O-Kit. In this case, you have to call sysctl_register_oid() manually - just like in a KEXT"). NMXAccel did that and
  * its debug.* entries work; NMXGPU did not, so every debug.nmx_* was an unknown oid even though the kext carried it. */
+/* User (mmap) cache mode for GPU buffers, read by nmx_umap_insert: 1 = uncached (default, this GPU does not snoop
+ * the CPU caches), 2 = write-combined, 0 = whatever the DRM driver asked for. */
+/* Flush every CPU cache before a submission (amdgpu_cs.c). Blunt on purpose: it tests whether a dirty write-back line
+ * from the kernel's view is being written over what userland put in a buffer through its uncached mapping. */
+/* Flush every CPU cache when a user mapping of GPU buffers is created (nmx_mmap): dirty write-back lines from the
+ * kernel's view of those pages would otherwise land on top of what userland writes through its uncached mapping. */
+extern "C" int nmx_umap_flush_on_map = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmx_umap_flush, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_umap_flush_on_map, 0,
+           "flush all CPU caches when a user BO mapping is created: 0 off (default), 1 on");
+
+extern "C" int nmx_wbinvd_before_submit = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmx_wbinvd, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_wbinvd_before_submit, 0,
+           "flush all CPU caches before each submission: 0 off (default), 1 on");
+
+extern "C" int nmx_umap_cache = 1;
+SYSCTL_INT(_debug, OID_AUTO, nmx_umap_cache, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_umap_cache, 0,
+           "user BO mapping cache: 0 driver default, 1 uncached (default), 2 write-combined");
+
 static void nmx_sysctl_install(void)
 {
     static bool installed = false;
     if (installed) return;
     sysctl_register_oid(&sysctl__debug_nmx_trace);
+    sysctl_register_oid(&sysctl__debug_nmx_grab);
     sysctl_register_oid(&sysctl__debug_nmx_jobs);
     sysctl_register_oid(&sysctl__debug_nmx_jobs_flushed);
     sysctl_register_oid(&sysctl__debug_nmx_jobs_no_flush);
     sysctl_register_oid(&sysctl__debug_nmx_timeouts);
+    sysctl_register_oid(&sysctl__debug_nmx_grab_flushed);
+    sysctl_register_oid(&sysctl__debug_nmx_grab_skipped);
+    sysctl_register_oid(&sysctl__debug_nmx_grab_stray);
+    sysctl_register_oid(&sysctl__debug_nmx_umap_cache);
+    sysctl_register_oid(&sysctl__debug_nmx_wbinvd);
+    sysctl_register_oid(&sysctl__debug_nmx_umap_flush);
     installed = true;
 }
 
@@ -237,60 +323,6 @@ void NMXGPU::attachThread(void *arg, wait_result_t)
     self->release();
 }
 
-/*
- * Boot guard, as in NMXNPU: the NPU kext on this layer panicked 7 s into every start until its boot argument was
- * removed from Linux. The attach, the modeset and the hand-over to macOS run between setting an NVRAM marker
- * and clearing it; a start that finds the marker still set follows an attach that never returned (a panic or a hang),
- * so this GPU stays with macOS and the driver says so. Turning the test driver off and on in the app clears it.
- */
-static const char *const kAttachMarker = "nullmoth-gpu-attaching";
-
-static IODTNVRAM *nmx_nvram()
-{
-    IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
-    IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e);
-    if (n == nullptr && e != nullptr)
-        e->release();
-    return n;
-}
-
-static bool nmx_marker_set()
-{
-    IODTNVRAM *n = nmx_nvram();
-    if (n == nullptr)
-        return false;
-    OSObject *v = n->copyProperty(kAttachMarker);
-    bool set = v != nullptr;
-    if (v)
-        v->release();
-    n->release();
-    return set;
-}
-
-static void nmx_marker_write(bool on)
-{
-    IODTNVRAM *n = nmx_nvram();
-    if (n == nullptr) {
-        IOLog("NullMoth GPU: no NVRAM; the boot guard is off\n");
-        return;
-    }
-    const OSSymbol *k = OSSymbol::withCString(kAttachMarker);
-    if (k != nullptr) {
-        if (on) {
-            OSData *d = OSData::withBytes("1", 1);
-            if (d == nullptr || !n->setProperty(k, d))
-                IOLog("NullMoth GPU: could not set the boot guard\n");
-            if (d)
-                d->release();
-        } else {
-            n->removeProperty(k);
-        }
-        k->release();
-    }
-    n->sync();
-    n->release();
-}
-
 void NMXGPU::attachNow()
 {
     int err = nmx_xnu_wait_firmware_root(300);
@@ -299,18 +331,8 @@ void NMXGPU::attachNow()
         attach_ = -1;
         return;
     }
-    if (nmx_marker_set()) {
-        IOLog("NullMoth GPU: the last attach of %04x:%04x never returned (the Mac stopped or restarted); this GPU stays "
-              "with macOS. Send logs, then turn the test driver off and on to try again\n",
-              pci_->configRead16(kIOPCIConfigVendorID), pci_->configRead16(kIOPCIConfigDeviceID));
-        setProperty("nullmoth-gpu-state", "parked: the last attach never returned");
-        attach_ = -1;
-        return;
-    }
-    nmx_marker_write(true);
     dev_ = nmx_port_attach(pci_);
     if (dev_ == nullptr) {
-        nmx_marker_write(false);
         IOLog("NullMoth GPU: no driver took %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
               pci_->configRead16(kIOPCIConfigDeviceID));
         attach_ = -1;
@@ -332,7 +354,6 @@ void NMXGPU::attachNow()
     pci_->registerService();
     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
     fb_ = nmx_fb_publish(this, dev_);
-    nmx_marker_write(false);
     IOLog("NullMoth GPU: driving %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
           pci_->configRead16(kIOPCIConfigDeviceID));
     OSSynchronizeIO();

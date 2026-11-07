@@ -1,0 +1,22 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c
+@@ -447,6 +447,19 @@
+ 		list_move_tail(&id->list, &id_mgr->ids_lru);
+ 	}
+ 
++	{
++		/* NullMoth: who was handed which VMID, whether it asked for a flush, and which page table the
++		 * manager believed that VMID already had. A job that skips the flush while owner != this VM is the
++		 * case that leaves the hardware on another VM's page table. */
++		extern void nmx_grab_trace(unsigned hub, unsigned vmid, unsigned needs_flush,
++			unsigned long long vm_ctx, unsigned long long id_owner,
++			unsigned long long pd_new, unsigned long long pd_old);
++
++		nmx_grab_trace(vmhub, (unsigned)(id - id_mgr->ids), job->vm_needs_flush ? 1u : 0u,
++			(unsigned long long)vm->immediate.fence_context, (unsigned long long)id->owner,
++			(unsigned long long)job->vm_pd_addr, (unsigned long long)id->pd_gpu_addr);
++	}
++
+ 	job->gds_switch_needed = amdgpu_vmid_gds_switch_needed(id, job);
+ 	if (job->vm_needs_flush) {
+ 		id->flushed_updates = amdgpu_vm_tlb_seq(vm);
