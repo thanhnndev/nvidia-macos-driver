@@ -155,24 +155,18 @@ static unsigned bucket_of(const void *p, unsigned n)
 }
 
 /*
- * A process's start time in microseconds: with its pid, what tells the owners of one recycled proc_t apart.
- * proc_starttime is in the 26.5 SDK but not exported to kexts by every kernel (25G332 has no kext export for it),
- * so it is imported weak; where it is missing the start reads 0 and the pid alone tells owners apart (a recycled
- * proc_t with the same pid needs a full pid wrap while the record lives).
+ * A process's start time, which with its pid would tell the owners of one recycled proc_t apart. It reads 0: the
+ * pid alone tells owners apart (a recycled proc_t with the same pid needs a full pid wrap while the record lives).
+ * proc_starttime is in the 26.5 SDK but 25G332 does not export it to kexts. A weak import of it does not work there:
+ * kmutil bound the missing weak symbol to an address in kernel data, neither NULL nor gOSKextUnresolved, so the
+ * check passed and the call jumped into data. Every boot panicked in NMXGPU::start about 7 s in (ga403wm Step128,
+ * Kernel-2026-11-07-164643: Kernel NX fault at RIP == CR2, _nmx_thread_get+0x1b6 <- nmx_curthread <- lkpi_kmalloc
+ * <- linux_compat_init). So no weak imports in this layer.
  */
-extern int nmx_weak_proc_starttime(void *p, struct timeval *tv) __asm("_proc_starttime") __attribute__((weak_import));
-extern const void *const gOSKextUnresolved;
-/* kmutil binds weak symbols only through data pointers (a weak reference in __text is "Unexpected bind type: 3") */
-static int (*volatile nmx_proc_starttime_fn)(void *, struct timeval *) = nmx_weak_proc_starttime;
-
 static uint64_t nmx_proc_start(void *xnu)
 {
-    struct timeval tv = { 0, 0 };
-    int (*fn)(void *, struct timeval *) = nmx_proc_starttime_fn;
-    if (fn == NULL || (const void *)fn == gOSKextUnresolved)
-        return 0;
-    fn(xnu, &tv);
-    return (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
+    (void)xnu;
+    return 0;
 }
 
 /* unlinks the record of a process that is gone and queues it for nmx_proc_reap; nmx_thread_lock held */

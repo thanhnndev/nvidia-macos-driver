@@ -36,7 +36,6 @@ static uint64_t thread_tid(thread_t t) { return cur_tid; }
 static char theproc[64];
 static void *current_proc(void) { return theproc; }
 static int proc_pid(void *p) { return 42; }
-static void proc_starttime(void *p, struct timeval *tv) { tv->tv_sec = 1; tv->tv_usec = 0; }
 static void proc_name(int pid, char *b, int n) { strncpy(b, "test", n); }
 static struct proc nmx_kernproc_rec_ = { 0 };
 #define pid_t int
