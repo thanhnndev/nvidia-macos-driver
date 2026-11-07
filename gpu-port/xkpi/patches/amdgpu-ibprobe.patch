@@ -1,9 +1,19 @@
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-11-07 15:05:40
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-11-07 15:07:17
-@@ -43,6 +43,121 @@
- 		printf("NullMoth ipdump: %s\n", line);
- }
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c	2026-11-07 15:15:56
+@@ -27,6 +27,7 @@
+ #include "amdgpu_dev_coredump.h"
+ #include "atom.h"
+ #include "soc15_common.h"
++#include <drm/ttm/ttm_tt.h>
+ #include "gc/gc_11_0_0_offset.h"
  
+ #ifndef CONFIG_DEV_COREDUMP
+@@ -41,6 +42,121 @@
+ 		line[n - 1] = 0;
+ 	if (n)
+ 		printf("NullMoth ipdump: %s\n", line);
++}
++
 +/*
 + * ga403wm Step86/89 ibprobe: on a GFX ring timeout, read the hung IB1 (CP_IB1_BASE) twice - through the BO's kernel
 + * vmap (view A, what the GPU sees in memory) and through each TT page's write-back kernel alias (view B, what the CPU
@@ -117,12 +127,10 @@
 +	if (first != ~0u)
 +		nmx_ibprobe_dump(&pr, first);
 +	nmx_ibprobe_dump(&pr, cmd - left);	/* around the CP fetch position */
-+}
-+
+ }
+ 
  void amdgpu_coredump(struct amdgpu_device *adev, bool skip_vram_check,
- 		     bool vram_lost, struct amdgpu_job *job)
- {
-@@ -94,6 +209,8 @@
+@@ -94,6 +210,8 @@
  				    rp, RREG32_SOC15(GC, 0, regCP_RB0_BASE), RREG32_SOC15(GC, 0, regCP_RB0_BASE_HI),
  				    RREG32_SOC15(GC, 0, regCP_RB0_CNTL), ib_hi, ib_lo, RREG32_SOC15(GC, 0, regCP_IB1_BUFSZ),
  				    (unsigned long long)ring->gpu_addr);

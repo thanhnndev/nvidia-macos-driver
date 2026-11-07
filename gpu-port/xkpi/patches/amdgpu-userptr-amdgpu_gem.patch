@@ -1,15 +1,13 @@
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-07 15:10:56
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-07 15:12:53
-@@ -408,8 +408,103 @@
- 
- 	memset(args, 0, sizeof(*args));
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-07 15:15:56
+@@ -410,7 +410,103 @@
  	args->out.handle = handle;
-+	return 0;
-+}
+ 	return 0;
+ }
 +
 +#ifdef NMXKPI
 +void nmx_cs_report_name(const char *what, int r, bool always);	/* amdgpu_cs.c, Step95 */
-+
+ 
 +/*
 + * macOS port (ga403wm Step92): userptr without HMM. This build has no CONFIG_HMM_MIRROR, so amdgpu_hmm_register() is
 + * the -ENODEV stub and every RADV host-pointer import failed (NVMTL then copied every IOSurface with the CPU). There
@@ -78,7 +76,7 @@
 +		return r;
 +	}
 +	nmx_userptr_say("pinned", args->addr, args->size, (long)n);
- 	return 0;
++	return 0;
 +}
 +
 +/*
@@ -95,16 +93,18 @@
 +	if (r != -EFAULT || (args->flags & AMDGPU_GEM_USERPTR_READONLY) || !bo->tbo.ttm)
 +		return r;
 +	args->flags |= AMDGPU_GEM_USERPTR_READONLY;
-+	ttm_to_amdgpu_ttm_tt(bo->tbo.ttm)->userflags |= AMDGPU_GEM_USERPTR_READONLY;
-+	r = nmx_userptr_pin(bo, args, filp, handle);
++	r = amdgpu_ttm_tt_set_userptr(&bo->tbo, args->addr, args->flags);	/* gtt->userflags gets READONLY */
++	if (!r)
++		r = nmx_userptr_pin(bo, args, filp, handle);
 +	nmx_cs_report_name("userptr_ro_retry", r, true);	/* "-> 0" when the read-only pin worked */
 +	return r;
- }
++}
 +#endif
- 
++
  int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
  			     struct drm_file *filp)
-@@ -457,6 +552,13 @@
+ {
+@@ -457,6 +553,13 @@
  	if (r)
  		goto release_object;
  

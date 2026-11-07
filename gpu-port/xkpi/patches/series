@@ -1,6 +1,7 @@
 amdgpu-timeout-ipdump.patch
 amdgpu-fence-read-flush.patch
 amdgpu-fence-irq-diag.patch
+amdgpu-fence-read-noprint.patch
 amdgpu-ringdump.patch
 amdgpu-ringdump2.patch
 amdgpu-ttm-force-wc.patch
@@ -24,3 +25,5 @@ amdgpu-userptr-amdgpu_gem.patch
 amdgpu-userptr-amdgpu_ttm.patch
 amdgpu-userptr-amdgpu_bo_list.patch
 amdgpu-userptr-cstrace-cs.patch
+amdgpu-irqwatch-fence.patch
+amdgpu-irqwatch-irq.patch

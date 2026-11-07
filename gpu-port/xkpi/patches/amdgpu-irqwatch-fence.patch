@@ -1,0 +1,365 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c	2026-11-07 15:14:09
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c	2026-11-07 15:15:25
+@@ -276,8 +276,16 @@
+  *
+  * Start a timer as fallback to our interrupts.
+  */
++static u64 nmx_iw_poll_ticks(void);
++static volatile u64 *nmx_iw_degraded_word(void);
++
+ static void amdgpu_fence_schedule_fallback(struct amdgpu_ring *ring)
+ {
++	/* ga403wm Step97 irqwatch: 2 ms while interrupts are lost (degraded mode), else as upstream */
++	if (unlikely(*nmx_iw_degraded_word())) {
++		mod_timer(&ring->fence_drv.fallback_timer, jiffies + nmx_iw_poll_ticks());
++		return;
++	}
+ 	mod_timer(&ring->fence_drv.fallback_timer,
+ 		  jiffies + AMDGPU_FENCE_JIFFIES_TIMEOUT);
+ }
+@@ -336,8 +344,336 @@
+ 	} while (last_seq != seq);
+ 
+ 	return true;
++}
++
++/*
++ * ga403wm Step97/100 irqwatch: lost-interrupt watch and degraded mode (H2).
++ *
++ * The IH ring has one consumer, the IOWorkLoop thread of the MSI vector. On some boots its interrupts stopped ~1 s
++ * after NMXGPU loaded and every fence completed only through the 0.5 s fallback timer (WindowServer's 5 s fence waits
++ * timed out and it crash-looped). The root cause found in Step100 was a kernel printf on that thread (stale fence
++ * reads, fixed by amdgpu-fence-read-noprint.patch): with the -v console stalled during the first modeset it did not
++ * return, rptr was never written, and with IH_RB_CNTL.RPTR_REARM no further MSI came. This stays as a safety net:
++ *  - amdgpu_ih_process on ring 0 is serialized (nmx_ih_guarded), so the ring can also be drained from the timer;
++ *  - the loss is detected in the fallback timer: two timer-completed fallbacks in a row with nmx_irq_dispatched
++ *    unchanged between them;
++ *  - each episode is logged ("NMX irqwatch: LOST interrupts ... cause ...") with the IH registers, the IH ring state,
++ *    the wptr write-back word before and after a flush, PCI command/status, MSI/MSI-X control and the interrupt event
++ *    sources' counters, and says whether the handler is blocked in a dispatch or idle with IVs pending;
++ *  - degraded mode: every fence fallback timer is armed for 2 ms, each expiry polls the IH ring and re-arms while
++ *    fences are pending; it ends as soon as the real handler dispatches an IV again.
++ * On a healthy boot this costs one compare per timer arm and fallback, one increment plus the guard per interrupt.
++ */
++extern unsigned long nmx_irq_dispatched;
++void nmx_bus_dump_intrs(void (*say)(const char *));
++
++static struct {
++	volatile u64 degraded, fb_irqs, handler_calls, req, handler_disp, poll_disp, episodes, polls, enter_j;
++	u64 handler_disp_at, handler_calls_at, poll_disp_at, polls_at, fb_done, fb_done_at, statlines;
++	volatile u64 handler_in;	/* jiffies + 1 while the real handler runs, else 0 */
++	u64 handler_irqs_in, handler_maxj;
++} nmx_iw;
++
++static u64 nmx_iw_poll_ticks(void)
++{
++	int t = HZ / 500;
++
++	return t > 0 ? (u64)t : 1;
++}
++
++static void nmx_iw_say(const char *s)
++{
++	printf("NMX irqwatch: %s\n", s);
++}
++
++static void nmx_iw_clflush(volatile void *p)
++{
++	__asm__ __volatile__("clflush (%0)\n\tmfence" : : "r"(p) : "memory");
++}
++
++/* amdgpu_ih_process on ring 0 never runs twice at once: a caller that finds it busy leaves its work to the running
++ * owner, which processes again before it lets go. Nobody waits or spins. */
++static int nmx_iw_ih_run(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih, u64 *credit)
++{
++	int r = IRQ_NONE;
++
++	if (__atomic_fetch_add(&nmx_iw.req, 1, __ATOMIC_ACQ_REL) != 0)
++		return IRQ_HANDLED;
++	for (;;) {
++		u64 n = __atomic_load_n(&nmx_iw.req, __ATOMIC_ACQUIRE);
++		u64 d0 = nmx_irq_dispatched;
++
++		r = amdgpu_ih_process(adev, ih);
++		*credit += nmx_irq_dispatched - d0;
++		if (__atomic_compare_exchange_n(&nmx_iw.req, &n, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++			break;
++	}
++	return r;
++}
++
++/* amdgpu_irq_handler's call of amdgpu_ih_process (interrupt work-loop thread) */
++int nmx_ih_guarded(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
++{
++	u64 j0 = jiffies, d;
++	int r;
++
++	nmx_iw.handler_calls++;
++	nmx_iw.handler_irqs_in = nmx_irq_dispatched;
++	__atomic_store_n(&nmx_iw.handler_in, j0 + 1, __ATOMIC_RELEASE);
++	r = nmx_iw_ih_run(adev, ih, (u64 *)&nmx_iw.handler_disp);
++	__atomic_store_n(&nmx_iw.handler_in, 0, __ATOMIC_RELEASE);
++	d = jiffies - j0;
++	if (d > nmx_iw.handler_maxj)
++		nmx_iw.handler_maxj = d;
++	return r;
++}
++
++/* the OSSSYS base the IH register fields were built from (all IH registers have BASE_IDX 0); 0 if they look wrong */
++static u32 nmx_iw_ih_base(struct amdgpu_ih_ring *ih)
++{
++	u32 cntl = ih->ih_regs.ih_rb_cntl;
++
++	if (cntl < 0x80 || ih->ih_regs.ih_rb_rptr != cntl + 1 || ih->ih_regs.ih_rb_wptr != cntl + 2)
++		return 0;
++	return cntl - 0x80;
++}
++
++static u32 nmx_iw_wptr_wb(struct amdgpu_ih_ring *ih, bool flush)
++{
++	volatile u32 *wp = (volatile u32 *)ih->wptr_cpu;
++
++	if (!wp)
++		return 0xdeadbeef;
++	if (flush)
++		nmx_iw_clflush(wp);
++	return *wp;
++}
++
++/* Which side stopped: the consumer (handler blocked inside a dispatch) or the producer (handler idle, IVs pending). */
++static void nmx_iw_cause(struct amdgpu_ih_ring *ih)
++{
++	extern unsigned long nmx_fence_stale_reads;
++	extern u64 nmx_fence_stale_last;
++	extern struct amdgpu_ring *nmx_fence_stale_ring;
++	char s[256];
++	u64 in = __atomic_load_n(&nmx_iw.handler_in, __ATOMIC_ACQUIRE), hz = HZ > 0 ? HZ : 1000;
++	u32 rptr = ih->rptr, mask = ih->ptr_mask, w = ih->wptr_cpu ? nmx_iw_wptr_wb(ih, true) : rptr;
++
++	if (in) {
++		u32 d0 = 0, d4 = 0;
++
++		if (ih->ring && mask) {
++			volatile u32 *iv = (volatile u32 *)((char *)ih->ring + ((rptr - 32) & mask & ~3u));
++
++			nmx_iw_clflush(iv);
++			d0 = iv[0];
++			d4 = iv[4];
++		}
++		snprintf(s, sizeof(s), "cause: the IH handler thread is BLOCKED in a dispatch for %llu ms "
++			 "(%llu IVs dispatched in this run); IV in dispatch (rptr-32): client %u src %u ring %u vmid %u data0 %#x",
++			 (unsigned long long)((jiffies - (in - 1)) * 1000 / hz),
++			 (unsigned long long)(nmx_irq_dispatched - nmx_iw.handler_irqs_in),
++			 d0 & 0xff, (d0 >> 8) & 0xff, (d0 >> 16) & 0xff, (d0 >> 24) & 0xf, d4);
++	} else if ((w & mask) != (rptr & mask)) {
++		snprintf(s, sizeof(s), "cause: handler idle with IVs pending (rptr %#x wptr_wb %#x): the MSI did not arrive",
++			 rptr, w);
++	} else {
++		snprintf(s, sizeof(s), "cause: handler idle and the IH ring empty (rptr %#x): fences completed with no "
++			 "trap/EOP IV", rptr);
++	}
++	nmx_iw_say(s);
++	snprintf(s, sizeof(s), "longest handler run %llu ms; stale fence reads %lu (not printed) last on %s cached %u "
++		 "memory %u", (unsigned long long)(nmx_iw.handler_maxj * 1000 / hz), nmx_fence_stale_reads,
++		 nmx_fence_stale_ring ? nmx_fence_stale_ring->name : "-", (u32)(nmx_fence_stale_last >> 32),
++		 (u32)nmx_fence_stale_last);
++	nmx_iw_say(s);
++}
++
++static const u16 nmx_iw_ih_regs[] = { 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0xa5, 0xa8, 0xa9, 0xac, 0xad,
++				       0xc1, 0xc2, 0xd5, 0xd9, 0xdc, 0xe4, 0xe5, 0xe6, 0xf1, 0x184, 0x18d, 0x18f };
++
++static void nmx_iw_dump(struct amdgpu_ring *ring, struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
++{
++	char s[256];
++	u32 base = nmx_iw_ih_base(ih), mask = ih->ptr_mask;
++	struct pci_dev *pdev = adev->pdev;
++	unsigned int i, k, n = ARRAY_SIZE(nmx_iw_ih_regs);
++
++	snprintf(s, sizeof(s), "LOST interrupts, episode %llu, ring %s last_seq %u sync_seq %u, dispatched %lu, handler "
++		 "runs %llu, jiffies %llu", (unsigned long long)nmx_iw.episodes, ring->name,
++		 atomic_read(&ring->fence_drv.last_seq), ring->fence_drv.sync_seq, nmx_irq_dispatched,
++		 (unsigned long long)nmx_iw.handler_calls, (unsigned long long)nmx_iw.enter_j);
++	nmx_iw_say(s);
++	{
++		u32 w0 = nmx_iw_wptr_wb(ih, false), w1 = nmx_iw_wptr_wb(ih, true);
++
++		snprintf(s, sizeof(s), "ih enabled %d rptr %#x mask %#x size %#x doorbell %d idx %#x bus_addr %d wptr_wb %#x "
++			 "flushed %#x rptr_wb %#x irq installed %d num %d msi %d", ih->enabled, ih->rptr, mask, ih->ring_size,
++			 ih->use_doorbell, ih->doorbell_index, ih->use_bus_addr, w0, w1,
++			 ih->rptr_cpu ? *(volatile u32 *)ih->rptr_cpu : 0xdeadbeef, adev->irq.installed, adev->irq.irq,
++			 adev->irq.msi_enabled);
++		nmx_iw_say(s);
++	}
++	if (ih->ring && mask) {
++		volatile u32 *iv = (volatile u32 *)((char *)ih->ring + (ih->rptr & mask & ~3u));
++
++		nmx_iw_clflush(iv);
++		snprintf(s, sizeof(s), "IV at rptr %08x %08x %08x %08x %08x %08x %08x %08x", iv[0], iv[1], iv[2], iv[3],
++			 iv[4], iv[5], iv[6], iv[7]);
++		nmx_iw_say(s);
++	}
++	if (base) {
++		for (i = 0; i < n;) {
++			int len = snprintf(s, sizeof(s), "IH@%#x", base);
++
++			for (k = 0; k < 9 && i < n; k++, i++)
++				if (len > 0 && len < (int)sizeof(s) - 24)
++					len += snprintf(s + len, sizeof(s) - len, " %x=%#x", nmx_iw_ih_regs[i],
++							RREG32_NO_KIQ(base + nmx_iw_ih_regs[i]));
++			nmx_iw_say(s);
++		}
++	} else {
++		snprintf(s, sizeof(s), "IH register fields look wrong (cntl %#x rptr %#x wptr %#x), no dump",
++			 ih->ih_regs.ih_rb_cntl, ih->ih_regs.ih_rb_rptr, ih->ih_regs.ih_rb_wptr);
++		nmx_iw_say(s);
++	}
++	if (pdev) {
++		int msi = pci_find_capability(pdev, PCI_CAP_ID_MSI), msix = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
++		u16 cmd = 0, st = 0, mctl = 0, mdata = 0, xctl = 0;
++		u32 mlo = 0, mhi = 0;
++
++		pci_read_config_word(pdev, PCI_COMMAND, &cmd);
++		pci_read_config_word(pdev, PCI_STATUS, &st);
++		if (msi) {
++			pci_read_config_word(pdev, msi + 2, &mctl);
++			pci_read_config_dword(pdev, msi + 4, &mlo);
++			if (mctl & 0x80) {
++				pci_read_config_dword(pdev, msi + 8, &mhi);
++				pci_read_config_word(pdev, msi + 12, &mdata);
++			} else {
++				pci_read_config_word(pdev, msi + 8, &mdata);
++			}
++		}
++		if (msix)
++			pci_read_config_word(pdev, msix + 2, &xctl);
++		snprintf(s, sizeof(s), "PCI cmd %#x status %#x MSI@%#x ctrl %#x addr %#x:%#x data %#x MSI-X@%#x ctrl %#x pdev "
++			 "irq %d msi_enabled %d", cmd, st, msi, mctl, mhi, mlo, mdata, msix, xctl, pdev->irq, pdev->msi_enabled);
++		nmx_iw_say(s);
++	}
++	nmx_bus_dump_intrs(nmx_iw_say);
++}
++
++static void nmx_iw_status(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih, const char *what)
++{
++	char s[256];
++	u32 base = nmx_iw_ih_base(ih);
++
++	snprintf(s, sizeof(s), "%s: %llu ms, polls %llu, poll-dispatched %llu, irq-dispatched %llu, handler runs %llu, "
++		 "timer completions %llu; IH rptr %#x wptr_wb %#x RB_RPTR %#x RB_WPTR %#x STATUS %#x", what,
++		 (unsigned long long)((jiffies - nmx_iw.enter_j) * 1000 / (HZ > 0 ? HZ : 1000)),
++		 (unsigned long long)(nmx_iw.polls - nmx_iw.polls_at),
++		 (unsigned long long)(nmx_iw.poll_disp - nmx_iw.poll_disp_at),
++		 (unsigned long long)(nmx_iw.handler_disp - nmx_iw.handler_disp_at),
++		 (unsigned long long)(nmx_iw.handler_calls - nmx_iw.handler_calls_at),
++		 (unsigned long long)(nmx_iw.fb_done - nmx_iw.fb_done_at), ih->rptr, nmx_iw_wptr_wb(ih, false),
++		 base ? RREG32_NO_KIQ(base + 0x81) : 0, base ? RREG32_NO_KIQ(base + 0x82) : 0,
++		 base ? RREG32_NO_KIQ(base + 0xc2) : 0);
++	nmx_iw_say(s);
++}
++
++static void nmx_iw_enter(struct amdgpu_ring *ring, struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
++{
++	char s[160];
++
++	nmx_iw.episodes++;
++	nmx_iw.enter_j = jiffies;
++	nmx_iw.handler_disp_at = nmx_iw.handler_disp;
++	nmx_iw.handler_calls_at = nmx_iw.handler_calls;
++	nmx_iw.poll_disp_at = nmx_iw.poll_disp;
++	nmx_iw.polls_at = nmx_iw.polls;
++	nmx_iw.fb_done_at = nmx_iw.fb_done;
++	__atomic_store_n(&nmx_iw.degraded, 1, __ATOMIC_RELEASE);
++	if (nmx_iw.episodes <= 4)
++		nmx_iw_dump(ring, adev, ih);
++	if (nmx_iw.episodes <= 16) {
++		nmx_iw_cause(ih);
++		snprintf(s, sizeof(s), "degraded mode ON (episode %llu): fence fallback every %llu ms, IH ring polled from "
++			 "the timer", (unsigned long long)nmx_iw.episodes,
++			 (unsigned long long)(nmx_iw_poll_ticks() * 1000 / (HZ > 0 ? HZ : 1000)));
++		nmx_iw_say(s);
++	}
+ }
+ 
++static void nmx_iw_leave(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
++{
++	char s[120];
++
++	__atomic_store_n(&nmx_iw.degraded, 0, __ATOMIC_RELEASE);
++	if (nmx_iw.episodes <= 16) {
++		nmx_iw_status(adev, ih, "interrupts back, degraded mode OFF");
++		snprintf(s, sizeof(s), "longest handler run so far %llu ms",
++			 (unsigned long long)(nmx_iw.handler_maxj * 1000 / (HZ > 0 ? HZ : 1000)));
++		nmx_iw_say(s);
++	}
++	if (nmx_iw.episodes <= 4)
++		nmx_bus_dump_intrs(nmx_iw_say);
++}
++
++static bool nmx_iw_poll(struct amdgpu_ring *ring, bool done)
++{
++	struct amdgpu_device *adev = ring->adev;
++	struct amdgpu_ih_ring *ih = &adev->irq.ih;
++
++	nmx_iw.polls++;
++	if (done)
++		nmx_iw.fb_done++;
++	if (nmx_iw.handler_disp != nmx_iw.handler_disp_at) {	/* the real handler dispatched an IV again */
++		nmx_iw_leave(adev, ih);
++		return false;
++	}
++	if (adev->shutdown || !ih->enabled)
++		return false;		/* tearing down or IH off: no poll, no re-arm */
++	if (ih->wptr_cpu)
++		nmx_iw_clflush(ih->wptr_cpu);	/* the write-back word may be stale in the CPU cache */
++	nmx_iw_ih_run(adev, ih, (u64 *)&nmx_iw.poll_disp);
++	if (((nmx_iw.polls - nmx_iw.polls_at) & 2047) == 0 && nmx_iw.statlines < 32) {
++		nmx_iw.statlines++;
++		nmx_iw_status(adev, ih, "still degraded");
++		if (nmx_iw.statlines <= 4)
++			nmx_bus_dump_intrs(nmx_iw_say);
++	}
++	if (atomic_read(&ring->fence_drv.last_seq) != ring->fence_drv.sync_seq)
++		mod_timer(&ring->fence_drv.fallback_timer, jiffies + nmx_iw_poll_ticks());
++	return false;		/* no per-expiry "Fence fallback timer expired" while degraded */
++}
++
++/* amdgpu_fence_fallback's call of amdgpu_fence_process (softclock thread; callouts run on it one at a time) */
++static bool nmx_iw_fb_process(struct amdgpu_ring *ring)
++{
++	bool r = amdgpu_fence_process(ring);
++
++	if (likely(!nmx_iw.degraded)) {
++		struct amdgpu_device *adev = ring->adev;
++		u64 irqs = nmx_irq_dispatched;
++
++		if (!r)
++			return r;
++		if (irqs != nmx_iw.fb_irqs) {
++			nmx_iw.fb_irqs = irqs;
++			return r;
++		}
++		if (!adev->irq.installed || !adev->irq.ih.enabled)
++			return r;	/* interrupts not set up yet (early init): not a loss */
++		nmx_iw_enter(ring, adev, &adev->irq.ih);
++	}
++	return nmx_iw_poll(ring, r);
++}
++
++static volatile u64 *nmx_iw_degraded_word(void)
++{
++	return &nmx_iw.degraded;
++}
++
+ /**
+  * amdgpu_fence_fallback - fallback for hardware interrupts
+  *
+@@ -353,7 +689,7 @@
+ 	extern unsigned long nmx_irq_dispatched;
+ 	u32 before = atomic_read(&ring->fence_drv.last_seq);
+ 
+-	if (amdgpu_fence_process(ring)) {
++	if (nmx_iw_fb_process(ring)) {
+ 		static int shown;
+ 
+ 		if (shown < 60) {
