@@ -32,3 +32,4 @@ amdgpu-gfx-timeout-3s.patch
 amdgpu-romap-gem.patch
 amdgpu-romap-gmc11.patch
 amdgpu-vcn405-readback.patch
+amdgpu-nmx-surface-hint.patch

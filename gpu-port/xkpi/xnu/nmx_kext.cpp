@@ -196,6 +196,15 @@ extern "C" volatile SInt64 gNmxPinOtherFail, gNmxPinOtherRc;
 extern "C" char gNmxPinOtherName[32];
 NMX_CNT(nmx_pin_other_fail, gNmxPinOtherFail, "Step132b: failed first writable wires outside WindowServer");
 NMX_CNT(nmx_pin_other_rc, gNmxPinOtherRc, "Step132b: IOReturn of the last of those");
+extern "C" volatile SInt64 gNmxSurfHint, gNmxSurfWire, gNmxSurfMiss, gNmxSurfBadPage, gNmxSurfNoSurf, gNmxSurfShort,
+    gNmxSurfPrepFail;
+NMX_CNT(nmx_surf_hint, gNmxSurfHint, "Step137: IOSurface hints for a userptr range (DRM_AMDGPU_NMX_SURFACE_HINT)");
+NMX_CNT(nmx_surf_wire, gNmxSurfWire, "Step137: userptr imports that pinned the IOSurface's own memory");
+NMX_CNT(nmx_surf_miss, gNmxSurfMiss, "Step137: hinted imports that fell back to the plain user wire");
+NMX_CNT(nmx_surf_bad_page, gNmxSurfBadPage, "Step137: of those, the range's first page was not the surface's");
+NMX_CNT(nmx_surf_no_surf, gNmxSurfNoSurf, "Step137: of those, the task could not look the surface up");
+NMX_CNT(nmx_surf_short, gNmxSurfShort, "Step137: of those, the surface's memory was shorter than the range");
+NMX_CNT(nmx_surf_prep_fail, gNmxSurfPrepFail, "Step137: of those, the surface's memory could not be prepared");
 SYSCTL_STRING(_debug, OID_AUTO, nmx_pin_other_name, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, gNmxPinOtherName,
               sizeof(gNmxPinOtherName), "Step132b: process of the last of those");
 NMX_CNT(nmx_grab_stray, gNmxGrabStray,

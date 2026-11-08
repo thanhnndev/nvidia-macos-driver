@@ -11,6 +11,9 @@
  */
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOService.h>
+#include <pexpert/pexpert.h>
+#include <kern/clock.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
 #include "nmx_xnu.h"
@@ -121,6 +124,181 @@ extern "C" int nmx_xnu_mm_copy(void *mm, uint64_t uaddr, void *kbuf, size_t len,
     return done == len ? 0 : EFAULT;
 }
 
+/*
+ * ga403wm Step137: IOSurface imports pin the surface's own memory.
+ *
+ * NVMTL imports every IOSurface it wraps as a userptr BO over the process's own mapping of the surface. Wiring that
+ * range faults each page into the process's map first: a fresh mapping (every process, every re-import) costs one
+ * VM fault per page in user space (NVMTL's write prefault) and again in the wire, ~7 % of a core in WindowServer
+ * while an app animates (docs/CPU-THERMALS.md, 2026-11-08). The pages are already the IOSurface's: before the import
+ * the plugin says which surface the range is (DRM_AMDGPU_NMX_SURFACE_HINT), and the wire then prepares the surface's
+ * memory descriptor (IOSurfaceRoot::lookupSurface for the calling task, so only a surface that task may use) and
+ * takes its pages, without touching the process's map.
+ *
+ * The claim is checked, not trusted: one page at the start of the range is wired through the process's map (with
+ * the access asked for, so a read-only mapping still refuses a writable pin) and must be the surface's first page.
+ * Any mismatch, unknown surface or short descriptor falls back to the plain user wire below, as before Step137.
+ * Hints are kept per task in a small ring and expire after 2 s; a stale one fails the page check.
+ * Boot-arg nmxsurfwire=0 turns the surface path off.
+ */
+extern "C" {
+volatile SInt64 gNmxSurfHint, gNmxSurfWire, gNmxSurfMiss, gNmxSurfBadPage, gNmxSurfNoSurf, gNmxSurfShort, gNmxSurfPrepFail;
+/* exported by com.apple.iokit.IOSurface; already imported by NMXAccel (Step128 rule: no new kernel symbols) */
+void *_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(void *root, unsigned int id, task_t task);
+void *_ZNK9IOSurface19getMemoryDescriptorEv(void *surface);
+}
+namespace {
+struct SurfHint {
+    task_t task;            /* compared only, no reference held */
+    uint64_t addr, size;
+    uint32_t id;
+    uint64_t when;          /* mach_absolute_time */
+};
+constexpr unsigned kSurfHints = 64;
+SurfHint gHints[kSurfHints];
+unsigned gHintNext;
+IOLock *gHintLock;
+IOService *gSurfRoot;
+int gSurfOn = -1;
+
+bool surf_on()
+{
+    if (gSurfOn < 0) {
+        int v = 1;
+        if (PE_parse_boot_argn("nmxsurfwire", &v, sizeof v) && v == 0)
+            gSurfOn = 0;
+        else
+            gSurfOn = 1;
+    }
+    return gSurfOn != 0;
+}
+
+IOLock *hint_lock()
+{
+    if (gHintLock == nullptr) {
+        IOLock *l = IOLockAlloc();
+        if (!OSCompareAndSwapPtr(nullptr, l, (void * volatile *)&gHintLock))
+            IOLockFree(l);
+    }
+    return gHintLock;
+}
+
+/* the hinted surface for exactly this range of this task, or 0. `take` clears the hint (after a successful pin): a
+ * failed attempt keeps it for the read-only retry (Step96), which is how WindowServer's r-- client surfaces arrive. */
+uint32_t hint_find(task_t task, uint64_t addr, uint64_t size, bool take)
+{
+    uint64_t now = mach_absolute_time(), limit;
+    nanoseconds_to_absolutetime(2ULL * 1000 * 1000 * 1000, &limit);
+    uint32_t id = 0;
+    IOLockLock(hint_lock());
+    for (unsigned i = 0; i < kSurfHints; i++) {
+        SurfHint &h = gHints[i];
+        if (h.task == task && h.addr == addr && h.size == size && h.id != 0 && now - h.when <= limit) {
+            id = h.id;
+            if (take)
+                h.id = 0;   /* one import per hint */
+            break;
+        }
+    }
+    IOLockUnlock(gHintLock);
+    return id;
+}
+
+IOService *surf_root()
+{
+    if (gSurfRoot == nullptr) {
+        OSDictionary *m = IOService::serviceMatching("IOSurfaceRoot");
+        if (m == nullptr)
+            return nullptr;
+        IOService *r = IOService::copyMatchingService(m);    /* retained */
+        m->release();
+        if (r != nullptr && !OSCompareAndSwapPtr(nullptr, r, (void * volatile *)&gSurfRoot))
+            r->release();
+    }
+    return gSurfRoot;
+}
+
+/* 0 and the prepared surface descriptor in *handle, or an errno (the caller then wires the user range) */
+int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
+{
+    IOService *root = surf_root();
+    if (root == nullptr)
+        return ENODEV;
+    OSObject *surf = (OSObject *)_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(root, id, task);     /* retained */
+    if (surf == nullptr) {
+        __atomic_add_fetch(&gNmxSurfNoSurf, 1, __ATOMIC_RELAXED);
+        return ENOENT;
+    }
+    IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
+    if (md != nullptr)
+        md->retain();       /* the BO keeps the memory, not the surface object */
+    surf->release();
+    if (md == nullptr || md->getLength() < npages * PAGE_SIZE) {
+        __atomic_add_fetch(&gNmxSurfShort, 1, __ATOMIC_RELAXED);
+        if (md != nullptr)
+            md->release();
+        return EINVAL;
+    }
+    if (md->prepare() != kIOReturnSuccess) {
+        __atomic_add_fetch(&gNmxSurfPrepFail, 1, __ATOMIC_RELAXED);
+        md->release();
+        return EFAULT;
+    }
+    /* the check: the range's first page, wired through the process's map with the access asked for */
+    IOMemoryDescriptor *one = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, PAGE_SIZE,
+                                                                   write ? kIODirectionOutIn : kIODirectionOut, task);
+    bool same = false;
+    if (one != nullptr) {
+        if (one->prepare() == kIOReturnSuccess) {
+            IOByteCount l1 = 0, l2 = 0;
+            addr64_t a = one->getPhysicalSegment(0, &l1, kIOMemoryMapperNone);
+            addr64_t b = md->getPhysicalSegment(0, &l2, kIOMemoryMapperNone);
+            same = a != 0 && a == b;
+            one->complete();
+        }
+        one->release();
+    }
+    if (!same) {
+        __atomic_add_fetch(&gNmxSurfBadPage, 1, __ATOMIC_RELAXED);
+        md->complete();
+        md->release();
+        return EPERM;
+    }
+    for (size_t i = 0; i < npages; i++) {
+        IOByteCount len = 0;
+        addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
+        if (pa == 0) {
+            md->complete();
+            md->release();
+            return EFAULT;
+        }
+        phys[i] = pa;
+    }
+    *handle = md;           /* nmx_xnu_user_unwire: complete + release, as for a user range */
+    return 0;
+}
+}
+
+extern "C" int nmx_xnu_surface_hint(uint32_t surface_id, uint64_t addr, uint64_t size)
+{
+    if (!surf_on())
+        return ENOTSUP;
+    if (surface_id == 0)
+        return EINVAL;
+    task_t task = current_task();
+    IOLockLock(hint_lock());
+    unsigned slot = gHintNext++ % kSurfHints;
+    for (unsigned i = 0; i < kSurfHints; i++)       /* the same range again replaces its hint */
+        if (gHints[i].task == task && gHints[i].addr == addr) {
+            slot = i;
+            break;
+        }
+    gHints[slot] = SurfHint{ task, addr, size, surface_id, mach_absolute_time() };
+    IOLockUnlock(gHintLock);
+    __atomic_add_fetch(&gNmxSurfHint, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
 extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
 {
     *handle = nullptr;
@@ -133,6 +311,20 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         task = find_ref(mm);
         if (task == nullptr)
             return EFAULT;
+    }
+    if (surf_on()) {
+        uint32_t sid = hint_find(task, uaddr, (uint64_t)npages * PAGE_SIZE, false);
+        if (sid != 0) {
+            int sr = surf_wire(task, sid, uaddr, npages, write, phys, handle);
+            if (sr == 0) {
+                (void)hint_find(task, uaddr, (uint64_t)npages * PAGE_SIZE, true);
+                __atomic_add_fetch(&gNmxSurfWire, 1, __ATOMIC_RELAXED);
+                if (mm != nullptr)
+                    task_deallocate(task);
+                return 0;
+            }
+            __atomic_add_fetch(&gNmxSurfMiss, 1, __ATOMIC_RELAXED);    /* the plain wire below */
+        }
     }
     /* the device writes the pages when the mapping is writable (kIODirectionIn), and always reads them; the BO that
      * keeps this wiring keeps the mm, whose record keeps the task */
