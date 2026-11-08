@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c	2026-11-08 16:42:45
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c	2026-11-08 16:42:45
+@@ -143,6 +143,18 @@
+ 
+ 		dev_err(adev->dev, "  in page starting at address 0x%016llx from client %d\n",
+ 				addr, entry->client_id);
++#ifdef NMXKPI
++		{
++			int nmx_romap_find(u32 pasid, u64 addr, char *buf, size_t len);	/* amdgpu_gem.c, Step135 */
++			char what[128];
++
++			if (nmx_romap_find(entry->pasid, addr, what, sizeof(what)) > 0)
++				dev_err(adev->dev, "  NMX: address is inside %s\n", what);
++			else
++				dev_err(adev->dev, "  NMX: address is in no recorded read-only mapping of pasid %u\n",
++					entry->pasid);
++		}
++#endif
+ 
+ 		/* Only print L2 fault status if the status register could be read and
+ 		 * contains useful information

@@ -29,3 +29,5 @@ amdgpu-irqwatch-fence.patch
 amdgpu-irqwatch-irq.patch
 amdgpu-stage-marks.patch
 amdgpu-gfx-timeout-3s.patch
+amdgpu-romap-gem.patch
+amdgpu-romap-gmc11.patch
