@@ -75,7 +75,8 @@ static lck_spin_t *reg_locks[REG_LOCKS];
 static struct backing *chunks;
 static struct vm_page *free_pages;         /* free single pages, linked through plinks.s.ss */
 static u_int free_count;
-static uint64_t pages_live;                /* pages currently handed out (all kinds) */
+uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
+#define pages_live gNmxPagesLive
 
 static unsigned reg_bucket(vm_paddr_t pfn)
 {

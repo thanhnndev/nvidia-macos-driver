@@ -219,6 +219,16 @@ IOService *surf_root()
 }
 
 /* 0 and the prepared surface descriptor in *handle, or an errno (the caller then wires the user range) */
+/* Step138: user-memory wirings held for the GPU right now (descriptors and their bytes): debug.nmx_userwire_* */
+extern "C" volatile SInt64 gNmxUserWires, gNmxUserWirePages;
+volatile SInt64 gNmxUserWires, gNmxUserWirePages;
+static void wire_note(IOMemoryDescriptor *md, int dir)
+{
+    SInt64 pages = (SInt64)((md->getLength() + PAGE_SIZE - 1) / PAGE_SIZE);
+    __atomic_add_fetch(&gNmxUserWires, dir, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&gNmxUserWirePages, dir * pages, __ATOMIC_RELAXED);
+}
+
 int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
 {
     IOService *root = surf_root();
@@ -274,6 +284,7 @@ int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write
         }
         phys[i] = pa;
     }
+    wire_note(md, 1);
     *handle = md;           /* nmx_xnu_user_unwire: complete + release, as for a user range */
     return 0;
 }
@@ -392,6 +403,7 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         }
         phys[i] = pa;
     }
+    wire_note(md, 1);
     *handle = md;
     return 0;
 }
@@ -401,6 +413,7 @@ extern "C" void nmx_xnu_user_unwire(void *handle)
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)handle;
     if (md == nullptr)
         return;
+    wire_note(md, -1);
     md->complete();
     md->release();
 }

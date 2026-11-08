@@ -198,6 +198,11 @@ NMX_CNT(nmx_pin_other_fail, gNmxPinOtherFail, "Step132b: failed first writable w
 NMX_CNT(nmx_pin_other_rc, gNmxPinOtherRc, "Step132b: IOReturn of the last of those");
 extern "C" volatile SInt64 gNmxSurfHint, gNmxSurfWire, gNmxSurfMiss, gNmxSurfBadPage, gNmxSurfNoSurf, gNmxSurfShort,
     gNmxSurfPrepFail;
+extern "C" volatile SInt64 gNmxUserWires, gNmxUserWirePages;
+extern "C" uint64_t gNmxPagesLive;
+NMX_CNT(nmx_pages_live, gNmxPagesLive, "Step138: port page records handed out now (GTT/system pages, all kinds)");
+NMX_CNT(nmx_userwire_count, gNmxUserWires, "Step138: user-memory wirings (IOMemoryDescriptors) held for the GPU now");
+NMX_CNT(nmx_userwire_pages, gNmxUserWirePages, "Step138: pages covered by those wirings");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -259,6 +264,9 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_fail);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_rc);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_name);
+    sysctl_register_oid(&sysctl__debug_nmx_pages_live);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_count);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_pages);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);
