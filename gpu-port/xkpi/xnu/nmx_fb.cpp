@@ -10,13 +10,109 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/graphics/IODisplay.h>
+#include <IOKit/ndrvsupport/IOMacOSVideo.h>
+#include <IOKit/IOCommandGate.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/thread_call.h>
+#include <libkern/OSAtomic.h>
+#include <pexpert/pexpert.h>
 #include "nmx_port.h"
 
 extern "C" long long nmx_fb_flip_call(const char *name, void *req);
 #include "../../../kexts/NVRM/nvrm_vram_abi.h"
 
 #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+
+/* override/src/linux_pci.c: the panel brightness in percent through amdgpu's backlight ops (set 0 = read) */
+extern "C" int nmx_backlight_percent(int set, unsigned *pct);
+
+/*
+ * ga403wm Step130: the brightness slider and keys. IOGraphics builds an AppleBacklightDisplay (slider, F-keys, dim on
+ * sleep) only if, at the framebuffer's first open, a child service named "backlight" exists and getAppleSense() says
+ * LCD. This handler is that child; it applies the level through amdgpu (DC, AUX nits on the OLED) from a thread call,
+ * because IODisplay calls doIntegerSet with the framebuffer lock held. It was the NMXBacklight kext, which called
+ * NMXGPU by address and went inert on the first source build. Boot-arg -nmxbloff leaves it out.
+ */
+class NMXFBBacklight : public IODisplayParameterHandler {
+    OSDeclareDefaultStructors(NMXFBBacklight)
+    IOService *fFb = nullptr;
+    thread_call_t fApply = nullptr;
+    volatile SInt32 fPending = -1;
+    SInt32 fLevel = 80;
+    UInt32 fWrites = 0, fFailures = 0, fRaw = 0;
+
+    static void applyFire(thread_call_param_t p, thread_call_param_t) {
+        NMXFBBacklight *me = (NMXFBBacklight *)p;
+        SInt32 v;
+        do { v = me->fPending; } while (!OSCompareAndSwap((UInt32)v, (UInt32)-1, (volatile UInt32 *)&me->fPending));
+        if (v < 0) return;
+        unsigned pct = (unsigned)v;
+        int rc = nmx_backlight_percent(1, &pct);
+        bool ok = rc == 0;
+        if (ok) { me->fLevel = v; me->fWrites++; } else me->fFailures++;
+        if (IOService *fb = me->fFb) {
+            fb->setProperty("Backlight,Writes", me->fWrites, 32);
+            fb->setProperty("Backlight,Failures", me->fFailures, 32);
+            fb->setProperty("Backlight,LastRc", (UInt32)rc, 32);
+            if (ok) fb->setProperty("Backlight,Percent", (UInt32)v, 32);
+        }
+        if ((ok && me->fWrites <= 20) || (!ok && me->fFailures <= 8))
+            FBLOG("backlight %d%% %s (rc %d)", (int)v, ok ? "applied" : "FAILED", rc);
+    }
+public:
+    static NMXFBBacklight *withFramebuffer(IOService *fb) {
+        NMXFBBacklight *h = OSTypeAlloc(NMXFBBacklight);
+        if (!h || !h->init()) { OSSafeReleaseNULL(h); return nullptr; }
+        h->fFb = fb;
+        unsigned pct = 0;
+        if (nmx_backlight_percent(0, &pct) == 0 && pct <= 100) h->fLevel = (SInt32)pct;
+        h->fApply = thread_call_allocate(applyFire, h);
+        if (!h->fApply) { h->release(); return nullptr; }
+        return h;
+    }
+    SInt32 level() const { return fLevel; }
+    void quiesce() {
+        fFb = nullptr;
+        if (fApply) {
+            thread_call_cancel(fApply);
+            while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); }
+            fApply = nullptr;
+        }
+    }
+    void free() override { quiesce(); IODisplayParameterHandler::free(); }
+    /* the framebuffer reports no display parameters, so IODisplayParameters may not exist yet, and
+     * IODisplay::setProperties() only accepts parameters listed there */
+    bool setDisplay(IODisplay *display) override {
+        if (!display) return false;
+        OSObject *old = display->copyProperty(gIODisplayParametersKey);
+        OSDictionary *cur = OSDynamicCast(OSDictionary, old);
+        OSDictionary *params = cur ? OSDictionary::withDictionary(cur) : OSDictionary::withCapacity(2);
+        if (old) old->release();
+        if (!params) return false;
+        IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, 100);
+        IODisplay::setParameter(params, gIODisplayBrightnessKey, fLevel);
+        IODisplay::addParameter(params, gIODisplayLinearBrightnessKey, 0, 100);
+        IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, fLevel);
+        display->setProperty(gIODisplayParametersKey, params);
+        params->release();
+        FBLOG("backlight parameters on %s (%s) at %d%%", display->getName(), display->getMetaClass()->getClassName(),
+              (int)fLevel);
+        return true;
+    }
+    bool doIntegerSet(OSDictionary *, const OSSymbol *name, UInt32 value) override {
+        if (fRaw < 20) { fRaw++; FBLOG("backlight set %s = %u", name ? name->getCStringNoCopy() : "?", (unsigned)value); }
+        if (name != gIODisplayBrightnessKey && name != gIODisplayLinearBrightnessKey) return false;
+        fPending = value > 100 ? 100 : (SInt32)value;
+        if (fApply) thread_call_enter(fApply);
+        return true;
+    }
+    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
+    bool doUpdate() override { return true; }
+};
+OSDefineMetaClassAndStructors(NMXFBBacklight, IODisplayParameterHandler)
 
 static IOPMPowerState kFbPowerStates[2] = {
     { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -43,6 +139,118 @@ class NMXAMDFB : public IOFramebuffer {
     bool fBeside = false;       // another framebuffer on this GPU's PCI device already drives the console
     unsigned fTraceN = 0;
     unsigned fNotReadyN = 0;    // 'scanout NOT READY' repeats every poll: counted apart so it cannot eat the trace cap
+    NMXFBBacklight *fBacklight = nullptr;
+    bool fLcd = false;          // getAppleSense says LCD for connection 0 (the backlight handler is published)
+
+    /*
+     * ga403wm Step130 (was NMXBacklight 0.4.0, Step109d): the system wake work IOGraphics never does here. A system
+     * sleep clears pagingState (IOFramebuffer::systemWork, kIOFBNotifyWillSleep to every client); IOGraphics sets it
+     * again only from its own power work (IOFramebuffer::setPowerState -> checkPowerWork). setPowerState below acks at
+     * once and handleEvent() does nothing off the controller's power thread, so after a system sleep pagingState
+     * stayed clear and WindowServer slept in _extEntry forever (userspace watchdog panic). On power-on after a system
+     * sleep: DidWake(true), DidWake(false) for each WillSleep(false), DidPowerOn(false), pagingState on, WindowServer
+     * woken, under a gate on the framebuffer's workloop. A thread call 3 s after the system power-on does the same if
+     * the framebuffer's own power-on never comes. -nmxfbwakeoff disables it.
+     */
+    IONotifier *fSleepTap = nullptr;
+    IONotifier *fSysNote = nullptr;
+    IOCommandGate *fWakeGate = nullptr;
+    thread_call_t fWakeLate = nullptr;
+    volatile UInt32 fSysSlept = 0;
+    volatile SInt32 fWillSleepOff = 0;
+    UInt32 fWakeWorks = 0;
+
+    static IOReturn sleepTap(OSObject *self, void *, IOFramebuffer *fb, IOIndex event, void *info) {
+        NMXAMDFB *me = OSDynamicCast(NMXAMDFB, self);
+        if (!me || fb != me || event != kIOFBNotifyWillSleep) return kIOReturnSuccess;
+        me->fSysSlept = 1;
+        if (!info) OSIncrementAtomic(&me->fWillSleepOff);
+        return kIOReturnSuccess;
+    }
+    static IOReturn wakeGated(OSObject *self, void *why, void *, void *, void *) {
+        NMXAMDFB *me = (NMXAMDFB *)self;
+        if (me->pagingState || me->fStopping) return kIOReturnSuccess;
+        const SInt32 owed = me->fWillSleepOff;
+        IOReturn r1 = me->deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)true);
+        IOReturn r2 = me->deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)false);
+        for (SInt32 i = 1; i < owed; ++i) r2 = me->deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)false);
+        IOReturn r3 = me->deliverFramebufferNotification(kIOFBNotifyDidPowerOn, (void *)false);
+        me->pagingState = true;
+        me->fWakeGate->commandWakeup(&me->fServerConnect, false);
+        me->fWillSleepOff = 0;
+        ++me->fWakeWorks;
+        FBLOG("paging wake (%s, #%u): DidWake true + %d x false (0x%x/0x%x), DidPowerOn 0x%x, paging on, WindowServer woken",
+              (const char *)why, (unsigned)me->fWakeWorks, owed > 1 ? (int)owed : 1, r1, r2, r3);
+        return kIOReturnSuccess;
+    }
+    void wakeWork(const char *why) {
+        if (!fWakeGate || fStopping) return;
+        if (!OSCompareAndSwap(1, 0, &fSysSlept)) return;
+        if (pagingState) { FBLOG("%s: paging already on, nothing to do", why); return; }
+        fWakeGate->runAction(&wakeGated, const_cast<char *>(why));
+    }
+    static void wakeLateFire(thread_call_param_t p, thread_call_param_t) {
+        NMXAMDFB *me = (NMXAMDFB *)p;
+        /* a dark wake leaves the framebuffer off: its own power-on does the work later */
+        if (!me->fStopping && me->getPowerState() > 0) me->wakeWork("3 s after system power-on");
+    }
+    static IOReturn sysPower(void *target, void *, UInt32 type, IOService *, void *arg, vm_size_t) {
+        NMXAMDFB *me = (NMXAMDFB *)target;
+        IOPowerStateChangeNotification *note = (IOPowerStateChangeNotification *)arg;
+        if ((type == kIOMessageCanSystemSleep || type == kIOMessageSystemWillSleep) && note) note->returnValue = 0;
+        /* WillPowerOn as well: HasPoweredOn did not arrive in the 2026-11-04 test (NMXPowerKeep) */
+        if ((type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn) && me->fWakeLate && !me->fStopping) {
+            uint64_t d;
+            clock_interval_to_deadline(3, kSecondScale, &d);
+            thread_call_enter_delayed(me->fWakeLate, d);
+        }
+        return kIOReturnSuccess;
+    }
+    void setupWakeWork() {
+        if (PE_parse_boot_argn("-nmxfbwakeoff", nullptr, 0)) { FBLOG("-nmxfbwakeoff: no paging wake"); return; }
+        /* IOGraphics' _extEntry sleeps on this+0x188 (fServerConnect) in its binary: the SDK header must agree */
+        if ((uintptr_t)&fServerConnect - (uintptr_t)this != 0x188) {
+            FBLOG("fServerConnect at +0x%lx, not 0x188: no paging wake", (unsigned long)((uintptr_t)&fServerConnect - (uintptr_t)this));
+            return;
+        }
+        IOWorkLoop *wl = getWorkLoop();
+        fWakeGate = IOCommandGate::commandGate(this);
+        if (fWakeGate && (!wl || wl->addEventSource(fWakeGate) != kIOReturnSuccess)) OSSafeReleaseNULL(fWakeGate);
+        fWakeLate = thread_call_allocate(wakeLateFire, this);
+        fSleepTap = addFramebufferNotification(&sleepTap, this, nullptr);
+        fSysNote = registerPrioritySleepWakeInterest(&sysPower, this, nullptr);
+        if (!fWakeGate || !fWakeLate || !fSleepTap) {
+            FBLOG("paging wake setup failed (gate %d call %d tap %d)", fWakeGate != nullptr, fWakeLate != nullptr,
+                  fSleepTap != nullptr);
+            teardownWakeWork();
+            return;
+        }
+        setProperty("NMXPagingWake", kOSBooleanTrue);
+    }
+    void teardownWakeWork() {
+        if (fSysNote) { fSysNote->remove(); fSysNote = nullptr; }
+        if (fSleepTap) { fSleepTap->remove(); fSleepTap = nullptr; }
+        if (fWakeLate) {
+            thread_call_cancel(fWakeLate);
+            while (!thread_call_free(fWakeLate)) { thread_call_cancel(fWakeLate); IOSleep(1); }
+            fWakeLate = nullptr;
+        }
+        if (fWakeGate) {
+            if (IOWorkLoop *wl = getWorkLoop()) wl->removeEventSource(fWakeGate);
+            OSSafeReleaseNULL(fWakeGate);
+        }
+    }
+    void publishBacklight() {
+        if (PE_parse_boot_argn("-nmxbloff", nullptr, 0)) { FBLOG("-nmxbloff: no backlight"); return; }
+        fBacklight = NMXFBBacklight::withFramebuffer(this);
+        if (!fBacklight) { FBLOG("backlight handler allocation failed"); return; }
+        fBacklight->setName("backlight");
+        if (!fBacklight->attach(this)) { FBLOG("backlight handler attach failed"); OSSafeReleaseNULL(fBacklight); return; }
+        fBacklight->registerService(kIOServiceSynchronous);
+        fLcd = true;
+        setProperty("Backlight,Initial", (UInt32)fBacklight->level(), 32);
+        FBLOG("backlight handler published (amdgpu DC, initial %d%%), panel sense LCD", (int)fBacklight->level());
+    }
 
     /* ga403wm b15: WindowServer only said "Failed to submit transaction: IOPRESENTMENT_METHOD_FAILURE:
      * IOReturn 0x2d8" (kIOReturnNotReady) for the OLED, which names neither the call nor the stage. Say which of
@@ -137,6 +345,9 @@ public:
         if (internalPanel && !foreign && !owned)
             FBLOG("internal panel is neither owned nor foreign (NMXOwnsDisplay false): no controller group, no display pipe");
         if (!IOFramebuffer::start(provider)) return false;
+        /* before registerService (nmx_fb_publish): the backlight child must exist at the framebuffer's first open */
+        if (internalPanel) publishBacklight();
+        setupWakeWork();
         setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
         if (fDisplay.edid_size) setProperty("NMXEDIDSource", "drm-connector");
@@ -155,6 +366,13 @@ public:
 
     void stop(IOService *provider) override {
         fStopping = true;
+        fLcd = false;
+        teardownWakeWork();
+        if (fBacklight) {
+            fBacklight->quiesce();
+            fBacklight->detach(this);
+            OSSafeReleaseNULL(fBacklight);
+        }
         /* thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out */
         if (fVblTimer) {
             thread_call_cancel(fVblTimer);
@@ -308,7 +526,19 @@ public:
     /* power acknowledged at once; left to IOFramebuffer it waits on a shared thread (seen with NVRMFB) */
     IOReturn setPowerState(unsigned long ordinal, IOService *) override {
         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        if (ordinal) wakeWork("framebuffer power-on");
         return kIOPMAckImplied;
+    }
+    IOReturn getAppleSense(IOIndex idx, UInt32 *senseType, UInt32 *primary, UInt32 *extended,
+                           UInt32 *displayType) override {
+        if (idx == 0 && fLcd) {
+            if (senseType) *senseType = 0;
+            if (primary) *primary = 0;
+            if (extended) *extended = 0;
+            if (displayType) *displayType = kGenericLCD;
+            return kIOReturnSuccess;
+        }
+        return IOFramebuffer::getAppleSense(idx, senseType, primary, extended, displayType);
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         if (attribute == kIOWindowServerActiveAttribute) { trace("setAttribute wsrv", value); return kIOReturnSuccess; }

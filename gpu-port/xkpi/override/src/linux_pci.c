@@ -2460,6 +2460,32 @@ linux_backlight_device_register(const char *name, struct device *dev,
 	return (dev->bd);
 }
 
+/*
+ * ga403wm Step130: the panel brightness for the macOS framebuffer (xnu/nmx_fb.cpp), in percent, through amdgpu's own
+ * backlight ops (amdgpu_dm_backlight_update_status -> DC, AUX nits on the OLED). Replaces the NMXBacklight kext,
+ * which called these by address and went inert on every rebuild. -ENODEV until amdgpu registered the panel.
+ */
+int nmx_backlight_percent(int set, unsigned *pct);
+int
+nmx_backlight_percent(int set, unsigned *pct)
+{
+	struct backlight_props p;
+	device_t dev = NULL;
+	int r;
+
+	if (pct == NULL || nmx_backlight_next(NULL, &dev) == NULL || dev == NULL)
+		return (-ENODEV);
+	memset(&p, 0, sizeof(p));
+	if (!set) {
+		r = linux_backlight_get_status(dev, &p);
+		if (r == 0)
+			*pct = p.brightness;
+		return (r);
+	}
+	p.brightness = *pct > 100 ? 100 : *pct;
+	return (linux_backlight_update_status(dev, &p));
+}
+
 void
 linux_backlight_device_unregister(struct backlight_device *bd)
 {

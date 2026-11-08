@@ -27,6 +27,9 @@
 #include "nmx_port.h"
 #include "nmx_xnu.h"
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPM.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 
 #define AMD_VENDOR 0x1002
 #define INTEL_VENDOR 0x8086
@@ -344,11 +347,118 @@ static void nmx_beat_start()
         thread_call_enter(g_beat_call);
 }
 
+/*
+ * ga403wm Step130 (was the NMXPowerKeep personality of the NMXBacklight kext, Step106): keeps NMXGPU powered while the
+ * system is awake. NMXGPU registers two power states but never asks for one itself, so its state follows its
+ * children: when display sleep takes the framebuffer down, NMXGPU dropped to 0 and ran a full amdgpu suspend under
+ * WindowServer and NMXAccel (the 2026-10-17 hang). This child of NMXGPU asks for state 1, which needs NMXGPU's
+ * kIOPMPowerOn, so display sleep is the framebuffer's own DPMS off/on only. On system sleep the power domain goes down
+ * from the top and this child follows it to 0 as any device does. -nmxkeepoff leaves it out; nmxkeep_dsleep=0 keeps
+ * the logging but lets display sleep suspend NMXGPU. It also logs the system sleep/wake timeline.
+ */
+class NMXPowerKeep : public IOService {
+    OSDeclareDefaultStructors(NMXPowerKeep)
+    bool pm_ = false;
+    UInt32 changes_ = 0, sleeps_ = 0, wakes_ = 0;
+    uint64_t tSleep_ = 0;
+    IONotifier *sysNote_ = nullptr;
+    static IOReturn sysPower(void *target, void *, UInt32 type, IOService *, void *arg, vm_size_t);
+public:
+    bool start(IOService *provider) override;
+    void stop(IOService *provider) override;
+    IOReturn setPowerState(unsigned long state, IOService *device) override;
+};
+OSDefineMetaClassAndStructors(NMXPowerKeep, IOService)
+
+bool NMXPowerKeep::start(IOService *provider)
+{
+    if (!IOService::start(provider))
+        return false;
+    static IOPMPowerState states[2] = {
+        { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    PMinit();
+    provider->joinPMtree(this);
+    if (registerPowerDriver(this, states, 2) != kIOReturnSuccess) {
+        IOLog("NMXPowerKeep: registerPowerDriver failed, inert\n");
+        PMstop();
+        return false;
+    }
+    pm_ = true;
+    UInt32 hold = 1;
+    PE_parse_boot_argn("nmxkeep_dsleep", &hold, sizeof hold);
+    if (hold)
+        changePowerStateTo(1);
+    setProperty("PowerKeep,Wanted", (unsigned long long)(hold ? 1 : 0), 32);
+    sysNote_ = registerPrioritySleepWakeInterest(&NMXPowerKeep::sysPower, this, nullptr);
+    setProperty("PowerKeep,SysSleeps", 0ULL, 32);
+    IOLog("NMXPowerKeep: %s %s while the system is awake; sleep/wake interest %s\n", hold ? "holding" : "NOT holding",
+          provider->getName(), sysNote_ ? "on" : "FAILED");
+    registerService();
+    return true;
+}
+
+void NMXPowerKeep::stop(IOService *provider)
+{
+    if (sysNote_) { sysNote_->remove(); sysNote_ = nullptr; }
+    if (pm_)
+        PMstop();
+    pm_ = false;
+    IOService::stop(provider);
+}
+
+IOReturn NMXPowerKeep::setPowerState(unsigned long state, IOService *)
+{
+    UInt32 n = ++changes_;
+    setProperty("PowerKeep,State", (unsigned long long)state, 32);
+    setProperty("PowerKeep,Changes", n, 32);
+    if (n <= 64)
+        IOLog("NMXPowerKeep: power state %lu (change %u)\n", state, (unsigned)n);
+    return kIOPMAckImplied;
+}
+
+IOReturn NMXPowerKeep::sysPower(void *target, void *, UInt32 type, IOService *, void *arg, vm_size_t)
+{
+    NMXPowerKeep *me = static_cast<NMXPowerKeep *>(target);
+    IOPowerStateChangeNotification *note = static_cast<IOPowerStateChangeNotification *>(arg);
+    uint64_t now = mach_absolute_time(), ns = 0;
+    switch (type) {
+    case kIOMessageCanSystemSleep:
+        if (note) note->returnValue = 0;
+        break;
+    case kIOMessageSystemWillSleep:
+        me->tSleep_ = now;
+        me->sleeps_++;
+        me->setProperty("PowerKeep,SysSleeps", me->sleeps_, 32);
+        IOLog("NMXPowerKeep: system will sleep (#%u), keep state %u\n", (unsigned)me->sleeps_,
+              (unsigned)me->getPowerState());
+        if (note) note->returnValue = 0;
+        break;
+    case kIOMessageSystemWillPowerOn:
+        if (me->tSleep_) absolutetime_to_nanoseconds(now - me->tSleep_, &ns);
+        IOLog("NMXPowerKeep: system will power on, %llu ms after will-sleep\n", ns / 1000000);
+        break;
+    case kIOMessageSystemHasPoweredOn:
+        me->wakes_++;
+        if (me->tSleep_) absolutetime_to_nanoseconds(now - me->tSleep_, &ns);
+        me->setProperty("PowerKeep,SysWakes", me->wakes_, 32);
+        me->setProperty("PowerKeep,LastWakeMs", ns / 1000000, 64);
+        IOLog("NMXPowerKeep: system has powered on (#%u), %llu ms after will-sleep, keep state %u\n",
+              (unsigned)me->wakes_, ns / 1000000, (unsigned)me->getPowerState());
+        break;
+    default:
+        break;
+    }
+    return kIOReturnSuccess;
+}
+
 class NMXGPU : public IOService {
     OSDeclareDefaultStructors(NMXGPU)
     void *dev_;
     IOService *fb_;
     IOPCIDevice *pci_;
+    NMXPowerKeep *keep_;
     volatile int attach_;   /* 0 = attach pending on its thread, 1 = attached, -1 = not attached */
     bool pm_;
     volatile SInt32 hold_;          /* 1 while the boot hold keeps this service busy */
@@ -433,6 +543,7 @@ bool NMXGPU::start(IOService *provider)
     pci_ = pci;
     dev_ = nullptr;
     fb_ = nullptr;
+    keep_ = nullptr;
     pm_ = false;
     hold_ = 0;
     holdT0_ = 0;
@@ -539,6 +650,15 @@ void NMXGPU::attachNow()
     registerPowerDriver(this, states, 2);
     pm_ = true;
     registerService();
+    if (PE_parse_boot_argn("-nmxkeepoff", nullptr, 0)) {
+        IOLog("NMXPowerKeep: -nmxkeepoff, not started\n");
+    } else if ((keep_ = OSTypeAlloc(NMXPowerKeep)) != nullptr) {
+        if (!keep_->init() || !keep_->attach(this) || !keep_->start(this)) {
+            IOLog("NMXPowerKeep: start failed\n");
+            if (keep_->getProvider() != nullptr) keep_->detach(this);
+            OSSafeReleaseNULL(keep_);
+        }
+    }
     /* NMXAccel (the Metal accelerator for this GPU) starts only on a device this driver has claimed; it declined while
        the claim was pending, so matching on the device runs again now that it is set */
     pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
@@ -565,6 +685,11 @@ void NMXGPU::stop(IOService *provider)
     if (fb_ != nullptr)
         nmx_fb_unpublish(fb_, this, dev_);
     fb_ = nullptr;
+    if (keep_ != nullptr) {
+        keep_->stop(this);
+        keep_->detach(this);
+        OSSafeReleaseNULL(keep_);
+    }
     if (pm_)
         PMstop();
     pm_ = false;
