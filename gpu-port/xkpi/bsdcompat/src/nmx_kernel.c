@@ -283,6 +283,9 @@ static void nmx_thread_recycle(struct nmx_thread_rec *r, uint64_t tid)
     struct task_struct *ts = r->td.td_lkpi_task;
     r->td.td_lkpi_task = NULL;
     r->td.td_proc = p;
+    /* ga403wm Step134: td_name is the Linux task's comm (linux_current.c); left empty, amdgpu's VM fault print named
+     * no process ("in process  pid N"), which hid the 15:17 PERMISSION_FAULTS writer */
+    strlcpy(r->td.td_name, p->p_comm, sizeof(r->td.td_name));
     r->td.td_tid = (int)(tid & 0x7fffffff);
     r->td.td_xnu_tid = tid;
     r->td.td_pinned = 0;
@@ -334,6 +337,7 @@ static struct thread *nmx_thread_get(int transient, int *created)
             panic("NullMoth xkpi: no memory for a thread record");
     }
     nr->td.td_proc = nmx_curproc();
+    strlcpy(nr->td.td_name, nr->td.td_proc->p_comm, sizeof(nr->td.td_name));   /* Step134: the task's comm */
     nr->td.td_tid = (int)(tid & 0x7fffffff);
     nr->td.td_xnu_tid = tid;
     nr->td.td_priority = PZERO;
