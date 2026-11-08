@@ -33,7 +33,17 @@ MALLOC_DEFINE(M_NMXPAGE, "nmxpage", "page records");
 #define REG_BUCKETS 65536                  /* page registry hash: page frame number -> struct vm_page */
 #define DMA32_LIMIT 0xffffffffULL
 
-enum backing_kind { BK_CHUNK = 1, BK_RUN = 2, BK_FICTITIOUS = 3 };
+enum backing_kind { BK_CHUNK = 1, BK_RUN = 2, BK_FICTITIOUS = 3, BK_USER = 4 };
+
+/*
+ * ga403wm Step138: a record made for a pinned user page (BK_USER) lives only while the page is pinned or referenced.
+ * Before, every user page ever pinned got a permanent fictitious record (backing + vm_page + registry entry, ~300 B):
+ * after an evening of video the registry held millions of them (kalloc var4.256 ~810 MB wired and growing) and every
+ * import walked ever longer hash chains (73 of 87 import samples in reg_find_locked). A BK_USER record is freed when
+ * its last reference goes and no pin is left on it. If any other path reaches the same page (PHYS_TO_VM_PAGE,
+ * virt_to_page), it may keep the pointer without a reference, so the record turns permanent (BK_FICTITIOUS) as before.
+ */
+volatile long long gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 
 struct backing {
     int kind;
@@ -266,7 +276,7 @@ vm_page_t vm_page_alloc_noobj_contig(int req, u_long npages, vm_paddr_t low, vm_
 void vm_page_free(vm_page_t m)
 {
     struct backing *bk = m->nmx_alloc;
-    if (bk == NULL || bk->kind == BK_FICTITIOUS)
+    if (bk == NULL || bk->kind == BK_FICTITIOUS || bk->kind == BK_USER)   /* BK_USER: page_unref frees it */
         return;
     lck_spin_lock(pg_lock);
     pages_live--;
@@ -345,6 +355,52 @@ static struct user_pin *page_pop_pin(vm_page_t m)
     return pin;
 }
 
+static bool page_unref(vm_page_t m);
+
+/* the record for a pinned user page, with one more reference; a new one is a BK_USER record (Step138) */
+static vm_page_t user_page_get(vm_paddr_t pa)
+{
+    vm_paddr_t pfn = pa >> PAGE_SHIFT;
+    lck_spin_t *l = reg_lock_of(pfn);
+    lck_spin_lock(l);
+    struct vm_page *m = reg_find_locked(pfn);
+    if (m != NULL)
+        __atomic_add_fetch(&m->ref_count, 1, __ATOMIC_SEQ_CST);
+    lck_spin_unlock(l);
+    if (m != NULL)
+        return m;
+    struct backing *bk = malloc(sizeof(*bk) + sizeof(struct vm_page), M_NMXPAGE, M_WAITOK | M_ZERO);
+    struct reg_entry *e = malloc(sizeof(*e), M_NMXPAGE, M_WAITOK);
+    if (bk == NULL || e == NULL) {
+        free(bk, M_NMXPAGE);
+        free(e, M_NMXPAGE);
+        return NULL;
+    }
+    bk->kind = BK_USER;
+    bk->npages = 1;
+    page_record_init(&bk->pages[0], bk, pfn << PAGE_SHIFT, NULL);
+    bk->pages[0].flags = PG_FICTITIOUS;
+    bk->pages[0].ref_count = 1;
+    lck_spin_lock(l);
+    m = reg_find_locked(pfn);
+    if (m == NULL) {
+        reg_insert_locked(&bk->pages[0], e);
+        m = &bk->pages[0];
+        bk = NULL;
+        e = NULL;
+    } else {
+        __atomic_add_fetch(&m->ref_count, 1, __ATOMIC_SEQ_CST);
+    }
+    lck_spin_unlock(l);
+    if (bk == NULL) {
+        __atomic_add_fetch(&gNmxUserRecLive, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&gNmxUserRecMade, 1, __ATOMIC_RELAXED);
+    }
+    free(bk, M_NMXPAGE);
+    free(e, M_NMXPAGE);
+    return m;
+}
+
 int nmx_user_pages_pin(void *mm, uintptr_t start, int npages, int write, vm_page_t *pages)
 {
     if (npages <= 0)
@@ -362,14 +418,15 @@ int nmx_user_pages_pin(void *mm, uintptr_t start, int npages, int write, vm_page
     if (err != 0)
         goto fail;
     for (i = 0; i < npages; i++) {
-        pages[i] = nmx_phys_to_page(phys[i]);
+        pages[i] = user_page_get(phys[i]);
         if (pages[i] == NULL) {
-            /* no record could be made: give back the pins already placed, then the wiring */
-            pin->remaining = (u_int)i + 1;
-            for (int k = 0; k < i; k++) {
-                __atomic_sub_fetch(&pages[k]->ref_count, 1, __ATOMIC_SEQ_CST);
-                pin_put(page_pop_pin(pages[k]));
-            }
+            /*
+             * no record could be made: drop the references taken so far (no pin entry is on any page yet, so none is
+             * popped: a page's list may hold other requests' pins), then release the wiring
+             */
+            for (int k = 0; k < i; k++)
+                (void)page_unref(pages[k]);
+            pin->remaining = 1;
             pin_put(pin);
             pin = NULL;
             for (int k = i; k < npages; k++)
@@ -386,8 +443,7 @@ int nmx_user_pages_pin(void *mm, uintptr_t start, int npages, int write, vm_page
         lck_spin_lock(l);
         refs[i]->next = pages[i]->nmx_pins;
         pages[i]->nmx_pins = refs[i];
-        lck_spin_unlock(l);
-        vm_page_wire(pages[i]);
+        lck_spin_unlock(l);                     /* the reference was taken by user_page_get */
     }
     free(refs, M_NMXPAGE);
     free(phys, M_NMXPAGE);
@@ -402,6 +458,34 @@ fail:
     return -err;
 }
 
+/* drops one reference of a page; a BK_USER record goes once nothing holds it (see Step138 above). True: caller frees */
+static bool page_unref(vm_page_t m)
+{
+    struct backing *bk = m->nmx_alloc;
+    if (bk == NULL || bk->kind != BK_USER)
+        return __atomic_sub_fetch(&m->ref_count, 1, __ATOMIC_SEQ_CST) == 0 && m->object == NULL;
+    vm_paddr_t pfn = m->phys_addr >> PAGE_SHIFT;
+    lck_spin_t *l = reg_lock_of(pfn);
+    struct reg_entry *e = NULL;
+    lck_spin_lock(l);
+    u_int left = __atomic_sub_fetch(&m->ref_count, 1, __ATOMIC_SEQ_CST);
+    if (left == 0 && m->nmx_pins == NULL && bk->kind == BK_USER) {
+        e = reg_remove_locked(pfn);
+        if (e != NULL && e->m != m) {               /* not ours: put it back and keep the record */
+            reg_insert_locked(e->m, e);
+            e = NULL;
+        }
+    }
+    lck_spin_unlock(l);
+    if (e != NULL) {
+        free(e, M_NMXPAGE);
+        free(bk, M_NMXPAGE);
+        __atomic_sub_fetch(&gNmxUserRecLive, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&gNmxUserRecFreed, 1, __ATOMIC_RELAXED);
+    }
+    return false;
+}
+
 bool vm_page_unwire_noq(vm_page_t m)
 {
     /* a pinned user page: this put releases one pin (see nmx_user_pages_pin) */
@@ -410,7 +494,7 @@ bool vm_page_unwire_noq(vm_page_t m)
         if (pin != NULL)
             pin_put(pin);
     }
-    return __atomic_sub_fetch(&m->ref_count, 1, __ATOMIC_SEQ_CST) == 0 && m->object == NULL;
+    return page_unref(m);
 }
 
 void vm_page_unwire(vm_page_t m, uint8_t queue)
@@ -550,6 +634,12 @@ vm_page_t nmx_phys_to_page(vm_paddr_t pa)
     lck_spin_t *l = reg_lock_of(pfn);
     lck_spin_lock(l);
     struct vm_page *m = reg_find_locked(pfn);
+    if (m != NULL && m->nmx_alloc != NULL && ((struct backing *)m->nmx_alloc)->kind == BK_USER) {
+        /* reached without a reference: the caller may keep it, so it can no longer be freed (Step138) */
+        ((struct backing *)m->nmx_alloc)->kind = BK_FICTITIOUS;
+        __atomic_sub_fetch(&gNmxUserRecLive, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&gNmxUserRecKept, 1, __ATOMIC_RELAXED);
+    }
     lck_spin_unlock(l);
     if (m)
         return m;

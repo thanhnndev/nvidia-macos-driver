@@ -198,6 +198,11 @@ NMX_CNT(nmx_pin_other_fail, gNmxPinOtherFail, "Step132b: failed first writable w
 NMX_CNT(nmx_pin_other_rc, gNmxPinOtherRc, "Step132b: IOReturn of the last of those");
 extern "C" volatile SInt64 gNmxSurfHint, gNmxSurfWire, gNmxSurfMiss, gNmxSurfBadPage, gNmxSurfNoSurf, gNmxSurfShort,
     gNmxSurfPrepFail;
+extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
+NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
+NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
+NMX_CNT(nmx_userrec_freed, gNmxUserRecFreed, "Step138: user page records freed after their last unpin");
+NMX_CNT(nmx_userrec_kept, gNmxUserRecKept, "Step138: user page records made permanent (reached by another path)");
 NMX_CNT(nmx_surf_hint, gNmxSurfHint, "Step137: IOSurface hints for a userptr range (DRM_AMDGPU_NMX_SURFACE_HINT)");
 NMX_CNT(nmx_surf_wire, gNmxSurfWire, "Step137: userptr imports that pinned the IOSurface's own memory");
 NMX_CNT(nmx_surf_miss, gNmxSurfMiss, "Step137: hinted imports that fell back to the plain user wire");
@@ -254,6 +259,10 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_fail);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_rc);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_name);
+    sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
+    sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
+    sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);
+    sysctl_register_oid(&sysctl__debug_nmx_userrec_kept);
     sysctl_register_oid(&sysctl__debug_nmx_surf_hint);
     sysctl_register_oid(&sysctl__debug_nmx_surf_wire);
     sysctl_register_oid(&sysctl__debug_nmx_surf_miss);
