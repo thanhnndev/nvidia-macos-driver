@@ -140,6 +140,7 @@ class NMXAMDFB : public IOFramebuffer {
     unsigned fTraceN = 0;
     unsigned fNotReadyN = 0;    // 'scanout NOT READY' repeats every poll: counted apart so it cannot eat the trace cap
     NMXFBBacklight *fBacklight = nullptr;
+    bool fInternalPanel = false;
     bool fLcd = false;          // getAppleSense says LCD for connection 0 (the backlight handler is published)
 
     /*
@@ -240,17 +241,29 @@ class NMXAMDFB : public IOFramebuffer {
             OSSafeReleaseNULL(fWakeGate);
         }
     }
+public:
+    /*
+     * ga403wm Step130c: called by nmx_fb_publish() AFTER this framebuffer's registerService(), not from start(). In
+     * start() the child's synchronous registerService ran before the framebuffer was published (and before
+     * NMXScanoutBridgeVersion was set): NMXAccel's fbPublished never armed the display pipe and both Step130 boots
+     * had a black panel (-nmxbloff gave the picture back). The old NMXBacklight kext attached at this same point (it
+     * matched the published NMXAMDFB) and its slider worked: IOGraphics looks for the child at the first open, which
+     * is WindowServer's, seconds later.
+     */
     void publishBacklight() {
+        if (!fInternalPanel || fStopping || fBacklight) return;
         if (PE_parse_boot_argn("-nmxbloff", nullptr, 0)) { FBLOG("-nmxbloff: no backlight"); return; }
         fBacklight = NMXFBBacklight::withFramebuffer(this);
         if (!fBacklight) { FBLOG("backlight handler allocation failed"); return; }
         fBacklight->setName("backlight");
         if (!fBacklight->attach(this)) { FBLOG("backlight handler attach failed"); OSSafeReleaseNULL(fBacklight); return; }
-        fBacklight->registerService(kIOServiceSynchronous);
-        fLcd = true;
+        fLcd = true;    /* before the child is visible: the open that finds it must also see LCD */
+        fBacklight->registerService();
         setProperty("Backlight,Initial", (UInt32)fBacklight->level(), 32);
-        FBLOG("backlight handler published (amdgpu DC, initial %d%%), panel sense LCD", (int)fBacklight->level());
+        FBLOG("backlight handler published after the framebuffer (amdgpu DC, initial %d%%), panel sense LCD",
+              (int)fBacklight->level());
     }
+private:
 
     /* ga403wm b15: WindowServer only said "Failed to submit transaction: IOPRESENTMENT_METHOD_FAILURE:
      * IOReturn 0x2d8" (kIOReturnNotReady) for the OLED, which names neither the call nor the stage. Say which of
@@ -345,10 +358,9 @@ public:
         if (internalPanel && !foreign && !owned)
             FBLOG("internal panel is neither owned nor foreign (NMXOwnsDisplay false): no controller group, no display pipe");
         if (!IOFramebuffer::start(provider)) return false;
-        /* before registerService (nmx_fb_publish): the backlight child must exist at the framebuffer's first open */
-        if (internalPanel) publishBacklight();
-        setupWakeWork();
         setProperty("NMXScanoutBridgeVersion", 1ULL, 32);
+        fInternalPanel = internalPanel;
+        setupWakeWork();
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
         if (fDisplay.edid_size) setProperty("NMXEDIDSource", "drm-connector");
         fVblTimer = thread_call_allocate(vblFire, this);
@@ -615,6 +627,7 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev)
         return nullptr;
     }
     fb->registerService();
+    fb->publishBacklight();
     return fb;
 }
 
