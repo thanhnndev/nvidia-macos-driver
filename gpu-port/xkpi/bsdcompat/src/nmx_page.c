@@ -426,11 +426,12 @@ int nmx_user_pages_pin(void *mm, uintptr_t start, int npages, int write, vm_page
              * popped: a page's list may hold other requests' pins), then release the wiring
              */
             for (int k = 0; k < i; k++)
-                (void)page_unref(pages[k]);
+                if (page_unref(pages[k]))
+                    vm_page_free(pages[k]);
             pin->remaining = 1;
             pin_put(pin);
             pin = NULL;
-            for (int k = i; k < npages; k++)
+            for (int k = 0; k < npages; k++)  /* none was pushed yet */
                 free(refs[k], M_NMXPAGE);
             free(refs, M_NMXPAGE);
             free(phys, M_NMXPAGE);
