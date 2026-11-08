@@ -805,14 +805,15 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 // wrapper was a private image filled on the CPU, a submit and a wait per copy: ~400 copies and ~600 MB/s in Photo Booth
 // at 30 fps (docs/890M-TRACE.md). A wrapper whose descriptor allows writes (RenderTarget, ShaderWrite or Unknown) also
 // copies its rows back at the end of each command buffer; a read-only one never touches the surface.
-// Off in WindowServer until it has run there (it composites video planes of every app; NVMTL_PLANE_HOST=1 turns it on
-// in any process, NVMTL_PLANE_HOST=0 or NVMTL_NO_PLANE_HOST=1 keeps the private images).
+// On in WindowServer too (2026-11-08): it composites every app's video planes, and with private images each 1080p60
+// NV12 frame was two CPU uploads (G13 surface-in, ~118 a second) with a submit and a wait each on its main thread,
+// WindowServer ~66 % CPU for one local VP9 clip in Chrome. A compositor wrapper only reads, so the import is read-only
+// and nothing is written back. NVMTL_PLANE_HOST=0 or NVMTL_NO_PLANE_HOST=1 keeps the private images.
 static int nvmtl_plane_host_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_PLANE_HOST"), *me = getprogname();
-                  const int ws = me && !strcmp(me, "WindowServer");
+    if (on < 0) { const char *e = getenv("NVMTL_PLANE_HOST");
                   on = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST") && !getenv("NVMTL_NO_PLANE_HOST")
-                       && (e ? e[0] == '1' : !ws);
+                       && (e ? e[0] == '1' : 1);
                   nvlog("surface planes: %s", on ? "host import of the surface's own pages, shadowed on the GPU (NVMTL_NO_PLANE_HOST=1: private copies)"
                                                    : "private images copied in and out"); }
     return on;
