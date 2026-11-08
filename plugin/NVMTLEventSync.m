@@ -101,8 +101,20 @@ static BOOL nvmtl_nmx_fence_on(void) {
     }
     if (!ws) return NO;
     if (ws == 2) return YES;
-    int v = 0; size_t n = sizeof v;
-    const BOOL on = sysctlbyname("debug.nmxaccel_fence_wait", &v, &n, NULL, 0) == 0 && v == 1;
+    // Called on every commit (WindowServer: every frame). The sysctl is a runtime toggle, so re-read it at most once a
+    // second instead of on each commit (it was ~1 % of WindowServer's main thread in __sysctl).
+    static _Atomic int cachedOn = -1;
+    static _Atomic uint64_t nextRead;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    BOOL on;
+    if (cachedOn >= 0 && now < nextRead) {
+        on = cachedOn == 1;
+    } else {
+        int v = 0; size_t n = sizeof v;
+        on = sysctlbyname("debug.nmxaccel_fence_wait", &v, &n, NULL, 0) == 0 && v == 1;
+        cachedOn = on ? 1 : 0;
+        nextRead = now + 1000000000ull;   // 1 s
+    }
     static int said = -1;
     if (said != on) { said = on;
         nvlog("commit: fence-ordered swap %s (debug.nmxaccel_fence_wait %s, NVMTL_NMX_FENCE=%s)",

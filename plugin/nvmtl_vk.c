@@ -6130,6 +6130,39 @@ static void nvmtl_bo_list_census(void)
         if ((k & 0x3fff) == 0x1000 && g_sl_breakdown) { char bl[1600]; g_sl_breakdown(g_dev, bl, sizeof bl); nvlog("vk: BO list: %s", bl); }
     }
 }
+// Submit fences are reused. Creating one per submit cost a DRM syncobj create + destroy ioctl pair on every
+// commit (WindowServer: every frame, ~1.3 % of its main thread in vk_drm_syncobj_init). A fence goes back to the pool
+// only after a successful wait and reset, so a pooled fence is always unsignaled and owned by nobody. g_dev lives for
+// the whole process, so pooled fences never outlive their device. NVMTL_FENCE_POOL=0 restores create/destroy.
+#define NVMTL_FENCE_POOL_MAX 32
+static pthread_mutex_t g_fence_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static VkFence g_fence_pool[NVMTL_FENCE_POOL_MAX]; static unsigned g_fence_pool_n;
+static int nvmtl_fence_pool_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_FENCE_POOL"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static VkResult nvmtl_fence_get(VkFence *out) {
+    if (nvmtl_fence_pool_on()) {
+        pthread_mutex_lock(&g_fence_pool_lock);
+        const VkFence f = g_fence_pool_n ? g_fence_pool[--g_fence_pool_n] : VK_NULL_HANDLE;
+        pthread_mutex_unlock(&g_fence_pool_lock);
+        if (f) { *out = f; return VK_SUCCESS; }
+    }
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    return pvkCreateFence(g_dev, &fci, NULL, out);
+}
+// Only for a fence whose wait returned VK_SUCCESS.
+static void nvmtl_fence_put(VkFence f) {
+    if (nvmtl_fence_pool_on() && pvkResetFences(g_dev, 1, &f) == VK_SUCCESS) {
+        pthread_mutex_lock(&g_fence_pool_lock);
+        const int kept = g_fence_pool_n < NVMTL_FENCE_POOL_MAX;
+        if (kept) g_fence_pool[g_fence_pool_n++] = f;
+        pthread_mutex_unlock(&g_fence_pool_lock);
+        if (kept) return;
+    }
+    pvkDestroyFence(g_dev, f, NULL);
+}
 int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
 {
     nvmtl_bo_list_census();
@@ -6154,8 +6187,8 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     VkResult result = pvkEndCommandBuffer(c->cb);
     const uint64_t sB = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
-    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; VkFence fence;
-    result = pvkCreateFence(g_dev, &fci, NULL, &fence);
+    VkFence fence;
+    result = nvmtl_fence_get(&fence);
     const uint64_t sC = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
     nvmtl_prologue *const pre = &f->pre;
@@ -6261,7 +6294,7 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
         }
         pvkDestroyQueryPool(g_dev, (VkQueryPool)c->pt_pool, NULL); c->pt_pool = NULL; c->pt_n = 0;
     }
-    pvkDestroyFence(g_dev, fence, NULL);
+    nvmtl_fence_put(fence);
     if (c->nsets > g_peak_sets) { g_peak_sets = c->nsets; nvlog("vk: commit high-water: %u descriptor sets = %u draws in one command buffer (%u pools open)", c->nsets, c->nsets / 2, g_ndescPools); }
     if (c->nfb > g_peak_fbs) g_peak_fbs = c->nfb;
     if (c->skipped) nvlog("vk: commit with %u draws/dispatches SKIPPED (no descriptor set could be allocated)", c->skipped);
