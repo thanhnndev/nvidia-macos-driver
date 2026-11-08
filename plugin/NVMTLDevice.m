@@ -869,20 +869,28 @@ static void nvmtl_prefault_write(uintptr_t base, size_t span) {
 struct nvmtl_surf_hint_args { uint64_t addr, size; uint32_t surface_id, pad; };
 #define NVMTL_DRM_IOCTL_SURF_HINT _IOW('d', 0x40 + 0x5e, struct nvmtl_surf_hint_args)
 static unsigned long long g_surf_hint_ok, g_surf_hint_fail;
+// ga403wm video-lag: a browser GPU process's sandbox refuses /dev/dri, so the plain open() left the hint off there and
+// every decoded video frame took the per-page prefault (98 of 999 Chrome GPU main-thread samples, YouTube 1080p60).
+// The node is opened and the hint sent through the same wrappers RADV uses (nvmtl_drm_xnu.h, below): the real node
+// where the sandbox allows it, else an NMXAccel NMDR connection whose ioctls run on the caller's thread, which is what
+// the kernel's per-task hint needs.
+static int nvmtl_drmx_w_open(const char *path, int flags, ...);
+static int nvmtl_drmx_w_ioctl(int fd, unsigned long cmd, ...);
+static int nvmtl_drmx_w_close(int fd);
 static int nvmtl_surface_hint(IOSurfaceRef surf, uintptr_t base, size_t span, int write) {
     static int fd = -2;
     if (fd == -2) {
         const char *e = getenv("NVMTL_SURF_HINT");
-        fd = (e && e[0] == '0') ? -1 : open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        fd = (e && e[0] == '0') ? -1 : nvmtl_drmx_w_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
         nvlog("surface hint: %s", fd >= 0 ? "on (NMXGPU pins the IOSurface's own memory)" : "off");
     }
     if (fd < 0 || !surf || !span) return -1;
     if (write) nvmtl_prefault_write(base, (size_t)getpagesize());   // the kernel's check wires this page for writing
     struct nvmtl_surf_hint_args a = { base, span, (uint32_t)IOSurfaceGetID(surf), 0 };
-    if (ioctl(fd, NVMTL_DRM_IOCTL_SURF_HINT, &a) != 0) {
+    if (nvmtl_drmx_w_ioctl(fd, NVMTL_DRM_IOCTL_SURF_HINT, &a) != 0) {
         int err = errno;
         if (++g_surf_hint_fail <= 4) nvlog("surface hint: refused (%s)%s", strerror(err), err == EINVAL || err == ENOTTY || err == ENOTSUP ? ", off for this process" : "");
-        if (err == EINVAL || err == ENOTTY || err == ENOTSUP) { close(fd); fd = -1; }
+        if (err == EINVAL || err == ENOTTY || err == ENOTSUP) { nvmtl_drmx_w_close(fd); fd = -1; }
         return -1;
     }
     if (++g_surf_hint_ok == 1 || g_surf_hint_ok % 5000 == 0) nvlog("surface hint: %llu imports hinted (%zu KB this one)", g_surf_hint_ok, span >> 10);
