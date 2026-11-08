@@ -773,7 +773,10 @@ static uint32_t flip_import(struct nmx_flipreq *r)
     for (i = 0; i < n; i++) {               /* runs of physically adjacent pages */
         len = 0;
         pa = nmx_xnu_md_phys(r->md, r->offset + i * PAGE_SIZE, &len);
-        if (!pa || (pa & PAGE_MASK))
+        /* ga403wm Step131: LinuxKPI's PAGE_MASK is Linux's ~(PAGE_SIZE - 1) in this file, so "pa & PAGE_MASK" was
+         * non-zero for every page and each import failed at page 0 (Step129/130: every frame took NMXAccel's CPU copy,
+         * ~100 fps x 20.7 MB). The cave build tested "pa & 4095". Test the in-page bits explicitly. */
+        if (!pa || (pa & (PAGE_SIZE - 1)))
             return flip_import_fail(r, m, "descriptor page", (int)i);
         if (i == 0 || pa != prev + PAGE_SIZE)
             runs++;
