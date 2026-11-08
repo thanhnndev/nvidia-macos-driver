@@ -839,7 +839,24 @@ static int nvmtl_span_writable(uintptr_t base, size_t span) {
     }
     return 1;
 }
-static unsigned long long g_surf_ro_maps;
+static unsigned long long g_surf_ro_maps, g_surf_prefault;
+// Fault every page of a writable span in for writing before a writable host import, without changing a byte (lock or
+// of 0). The kernel pins a userptr for writing only over resident, writable pages; a fresh IOSurface's untouched pages
+// failed that pin, the kernel retried it read-only (amdgpu userptr, fork Step96: `userptr_ro_retry -> 0`, dozens per
+// boot in WindowServer) and the GPU then wrote read-only PTEs: mediaanalysisd's own new 420f surface, 2026-11-08
+// 12:42:49, gfxhub PERMISSION_FAULTS, GFX ring hung 3 s. Only after nvmtl_span_writable said yes (a read-only page
+// would take SIGBUS here). NVMTL_PREFAULT=0 skips it.
+static void nvmtl_prefault_write(uintptr_t base, size_t span) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_PREFAULT"); on = !(e && e[0] == '0'); }
+    if (!on || !span) return;
+    const size_t pg = (size_t)getpagesize();
+    for (uintptr_t p = base & ~(uintptr_t)(pg - 1); p < base + span; p += pg)
+        __asm__ volatile("lock orb $0, (%0)" :: "r"(p) : "memory");
+    g_surf_prefault++;
+    if (g_surf_prefault == 1 || g_surf_prefault % 5000 == 0)
+        nvlog("surface prefault: %llu writable host imports faulted in for writing first (%zu KB this one)", g_surf_prefault, span >> 10);
+}
 static void nvmtl_surf_ro_log(IOSurfaceRef surf, NSUInteger plane, int rw) {
     g_surf_ro_maps++;
     static unsigned said; if (said++ < 8 || g_surf_ro_maps % 1000 == 0)
@@ -864,6 +881,7 @@ static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUIntege
                    (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, why, row, (size_t)(pb - base), alloc); return -1; }
     const size_t span = (alloc + al - 1) & ~(al - 1);
     if (!nvmtl_span_writable(base, span)) { nvmtl_surf_ro_log(surf, plane, rw); if (rw) return -1; }
+    else if (rw) nvmtl_prefault_write(base, span);
     nvk_buffer hb;
     if (nvmtl_vk_buffer_import_host((void *)base, span, &hb)) return -1;
     if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, rw && stex, rw, &hb, pb - base, row, &t->_i)) {
@@ -897,6 +915,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             // read-only mapping: a read-only wrapper still imports (read-only, never widened), a writable one goes on
             const int wr = nvmtl_span_writable((uintptr_t)base, span);
             if (!wr) nvmtl_surf_ro_log(surf, plane, rw);
+            else nvmtl_prefault_write((uintptr_t)base, span);   // this path's image is always writable
             nvk_buffer hb;
             if ((wr || !rw) && !nvmtl_vk_buffer_import_host(base, span, &hb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, wr ? stex : 0, wr, &hb, 0, row, &t->_i)) {
