@@ -1285,6 +1285,12 @@ void nvmtl_frame_stats_surfin(uint64_t ns, size_t bytes) {
         static unsigned nd; if (nd++ < 6 || nd % 5000 == 0) nvlog("surface-out -> dirty, no copy (%ux%u surface %u seed %u, #%u)", r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf), seed, nd);
         return YES;
     }
+    // a surface mapped read-only in this process (another process owns it): a CPU write-back would fault here
+    { const uintptr_t sb = (uintptr_t)IOSurfaceGetBaseAddress(r->_surf); const size_t sz = IOSurfaceGetAllocSize(r->_surf), pg = (size_t)getpagesize();
+      if (sb && sz && !nvmtl_span_writable(sb & ~(uintptr_t)(pg - 1), ((sb & (pg - 1)) + sz + pg - 1) & ~(pg - 1))) {
+          static unsigned said; if (said++ < 8) nvlog("surface-out: surface %u is mapped read-only in this process, write-back skipped",
+                                                      (unsigned)IOSurfaceGetID(r->_surf));
+          return NO; } }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     uint32_t lockopt = nvmtl_noseed() ? kIOSurfaceLockReadOnly : 0;
     if (IOSurfaceLock(r->_surf, lockopt, NULL) != kIOReturnSuccess) { nvlog("G13 surface-out: IOSurfaceLock FAILED"); return NO; }

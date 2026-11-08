@@ -10,6 +10,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -817,6 +818,33 @@ static int nvmtl_plane_host_on(void) {
     return on;
 }
 static unsigned long long g_plane_host, g_plane_host_ro;
+// Whether this process may write every page of [base, base + span). A surface another process owns can be mapped
+// read-only here (mediaanalysisd running Live Text on a Preview screenshot, 2026-11-07 23:18). The kernel then pins
+// those pages read-only for the GPU (amdgpu userptr, fork Step96: a write pin that fails is retried read-only), so a
+// writable wrapper over them made the GPU write read-only PTEs: gfxhub PERMISSION_FAULTS, a hung GFX ring, and
+// WindowServer's backend gave up after 5 s (its next screen capture aborted). NVMTL_SURF_RO_CHECK=0 skips the check.
+static int nvmtl_span_writable(uintptr_t base, size_t span) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_RO_CHECK"); on = !(e && e[0] == '0'); }
+    if (!on) return 1;
+    mach_vm_address_t a = base; const mach_vm_address_t end = base + span;
+    while (a < end) {
+        mach_vm_address_t ra = a; mach_vm_size_t rs = 0; vm_region_basic_info_data_64_t info; mach_port_t obj = MACH_PORT_NULL;
+        mach_msg_type_number_t n = VM_REGION_BASIC_INFO_COUNT_64;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &n, &obj) != KERN_SUCCESS) return 0;
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+        if (ra > a || !(info.protection & VM_PROT_WRITE)) return 0;   // a hole, or a page this process cannot write
+        a = ra + rs;
+    }
+    return 1;
+}
+static unsigned long long g_surf_ro_maps;
+static void nvmtl_surf_ro_log(IOSurfaceRef surf, NSUInteger plane, int rw) {
+    g_surf_ro_maps++;
+    static unsigned said; if (said++ < 8 || g_surf_ro_maps % 1000 == 0)
+        nvlog("surface %u plane %lu: mapping is read-only in this process, %s (%llu so far)", (unsigned)IOSurfaceGetID(surf),
+              (unsigned long)plane, rw ? "writable wrapper uses a private image" : "read-only host import", g_surf_ro_maps);
+}
 static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                    uint32_t vkf, uint32_t bpp, int a8, int stex, int rw)
 {
@@ -834,6 +862,7 @@ static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUIntege
     if (why) { static unsigned said; if (said++ < 8) nvlog("surface %u plane %lu %ux%u: no host import (%s; row %zu, offset %zu, alloc %zu)",
                    (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, why, row, (size_t)(pb - base), alloc); return -1; }
     const size_t span = (alloc + al - 1) & ~(al - 1);
+    if (!nvmtl_span_writable(base, span)) { nvmtl_surf_ro_log(surf, plane, rw); if (rw) return -1; }
     nvk_buffer hb;
     if (nvmtl_vk_buffer_import_host((void *)base, span, &hb)) return -1;
     if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, rw && stex, rw, &hb, pb - base, row, &t->_i)) {
@@ -864,10 +893,13 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         const size_t alloc = IOSurfaceGetAllocSize(surf), span = al ? (alloc + al - 1) & ~(al - 1) : 0;
         if (base && al && !((uintptr_t)base & (al - 1)) && alloc && (size_t)w * (bpp ? bpp : 4) <= row
             && h <= sh && row % 32 == 0 && row * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
+            // read-only mapping: a read-only wrapper still imports (read-only, never widened), a writable one goes on
+            const int wr = nvmtl_span_writable((uintptr_t)base, span);
+            if (!wr) nvmtl_surf_ro_log(surf, plane, rw);
             nvk_buffer hb;
-            if (!nvmtl_vk_buffer_import_host(base, span, &hb)) {
-                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, 0, row, &t->_i)) {
-                    t->_hostBuf = hb; t->_hostOn = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+            if ((wr || !rw) && !nvmtl_vk_buffer_import_host(base, span, &hb)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, wr ? stex : 0, wr, &hb, 0, row, &t->_i)) {
+                    t->_hostBuf = hb; t->_hostOn = YES; t->_hostRO = !wr; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
                     t->_hostSL = nvmtl_vk_surface_list_mark(&t->_hostBuf) ? YES : NO;
                     static unsigned long long nh; static unsigned said;
                     if (said++ < 8 || ++nh % 2000 == 0)
