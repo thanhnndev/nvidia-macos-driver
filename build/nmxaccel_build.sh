@@ -20,6 +20,9 @@ CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" "${RMIN
   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
   -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 )
 xcrun clang++ "${CFLAGS[@]}" -I"$SRC/accel" -I"$SRC/accel/iofam" -I"$RE" -c "$SRC/accel/nvrm-accel.cpp" -o "$OUT/nmx-accel.o" 2>"$OUT/nmxaccel.err" || { grep error "$OUT/nmxaccel.err" | head; exit 1; }
-xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/nmx-accel.o" -o "$OUT/NMXAccel.kext/Contents/MacOS/NMXAccel" 2>"$OUT/nmxaccelld.err" || { cat "$OUT/nmxaccelld.err" | head; exit 1; }
+xcrun clang++ -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
+  -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter -O2 \
+  -c "$SRC/accel/nmx/nmx_drm_uc.cpp" -o "$OUT/nmx-drm-uc.o" 2>"$OUT/nmxdrmuc.err" || { grep error "$OUT/nmxdrmuc.err" | head; exit 1; }
+xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "$OUT/nmx-accel.o" "$OUT/nmx-drm-uc.o" -o "$OUT/NMXAccel.kext/Contents/MacOS/NMXAccel" 2>"$OUT/nmxaccelld.err" || { cat "$OUT/nmxaccelld.err" | head; exit 1; }
 cp "$SRC/accel/nmx/Info.plist" "$OUT/NMXAccel.kext/Contents/Info.plist"
 echo "NMXAccel $(md5 -q "$OUT/NMXAccel.kext/Contents/MacOS/NMXAccel") $(stat -f %z "$OUT/NMXAccel.kext/Contents/MacOS/NMXAccel") B  ($(xcrun clang++ --version | head -1))"

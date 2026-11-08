@@ -82,7 +82,24 @@ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
     uint16_t v = 0;
     if (accel && IOObjectConformsTo(accel, "NMXAccel")) { v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0; }
     else if (accel && IOObjectConformsTo(accel, "NVAccel")) v = 0x10de;
-    if (v && !g_vendor) g_vendor = v;
+    /* WindowServer asks each display's accelerator in turn and the AMD panel comes first (it is the built-in
+       framebuffer). Letting 0x1002 claim the process made every later request, including the NVIDIA display's
+       accelerator, fail the vendor gate in nvmtl_process_is_allowed() and CoreDisplay aborted with "Failed to create
+       MetalDevice (null)" about 8 s later, then respawned every 10 s. The compositor's device must be the NVIDIA one:
+       its display is a real IOFramebuffer, and NVK reaches the GPU over IOKit, which the WindowServer sandbox allows.
+       The AMD panel does not need a Metal device in that process -- it presents through its display pipe. Apps are
+       untouched: only WindowServer defers, and only when an NVAccel exists to take the claim. */
+    if (v && !g_vendor) {
+        if (v != 0x10de && !strcmp(getprogname(), "WindowServer")) {
+            io_service_t nv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+            if (nv) {
+                IOObjectRelease(nv);
+                nvlog("  WindowServer: the %04x accelerator does not claim this process -- the NVIDIA display's accelerator must", v);
+                return v;
+            }
+        }
+        g_vendor = v;
+    }
     return v;
 }
 /* a process that starts Vulkan before Metal makes a device: NVIDIA when its accelerator runs, else the AMD/Intel one */
