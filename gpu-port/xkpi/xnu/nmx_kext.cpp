@@ -254,6 +254,13 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_fail);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_rc);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_name);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_hint);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_wire);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_miss);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_bad_page);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_no_surf);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_short);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_prep_fail);
     sysctl_register_oid(&sysctl__debug_nmx_umap_cache);
     sysctl_register_oid(&sysctl__debug_nmx_wbinvd);
     sysctl_register_oid(&sysctl__debug_nmx_umap_flush);
