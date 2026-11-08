@@ -857,6 +857,37 @@ static void nvmtl_prefault_write(uintptr_t base, size_t span) {
     if (g_surf_prefault == 1 || g_surf_prefault % 5000 == 0)
         nvlog("surface prefault: %llu writable host imports faulted in for writing first (%zu KB this one)", g_surf_prefault, span >> 10);
 }
+// ga403wm Step137: tell NMXGPU that [base, base + span) is this IOSurface, so the userptr import that follows pins the
+// surface's own memory descriptor instead of faulting the range in through this process's map (one VM fault per page
+// here in the prefault and again in the kernel wire: ~7 % of a core in WindowServer while an app animates). The
+// kernel checks the claim (the range's first page must be the surface's first page) and otherwise wires the range as
+// before. Only that first page is faulted in here. A kernel without the ioctl (before NMXGPU out-18) answers EINVAL
+// once, and the hint is then off for the process. NVMTL_SURF_HINT=0 turns it off.
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <errno.h>
+struct nvmtl_surf_hint_args { uint64_t addr, size; uint32_t surface_id, pad; };
+#define NVMTL_DRM_IOCTL_SURF_HINT _IOW('d', 0x40 + 0x5e, struct nvmtl_surf_hint_args)
+static unsigned long long g_surf_hint_ok, g_surf_hint_fail;
+static int nvmtl_surface_hint(IOSurfaceRef surf, uintptr_t base, size_t span, int write) {
+    static int fd = -2;
+    if (fd == -2) {
+        const char *e = getenv("NVMTL_SURF_HINT");
+        fd = (e && e[0] == '0') ? -1 : open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        nvlog("surface hint: %s", fd >= 0 ? "on (NMXGPU pins the IOSurface's own memory)" : "off");
+    }
+    if (fd < 0 || !surf || !span) return -1;
+    if (write) nvmtl_prefault_write(base, (size_t)getpagesize());   // the kernel's check wires this page for writing
+    struct nvmtl_surf_hint_args a = { base, span, (uint32_t)IOSurfaceGetID(surf), 0 };
+    if (ioctl(fd, NVMTL_DRM_IOCTL_SURF_HINT, &a) != 0) {
+        int err = errno;
+        if (++g_surf_hint_fail <= 4) nvlog("surface hint: refused (%s)%s", strerror(err), err == EINVAL || err == ENOTTY || err == ENOTSUP ? ", off for this process" : "");
+        if (err == EINVAL || err == ENOTTY || err == ENOTSUP) { close(fd); fd = -1; }
+        return -1;
+    }
+    if (++g_surf_hint_ok == 1 || g_surf_hint_ok % 5000 == 0) nvlog("surface hint: %llu imports hinted (%zu KB this one)", g_surf_hint_ok, span >> 10);
+    return 0;
+}
 static void nvmtl_surf_ro_log(IOSurfaceRef surf, NSUInteger plane, int rw) {
     g_surf_ro_maps++;
     static unsigned said; if (said++ < 8 || g_surf_ro_maps % 1000 == 0)
@@ -881,7 +912,8 @@ static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUIntege
                    (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, why, row, (size_t)(pb - base), alloc); return -1; }
     const size_t span = (alloc + al - 1) & ~(al - 1);
     if (!nvmtl_span_writable(base, span)) { nvmtl_surf_ro_log(surf, plane, rw); if (rw) return -1; }
-    else if (rw) nvmtl_prefault_write(base, span);
+    else if (rw && nvmtl_surface_hint(surf, base, span, 1)) nvmtl_prefault_write(base, span);
+    if (!rw) (void)nvmtl_surface_hint(surf, base, span, 0);
     nvk_buffer hb;
     if (nvmtl_vk_buffer_import_host((void *)base, span, &hb)) return -1;
     if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, rw && stex, rw, &hb, pb - base, row, &t->_i)) {
@@ -915,7 +947,8 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             // read-only mapping: a read-only wrapper still imports (read-only, never widened), a writable one goes on
             const int wr = nvmtl_span_writable((uintptr_t)base, span);
             if (!wr) nvmtl_surf_ro_log(surf, plane, rw);
-            else nvmtl_prefault_write((uintptr_t)base, span);   // this path's image is always writable
+            // this path's image is always writable; a hinted import pins the surface's memory and needs no prefault
+            if (nvmtl_surface_hint(surf, (uintptr_t)base, span, wr) && wr) nvmtl_prefault_write((uintptr_t)base, span);
             nvk_buffer hb;
             if ((wr || !rw) && !nvmtl_vk_buffer_import_host(base, span, &hb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, wr ? stex : 0, wr, &hb, 0, row, &t->_i)) {
