@@ -310,6 +310,51 @@ extern "C" int nmx_xnu_surface_hint(uint32_t surface_id, uint64_t addr, uint64_t
     return 0;
 }
 
+/* Step139: who pins user pages, and how many (debug.nmx_pin_by_proc). One row per process name, 8 rows, the
+ * least-used row is recycled. Counted at every nmx_xnu_user_wire call, before the surface/user split. */
+struct PinAcct { char name[24]; SInt64 calls, pages; };
+static PinAcct gPinAcct[8];
+static IOLock *gPinAcctLock;
+static void pin_account(size_t npages)
+{
+    char who[24] = "";
+    proc_name(proc_pid(current_proc()), who, (int)sizeof who);
+    if (gPinAcctLock == nullptr) {
+        IOLock *l = IOLockAlloc();
+        if (!OSCompareAndSwapPtr(nullptr, l, (void * volatile *)&gPinAcctLock))
+            IOLockFree(l);
+    }
+    if (gPinAcctLock == nullptr)
+        return;
+    IOLockLock(gPinAcctLock);
+    int hit = -1, low = 0;
+    for (int i = 0; i < 8; i++) {
+        if (strncmp(gPinAcct[i].name, who, sizeof who) == 0) { hit = i; break; }
+        if (gPinAcct[i].pages < gPinAcct[low].pages) low = i;
+    }
+    if (hit < 0) {
+        hit = low;
+        strlcpy(gPinAcct[hit].name, who, sizeof gPinAcct[hit].name);
+        gPinAcct[hit].calls = gPinAcct[hit].pages = 0;
+    }
+    gPinAcct[hit].calls++;
+    gPinAcct[hit].pages += (SInt64)npages;
+    IOLockUnlock(gPinAcctLock);
+}
+extern "C" int nmx_pin_by_proc_format(char *buf, size_t size)
+{
+    int n = snprintf(buf, size, "name calls pages\n");
+    if (gPinAcctLock == nullptr)
+        return n;
+    IOLockLock(gPinAcctLock);
+    for (int i = 0; i < 8 && n > 0 && (size_t)n < size - 1; i++)
+        if (gPinAcct[i].name[0] != 0 || gPinAcct[i].calls != 0)
+            n += snprintf(buf + n, size - (size_t)n, "%s %lld %lld\n", gPinAcct[i].name[0] ? gPinAcct[i].name : "?",
+                          (long long)gPinAcct[i].calls, (long long)gPinAcct[i].pages);
+    IOLockUnlock(gPinAcctLock);
+    return n;
+}
+
 extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
 {
     *handle = nullptr;
@@ -317,6 +362,7 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         return 0;
     if ((uaddr & PAGE_MASK) != 0)
         return EINVAL;
+    pin_account(npages);
     task_t task = current_task();
     if (mm != nullptr) {
         task = find_ref(mm);

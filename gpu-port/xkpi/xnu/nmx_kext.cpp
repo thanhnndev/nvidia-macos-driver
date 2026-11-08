@@ -171,6 +171,18 @@ static int nmx_grab_sysctl SYSCTL_HANDLER_ARGS
     return sysctl_handle_string(oidp, buf, sizeof buf, req);
 }
 
+extern "C" int nmx_pin_by_proc_format(char *buf, size_t size);
+static int nmx_pin_by_proc_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[512];
+    int n = nmx_pin_by_proc_format(buf, sizeof buf);
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    buf[n] = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_pin_by_proc, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_pin_by_proc_sysctl, "A", "Step139: user-page pin calls and pages per process name");
 SYSCTL_PROC(_debug, OID_AUTO, nmx_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             0, 0, nmx_trace_sysctl, "A",
             "last 16 AMD submissions: ring, VM hub, vmid, page directory, job->vm_needs_flush and the flush emitted");
@@ -264,6 +276,7 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_fail);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_rc);
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_name);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_by_proc);
     sysctl_register_oid(&sysctl__debug_nmx_pages_live);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_count);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_pages);
