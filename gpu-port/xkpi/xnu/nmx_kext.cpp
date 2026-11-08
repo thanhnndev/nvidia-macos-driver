@@ -238,6 +238,13 @@ static void nmx_sysctl_install(void)
     static bool installed = false;
     if (installed) return;
     sysctl_register_oid(&sysctl__debug_nmx_trace);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_hint);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_wire);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_miss);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_bad_page);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_no_surf);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_short);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_prep_fail);
     sysctl_register_oid(&sysctl__debug_nmx_grab);
     sysctl_register_oid(&sysctl__debug_nmx_jobs);
     sysctl_register_oid(&sysctl__debug_nmx_jobs_flushed);
