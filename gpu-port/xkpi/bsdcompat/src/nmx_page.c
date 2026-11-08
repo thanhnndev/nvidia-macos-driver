@@ -52,7 +52,16 @@ struct reg_entry {
 };
 
 static struct reg_entry **reg_table;
-static lck_spin_t *pg_lock;               /* registry, chunk list and free list */
+static lck_spin_t *pg_lock;               /* chunk list, free list and the live counts */
+/*
+ * ga403wm Step133: the registry and the pin lists have their own locks, one per stripe of hash buckets. They were under
+ * pg_lock, taken once per page by every pin (phys_to_page, pin push) and every unpin (pin pop): with WindowServer,
+ * Chrome, VTDecoder and Claude pinning and releasing userptr surfaces every frame, a 10 s spindump of 1080p60 video
+ * had ~4 s of CPU spinning on that one lock (1.8 s of it in WindowServer). A page's registry entry and its pin list are
+ * both guarded by the stripe of its page frame number, so different pages almost never meet on a lock.
+ */
+#define REG_LOCKS 256                      /* power of two dividing REG_BUCKETS */
+static lck_spin_t *reg_locks[REG_LOCKS];
 static struct backing *chunks;
 static struct vm_page *free_pages;         /* free single pages, linked through plinks.s.ss */
 static u_int free_count;
@@ -63,6 +72,12 @@ static unsigned reg_bucket(vm_paddr_t pfn)
     return (unsigned)((pfn ^ (pfn >> 16)) & (REG_BUCKETS - 1));
 }
 
+static lck_spin_t *reg_lock_of(vm_paddr_t pfn)
+{
+    return reg_locks[reg_bucket(pfn) & (REG_LOCKS - 1)];
+}
+
+/* the *_locked registry helpers below need reg_lock_of(pfn) held */
 static void reg_insert_locked(struct vm_page *m, struct reg_entry *e)
 {
     vm_paddr_t pfn = m->phys_addr >> PAGE_SHIFT;
@@ -97,6 +112,9 @@ static struct vm_page *reg_find_locked(vm_paddr_t pfn)
 int nmx_page_init(void)
 {
     pg_lock = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL);
+    for (int i = 0; i < REG_LOCKS; i++)
+        if ((reg_locks[i] = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL)) == NULL)
+            return ENOMEM;
     reg_table = malloc(sizeof(*reg_table) * REG_BUCKETS, M_NMXPAGE, M_WAITOK | M_ZERO);
     return (pg_lock && reg_table) ? 0 : ENOMEM;
 }
@@ -117,19 +135,25 @@ static int backing_register(struct backing *bk)
     struct reg_entry *ents = malloc(sizeof(*ents) * bk->npages, M_NMXPAGE, M_WAITOK);
     if (ents == NULL)
         return ENOMEM;
-    lck_spin_lock(pg_lock);
-    for (size_t i = 0; i < bk->npages; i++)
+    for (size_t i = 0; i < bk->npages; i++) {
+        lck_spin_t *l = reg_lock_of(bk->pages[i].phys_addr >> PAGE_SHIFT);
+        lck_spin_lock(l);
         reg_insert_locked(&bk->pages[i], &ents[i]);
-    lck_spin_unlock(pg_lock);
+        lck_spin_unlock(l);
+    }
     return 0;
 }
 
-/* removes a backing's pages from the registry (lock held); returns the registry entry array for freeing */
-static struct reg_entry *backing_unregister_locked(struct backing *bk)
+/* removes a backing's pages from the registry (takes each page's stripe); returns the entry array for freeing */
+static struct reg_entry *backing_unregister(struct backing *bk)
 {
     struct reg_entry *first = NULL;
     for (size_t i = 0; i < bk->npages; i++) {
-        struct reg_entry *e = reg_remove_locked(bk->pages[i].phys_addr >> PAGE_SHIFT);
+        vm_paddr_t pfn = bk->pages[i].phys_addr >> PAGE_SHIFT;
+        lck_spin_t *l = reg_lock_of(pfn);
+        lck_spin_lock(l);
+        struct reg_entry *e = reg_remove_locked(pfn);
+        lck_spin_unlock(l);
         if (i == 0)
             first = e;
     }
@@ -162,9 +186,7 @@ static struct backing *backing_alloc(int kind, size_t npages, int contiguous, ui
 
 static void backing_release(struct backing *bk)
 {
-    lck_spin_lock(pg_lock);
-    struct reg_entry *ents = backing_unregister_locked(bk);
-    lck_spin_unlock(pg_lock);
+    struct reg_entry *ents = backing_unregister(bk);
     free(ents, M_NMXPAGE);
     nmx_xnu_mem_free(bk->handle);
     free(bk, M_NMXPAGE);
@@ -310,11 +332,12 @@ static void pin_put(struct user_pin *pin)
 static struct user_pin *page_pop_pin(vm_page_t m)
 {
     struct pin_ref *r;
-    lck_spin_lock(pg_lock);
+    lck_spin_t *l = reg_lock_of(m->phys_addr >> PAGE_SHIFT);
+    lck_spin_lock(l);
     r = m->nmx_pins;
     if (r != NULL)
         m->nmx_pins = r->next;
-    lck_spin_unlock(pg_lock);
+    lck_spin_unlock(l);
     if (r == NULL)
         return NULL;
     struct user_pin *pin = r->pin;
@@ -359,10 +382,11 @@ int nmx_user_pages_pin(void *mm, uintptr_t start, int npages, int write, vm_page
     pin->remaining = (u_int)npages;
     for (i = 0; i < npages; i++) {
         refs[i]->pin = pin;
-        lck_spin_lock(pg_lock);
+        lck_spin_t *l = reg_lock_of(pages[i]->phys_addr >> PAGE_SHIFT);
+        lck_spin_lock(l);
         refs[i]->next = pages[i]->nmx_pins;
         pages[i]->nmx_pins = refs[i];
-        lck_spin_unlock(pg_lock);
+        lck_spin_unlock(l);
         vm_page_wire(pages[i]);
     }
     free(refs, M_NMXPAGE);
@@ -523,9 +547,10 @@ void vm_object_page_remove(vm_object_t o, vm_pindex_t start, vm_pindex_t end, in
 vm_page_t nmx_phys_to_page(vm_paddr_t pa)
 {
     vm_paddr_t pfn = pa >> PAGE_SHIFT;
-    lck_spin_lock(pg_lock);
+    lck_spin_t *l = reg_lock_of(pfn);
+    lck_spin_lock(l);
     struct vm_page *m = reg_find_locked(pfn);
-    lck_spin_unlock(pg_lock);
+    lck_spin_unlock(l);
     if (m)
         return m;
 
@@ -542,7 +567,7 @@ vm_page_t nmx_phys_to_page(vm_paddr_t pa)
     page_record_init(&bk->pages[0], bk, pfn << PAGE_SHIFT, NULL);
     bk->pages[0].flags = PG_FICTITIOUS;
     bk->pages[0].ref_count = 1;
-    lck_spin_lock(pg_lock);
+    lck_spin_lock(l);
     m = reg_find_locked(pfn);
     if (m == NULL) {
         reg_insert_locked(&bk->pages[0], e);
@@ -550,7 +575,7 @@ vm_page_t nmx_phys_to_page(vm_paddr_t pa)
         bk = NULL;
         e = NULL;
     }
-    lck_spin_unlock(pg_lock);
+    lck_spin_unlock(l);
     free(bk, M_NMXPAGE);
     free(e, M_NMXPAGE);
     return m;
@@ -570,19 +595,21 @@ vm_page_t nmx_kva_to_page(const void *va)
 
 bool nmx_phys_in_dmap(vm_paddr_t pa)
 {
-    lck_spin_lock(pg_lock);
+    lck_spin_t *l = reg_lock_of(pa >> PAGE_SHIFT);
+    lck_spin_lock(l);
     struct vm_page *m = reg_find_locked(pa >> PAGE_SHIFT);
     bool in = m && m->nmx_kva;
-    lck_spin_unlock(pg_lock);
+    lck_spin_unlock(l);
     return in;
 }
 
 void *nmx_phys_to_kva(vm_paddr_t pa)
 {
-    lck_spin_lock(pg_lock);
+    lck_spin_t *l = reg_lock_of(pa >> PAGE_SHIFT);
+    lck_spin_lock(l);
     struct vm_page *m = reg_find_locked(pa >> PAGE_SHIFT);
     void *kva = (m && m->nmx_kva) ? (char *)m->nmx_kva + (pa & PAGE_MASK) : NULL;
-    lck_spin_unlock(pg_lock);
+    lck_spin_unlock(l);
     return kva;
 }
 
@@ -805,4 +832,9 @@ void nmx_page_fini(void)
     reg_table = NULL;
     lck_spin_free(pg_lock, nmx_lck_grp);
     pg_lock = NULL;
+    for (int i = 0; i < REG_LOCKS; i++)
+        if (reg_locks[i] != NULL) {
+            lck_spin_free(reg_locks[i], nmx_lck_grp);
+            reg_locks[i] = NULL;
+        }
 }
