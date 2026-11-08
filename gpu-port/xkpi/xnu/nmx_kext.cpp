@@ -192,6 +192,12 @@ NMX_CNT(nmx_pin_write_retry_ok, gNmxPinWriteRetryOk, "Step132: of those, wires t
 NMX_CNT(nmx_pin_ro_retry, gNmxPinRoRetry, "Step96/132: userptr BOs pinned read-only after a failed writable pin");
 NMX_CNT(nmx_pin_last_rc, gNmxPinLastRc, "Step132: IOReturn of the last failed first writable wire");
 NMX_CNT(nmx_pin_last_rc2, gNmxPinLastRc2, "Step132: IOReturn of the last writable wire that failed again after fault-in");
+extern "C" volatile SInt64 gNmxPinOtherFail, gNmxPinOtherRc;
+extern "C" char gNmxPinOtherName[32];
+NMX_CNT(nmx_pin_other_fail, gNmxPinOtherFail, "Step132b: failed first writable wires outside WindowServer");
+NMX_CNT(nmx_pin_other_rc, gNmxPinOtherRc, "Step132b: IOReturn of the last of those");
+SYSCTL_STRING(_debug, OID_AUTO, nmx_pin_other_name, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, gNmxPinOtherName,
+              sizeof(gNmxPinOtherName), "Step132b: process of the last of those");
 NMX_CNT(nmx_grab_stray, gNmxGrabStray,
         "VMID assignments that skipped the flush while the VMID still belonged to another VM");
 
@@ -236,6 +242,9 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_pin_ro_retry);
     sysctl_register_oid(&sysctl__debug_nmx_pin_last_rc);
     sysctl_register_oid(&sysctl__debug_nmx_pin_last_rc2);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_other_fail);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_other_rc);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_other_name);
     sysctl_register_oid(&sysctl__debug_nmx_umap_cache);
     sysctl_register_oid(&sysctl__debug_nmx_wbinvd);
     sysctl_register_oid(&sysctl__debug_nmx_umap_flush);
