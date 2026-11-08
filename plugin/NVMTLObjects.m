@@ -5037,6 +5037,20 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (void)removeResidencySet:(id<MTLResidencySet>)r {}
 - (void)removeResidencySets:(const id<MTLResidencySet> __unsafe_unretained [])r count:(NSUInteger)n {}
 - (void)dealloc { nvmtl_vk_queue_destroy(&_q); }
+// The backend is down for good once a submit or fence wait fails (nvmtl_vk.c sets g_state -1; no device is made again).
+// WindowServer then got nil from every -commandBuffer: SkyLight's RenderEncoder -> SetScissor -> RenderEncoder retried
+// without end until the stack ran out (WindowServer-2026-11-08-100218.ips, after a GPU reset), and after 64 failed
+// begins the capacity semaphore blocked it for good. A command buffer that commits as a no-op would keep a WindowServer
+// that can never draw again: a frozen screen. It exits instead, with the reason, and launchd starts a new one on a fresh
+// Vulkan device (once the kernel has recovered the ring). NVMTL_WS_DOWN_EXIT=0 keeps the nil return.
+static void nvmtl_queue_down_exit(void) {
+    static int ws = -1;
+    if (ws < 0) { const char *me = getprogname(), *e = getenv("NVMTL_WS_DOWN_EXIT");
+                  ws = me && !strcmp(me, "WindowServer") && !(e && e[0] == '0'); }
+    if (!ws || !nvmtl_vk_init_failed()) return;
+    nvlog("queue: Vulkan backend is down in WindowServer (%s); exiting so launchd starts it again on a new device", nvmtl_vk_device_name());
+    abort();
+}
 - (id<MTLCommandBuffer>)commandBuffer {
     dispatch_semaphore_t cap = nil;
     if (nvmtl_async_commit_on()) {
@@ -5053,7 +5067,12 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     // member) or in its -dealloc - about 14 Macs from 1.15 to 2.0.1 (NotificationCenter, Music, mediaanalysisd, games).
     // The set itself takes a lock for every operation; only its creation was unguarded. The first-use checks now never fire.
     cb->_resources = [NVMTLResSet new];
-    if (nvmtl_vk_cmd_begin(&_q, &cb->_c)) { nvlog("queue: command buffer begin FAILED"); return nil; }
+    if (nvmtl_vk_cmd_begin(&_q, &cb->_c)) {
+        if (cap) { cb->_capacityHeld = NO; dispatch_semaphore_signal(cap); }   // a failed begin used to keep its slot
+        nvmtl_queue_down_exit();
+        static unsigned said; if (said++ < 8) nvlog("queue: command buffer begin FAILED");
+        return nil;
+    }
     return cb;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
