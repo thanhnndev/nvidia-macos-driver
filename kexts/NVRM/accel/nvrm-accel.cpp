@@ -37,6 +37,10 @@ void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource
 bool                      nvAccelResHasContent(IOAccelResource2 *res);
 static void               nvAccelWriteStamp(int index, unsigned int value);
 #ifdef NMX_ACCEL
+extern "C" IOReturn nmx_drm_new_client(IOService *provider, task_t owningTask, void *securityID, UInt32 type,
+                                       IOUserClient **handler);   // nmx/nmx_drm_uc.cpp
+#endif
+#ifdef NMX_ACCEL
 #define NV_LOG_TAG "NMXAccel: "
 #else
 #define NV_LOG_TAG "NVAccel: "
@@ -54,6 +58,7 @@ extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family head
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
 void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
+void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 }
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
@@ -317,7 +322,9 @@ public:
             thread_call_enter_delayed(me->fNmxArmCall, deadline);
             return;
         }
-        if (query != kIOReturnSuccess || !q.kva || q.phys) {
+        // The panel's framebuffer now reports its scanout's physical address too (initFramebufferResource needs it for
+        // the pipe to go active), so a non-zero phys is no longer a reason to refuse.
+        if (query != kIOReturnSuccess || !q.kva) {
             me->setProperty("NMXDisplayBindError", (unsigned long long)query, 32);
             ALOG("NMX display bind refused: query 0x%x after %u attempts", query, me->fNmxArmAttempts);
             return;
@@ -372,9 +379,9 @@ public:
         NVAccel *me = (NVAccel *)target;
         if (!me || !newService) return true;
 #ifdef NMX_ACCEL
-        // NMXGPUFB is a child of NMXGPU, itself on this exact PCI provider.
+        // NMXAMDFB is a child of NMXGPU, itself on this exact PCI provider.
         IOService *gpu = newService->getProvider();
-        if (!newService->metaCast("NMXGPUFB") || !gpu || gpu->getProvider() != me->fPCI ||
+        if (!newService->metaCast("NMXAMDFB") || !gpu || gpu->getProvider() != me->fPCI ||
             !newService->getProperty("NMXScanoutBridgeVersion")) return true;
 #endif
         unsigned idx = 0;
@@ -574,6 +581,32 @@ public:
         ALOG("  debug.nvaccelfb now reads 1 -- armed-only Metal clients may have a device THIS BOOT ONLY "
              "(heads published 0x%x, registered 0x%x, piped 0x%x)", gNvHeadsPublished, gNvHeadsRegistered, gNvHeadsPiped);
     }
+    // true when every reconstructed family class has the size IOAcceleratorFamily2 registered for it (OSMetaClass)
+    bool familyLayoutMatches() {
+        UInt32 gate = 1;
+        PE_parse_boot_argn("nmxaccel_gate", &gate, sizeof gate);
+        if (gate == 0) { ALOG("family layout gate skipped (nmxaccel_gate=0)"); return true; }
+        if (gate == 2) { ALOG("family layout gate forced off (nmxaccel_gate=2)"); return false; }
+        static const struct { const char *name; size_t size; } kWant[] = {
+            { "IOGraphicsAccelerator2", kIOGraphicsAccelerator2Size },
+            { "IOAccelDisplayMachine", kIOAccelDisplayMachineSize },
+            { "IOAccelLegacyDisplayMachine", kIOAccelLegacyDisplayMachineSize },
+            { "IOAccelEventMachineFast2", kIOAccelEventMachineFast2Size },
+            { "IOAccelTask", kIOAccelTaskSize },
+        };
+        bool ok = true;
+        for (auto &w : kWant) {
+            const OSSymbol *sym = OSSymbol::withCString(w.name);
+            const OSMetaClass *mc = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
+            unsigned have = mc ? mc->getClassSize() : 0;
+            if (sym) sym->release();
+            bool m = have == w.size;
+            ok = ok && m;
+            ALOG("family layout: %s size %u, headers %u%s", w.name, have, unsigned(w.size), m ? "" : "  <-- MISMATCH");
+        }
+        setProperty("NMXFamilyLayoutOK", ok ? kOSBooleanTrue : kOSBooleanFalse);
+        return ok;
+    }
     void registerFramebuffer(int how) {
         if (fRegLock) IOLockLock(fRegLock);
         registerFramebufferLocked(how);
@@ -627,6 +660,14 @@ public:
     IOService *fNVRM = nullptr;
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
                            IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+#ifdef NMX_ACCEL
+        // 'NMDR': the DRM render node through IOKit, for processes whose sandbox refuses /dev/dri (nmx/nmx_drm_uc.cpp)
+        if (type == 0x4E4D4452u) {
+            IOReturn dr = nmx_drm_new_client(this, owningTask, securityID, type, handler);
+            if (dr != kIOReturnSuccess) ALOG("newUserClient(NMDR): DRM client refused (0x%x)", (unsigned)dr);
+            return dr;
+        }
+#endif
         if ((type & 0xFFFF0000u) != 0x4E560000u) {
             IOReturn fr = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
             if (fUcLogged < 40) { fUcLogged++;
@@ -778,14 +819,18 @@ public:
             OSDictionary *fbm = nullptr;
             auto root = IORegistryEntry::getRegistryRoot();
             auto build = root ? OSDynamicCast(OSString, root->getProperty("IOKitBuildVersion")) : nullptr;
-            // This path uses reviewed private family offsets; no automatic OS migration.
+            // This path uses private IOAcceleratorFamily2 layouts (the reconstructed iofam/re headers). It used to
+            // run only on the exact 25G241 kernel string, so every macOS point update (25G332: same family 487.4.4)
+            // lost the display pipe. Gate on the family itself instead: each reconstructed class must have the size
+            // the family registered for it at run time. Boot-arg nmxaccel_gate=0 skips the check, =2 forces it off.
             const bool displayEnabled = getProperty("NMXDisplayPipeEnabled") != kOSBooleanFalse;
-            if (displayEnabled && fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && build &&
-                build->isEqualTo("Darwin Kernel Version 25.6.0: Tue Aug 18 17:46:40 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_X86_64")) {
+            const bool layoutOk = familyLayoutMatches();
+            if (displayEnabled && fPCI && fPCI->configRead16(0) == 0x1002 && fRegLock && layoutOk) {
                 fNmxArmCall = thread_call_allocate(&NVAccel::nmxArm, this);
-                if (fNmxArmCall) fbm = serviceMatching("NMXGPUFB");
+                if (fNmxArmCall) fbm = serviceMatching("NMXAMDFB");
             }
-            ALOG("AMD display adapter: native framebuffer watch %s", fbm ? "enabled" : "not on reviewed kernel profile");
+            ALOG("AMD display adapter: native framebuffer watch %s (kernel %s)", fbm ? "enabled" : "OFF: IOAcceleratorFamily2 layout differs from the reconstructed headers",
+                 build ? build->getCStringNoCopy() : "?");
 #else
             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
 #endif
@@ -1059,6 +1104,7 @@ public:
     unsigned long long  getBytesPerRow() const;
     unsigned int        getPixelFormat() const;
     unsigned int        getSurfaceID() const;
+    OSObject           *copyValue(const char *key, unsigned int *err) const;   // IOSurfaceSetValue's store (kernel side)
 };
 class IOAccelDisplayPipeTransaction2 {
 public:
@@ -1117,10 +1163,18 @@ IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 }
 
 static bool nvAccelIopAsyncBusy(const void *pipe);
+#ifdef NMX_ACCEL
+static bool nmxFlipPending(const void *pipe);
+#endif
 bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
     const SInt64 trace = OSAddAtomic64(1, &gCntIopComplete);
+#ifdef NMX_ACCEL
+    // a page flip completes the transaction only once the display has latched it (nmxFlipPresent)
+    const bool busy = gNvIop != 0 && (nvAccelIopAsyncBusy(this) || nmxFlipPending(this));
+#else
     const bool busy = gNvIop != 0 && nvAccelIopAsyncBusy(this);
+#endif
     if (trace <= 8) ALOG("iop: TRACE isTransactionComplete entry [%lld/8] pipe %p gate %d busy %d",
                          (long long)trace, this, gNvIop, busy ? 1 : 0);
     return gNvIop != 0 && !busy;
@@ -1130,6 +1184,579 @@ static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static void nvAccelIopHome(IOService *fb, unsigned head);
+#ifdef NMX_ACCEL
+// The K6 copy writes the frame into the buffer the display is scanning out. Copied with no regard for the scan, the panel
+// shows the top of one frame over the bottom of the last: the tearing on the 890M. The copy now trails the scan: a band of
+// rows is written only after the scan has passed it in this refresh, and has to be written before the scan comes back to it
+// in the next one. Every refresh then shows one whole frame. The scan position is the DCN timing generator's vertical
+// counter (OTG_STATUS_POSITION) read over the register BAR; DCN 3.5 offsets (Strix 890M/880M), checked against the live
+// timing so anything else falls back to the unpaced copy.
+static int gNmxBeam = 1;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_beam, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBeam, 0, "1 = pace the K6 copy behind the display scan (no tearing)");
+static SInt64 gCntBeamOk, gCntBeamLapped, gCntBeamOff, gCntBeamWaitUs, gCntBeamCopyUs;
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_ok, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamOk, "K6 copies paced behind the scan");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_lapped, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamLapped, "paced copies the scan caught up with (that refresh tore)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_off, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamOff, "K6 copies not paced (no timing generator, or debug.nmxaccel_beam=0)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamWaitUs, "microseconds paced copies spent waiting for the scan");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_beam_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBeamCopyUs, "microseconds paced copies took in all");
+
+static IOMemoryMap *gNmxMmioMap;
+static volatile UInt32 *gNmxMmio;
+static bool gNmxMmioTried;
+enum : UInt32 {
+    kDcn35Seg2      = 0x34C0,   // DCN 3.5 register base, segment 2 (IP discovery: 0x12 0xC0 0x34C0 0x9000)
+    kOtgStride      = 0x80,
+    kOtgVTotal      = 0x1b2f, kOtgVBlankStartEnd = 0x1b38, kOtgControl = 0x1b43, kOtgStatusPosition = 0x1b4a,
+};
+static inline UInt32 nmxReg(UInt32 dw) { return gNmxMmio[dw]; }
+
+struct NmxScan { UInt32 otg, vtotal, vbs, vbe; };
+// The timing generator that is scanning out h active rows, or false
+static bool nmxScanFind(IOPCIDevice *pci, unsigned h, NmxScan *sc)
+{
+    if (!gNmxMmioTried) {
+        gNmxMmioTried = true;
+        if (pci && pci->configRead16(0) == 0x1002) {
+            gNmxMmioMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5, kIOMapInhibitCache);
+            if (gNmxMmioMap && gNmxMmioMap->getLength() >= 0x80000) gNmxMmio = (volatile UInt32 *)gNmxMmioMap->getVirtualAddress();
+        }
+        ALOG("iop: beam: register BAR5 %s (%llu bytes)", gNmxMmio ? "mapped" : "NOT mapped",
+             gNmxMmioMap ? (unsigned long long)gNmxMmioMap->getLength() : 0ull);
+    }
+    if (!gNmxMmio) return false;
+    for (UInt32 i = 0; i < 4; i++) {
+        const UInt32 b = kDcn35Seg2 + i * kOtgStride;
+        const UInt32 ctl = nmxReg(b + kOtgControl);
+        if (ctl == 0xffffffffu || !(ctl & 1)) continue;
+        const UInt32 vt = (nmxReg(b + kOtgVTotal) & 0x7fff) + 1, se = nmxReg(b + kOtgVBlankStartEnd);
+        const UInt32 vbs = se & 0x7fff, vbe = (se >> 16) & 0x7fff;
+        if (vbs <= vbe || vbs - vbe != h || vbs > vt || vt > 2 * h + 64) continue;
+        sc->otg = i; sc->vtotal = vt; sc->vbs = vbs; sc->vbe = vbe;
+        return true;
+    }
+    return false;
+}
+static inline UInt32 nmxScanLine(const NmxScan &sc) { return nmxReg(kDcn35Seg2 + sc.otg * kOtgStride + kOtgStatusPosition) & 0x7fff; }
+#endif
+#ifdef NMX_ACCEL
+// Fence-ordered swap. WindowServer used to block in commitAndWaitUntilSubmitted until its composite had finished on the GPU
+// (~4.6 ms per frame on the 890M), because nothing here waited before copying the surface out. NVMTL (in WindowServer, when
+// debug.nmxaccel_fence_wait is 1) now marks every IOSurface a command buffer writes: IOSurfaceSetValue("NMXFencePending", n)
+// at commit, ("NMXFenceDone", n) once the work completed and its pixels are in the surface. The transaction waits here,
+// sleeping, until done >= pending; WindowServer returns as soon as its work is submitted. A surface with no
+// NMXFencePending (another client, an older plugin) is copied at once, as before. 0 = no wait (NVMTL then waits itself).
+static int gNmxFenceWait = 1;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_fence_wait, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFenceWait, 0,
+           "1 = the K6 copy waits for the surface's NMXFenceDone (NVMTL then returns from commitAndWaitUntilSubmitted early)");
+static SInt64 gCntFenceFrames, gCntFenceWaited, gCntFenceWaitUs, gCntFenceTimeouts;
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_frames, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceFrames, "frames whose surface carried an NVMTL fence");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_waited, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceWaited, "frames that had to wait for their GPU work");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceWaitUs, "microseconds spent waiting for GPU work");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceTimeouts, "waits given up after 100 ms (the frame is copied anyway)");
+static unsigned long long nmxSurfValue(IOSurface *s, const char *key)
+{
+    unsigned int err = 0;
+    OSObject *o = s->copyValue(key, &err);
+    OSNumber *n = OSDynamicCast(OSNumber, o);
+    const unsigned long long v = n ? n->unsigned64BitValue() : 0;
+    if (o) o->release();
+    return v;
+}
+// false only when the surface's GPU work was still not done after the 100 ms cap (the frame may be incomplete)
+static bool nmxFenceWait(IOSurface *s)
+{
+    if (!gNmxFenceWait || !s) return true;
+    const unsigned long long want = nmxSurfValue(s, "NMXFencePending");
+    if (!want) return true;
+    OSAddAtomic64(1, &gCntFenceFrames);
+    if (nmxSurfValue(s, "NMXFenceDone") >= want) return true;
+    const uint64_t t0 = mach_absolute_time();
+    uint64_t ns = 0;
+    bool done = false;
+    while (!done) {
+        IODelay(100);   // long enough that xnu blocks the thread instead of spinning
+        done = nmxSurfValue(s, "NMXFenceDone") >= want;
+        absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+        if (!done && ns > 100000000ull) break;
+    }
+    OSAddAtomic64(1, &gCntFenceWaited);
+    OSAddAtomic64((SInt64)(ns / 1000), &gCntFenceWaitUs);
+    if (!done) {
+        const SInt64 n = OSAddAtomic64(1, &gCntFenceTimeouts);
+        if (n < 8) ALOG("iop: fence: surface 0x%x pending %llu, done %llu after 100 ms - copied anyway", s->getSurfaceID(), want,
+                        nmxSurfValue(s, "NMXFenceDone"));
+    }
+    return done;
+}
+#endif
+#ifdef NMX_ACCEL
+// Page flips (debug.nmxaccel_flip, 0 by default). The K6 path copies every frame with the CPU (~3.2 ms) into the one buffer
+// the display scans, paced behind the scan (~2.2 ms of waiting). With a flip the display is told to scan another buffer,
+// and DCN latches the new address at the vertical blank, so no refresh shows two frames and nothing is copied:
+//   1 = zero copy: the composited IOSurface itself is scanned out (NMXGPU imports its pages as a scan-out buffer);
+//   2 = copy + flip: the frame is copied (unpaced, CPU) into a VRAM back buffer of the bridge, then flipped to.
+// The flip is ordered after the fence: nmxFenceWait has seen NMXFenceDone >= NMXFencePending (or no mark) before a
+// flip is submitted, and a frame whose wait hit the 100 ms cap is never flipped (it takes the copy path). The transaction
+// completes only once the display has latched the flip, so IOAcceleratorFamily keeps the previous transaction (whose
+// surface is still on screen until then) live. The flips go through NMXGPU's display bridge (nmx_flip_abi.h); without
+// that API (callPlatformFunction answers kIOReturnUnsupported) nothing changes. Any failure falls back to the K6 copy,
+// with the bridge's own buffer put back on screen first; repeated failures turn flips off for the boot
+// (debug.nmxaccel_flip_tripped, write 0 to re-arm).
+#include "../nmx_flip_abi.h"
+extern "C" {
+int thread_call_enter(struct thread_call *call);
+void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
+}
+static int gNmxFlip = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFlip, 0,
+           "0 = K6 copy (default), 1 = zero-copy page flip of the IOSurface, 2 = copy into a VRAM back buffer + page flip");
+static int gNmxFlipSync = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip_sync, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFlipSync, 0,
+           "1 = performTransaction waits for the flip to latch; 0 = it completes later (signalTransactionInterrupt)");
+static int gNmxFlipCaps = -1;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip_api, CTLFLAG_RD | CTLFLAG_LOCKED, &gNmxFlipCaps, 0,
+           "NMXGPU flip caps (nmx_flip_abi.h); -1 = not asked yet, 0 = no flip API in NMXGPU");
+static int gNmxFlipTripped = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip_tripped, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFlipTripped, 0,
+           "1 = flips turned themselves off after errors (see the iop: flip log); write 0 to try again");
+static SInt64 gCntFlipSubmit, gCntFlipLatched, gCntFlipFallback, gCntFlipRefused, gCntFlipTimeouts, gCntFlipHome,
+              gCntFlipImports, gCntFlipImportFail, gCntFlipFrontWritten, gCntFlipWaitUs, gCntFlipSame, gCntFlipDrop,
+              gCntFlipGen, gCntFlipHwMismatch;
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_submitted, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipSubmit, "flips submitted to NMXGPU");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_latched, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipLatched, "flips the display latched");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_fallback, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipFallback, "frames that took the K6 copy while flips were on");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_refused, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipRefused, "flips NMXGPU refused");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipTimeouts, "flips not latched within 50 ms");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_home, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipHome, "flips back to the bridge's own buffer before a copied frame");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_imports, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipImports, "IOSurfaces imported as scan-out buffers");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_import_fail, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipImportFail, "IOSurface imports NMXGPU refused");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_front_written, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipFrontWritten, "GPU work committed into the surface while it was on screen (zero copy unsafe)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipWaitUs, "microseconds from flip submit to latch");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_same, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipSame, "transactions that re-presented the surface already on screen");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_drop, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipDrop, "frames dropped because the previous flip was still pending after 20 ms");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_generation, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipGen, "times the bridge put its own buffer back (restore, hotplug, display power)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_hw_mismatch, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipHwMismatch, "latched flips whose address HUBP0 does not report in use");
+
+enum : unsigned { kNmxFlipImports = 4, kFnCaps = 0, kFnImport, kFnBuffers, kFnRelease, kFnSubmit, kFnStatus, kFnCount };
+enum : uint64_t { kNmxFlipLatchCapNs = 50000000ull, kNmxFlipBusyCapNs = 20000000ull };
+enum : int { kLatchNone = 0, kLatchOk = 1, kLatchTimeout = 2, kLatchWentHome = 3, kLatchNoStatus = 4 };
+struct NmxImport { IOSurface *s; IOMemoryDescriptor *md; unsigned sid, handle, fmt; unsigned long long gpu, use; };
+struct NmxFlip {
+    IOLock *lock;
+    IOService *fb;
+    void *pipe;
+    unsigned caps, maxImports, gen, w, h;
+    struct NMXFlipBuffer buf[NMX_FLIP_MAX_BUFFERS];
+    unsigned nbuf;
+    bool bufTried, inited;
+    unsigned front;                        // handle on screen
+    IOSurface *frontS;                     // zero copy: the surface on screen (held by its import)
+    unsigned long long frontFence;         // its NMXFencePending when it was flipped to
+    unsigned long long frontGpu;
+    unsigned pend;                         // handle submitted and not yet retired
+    IOSurface *pendS;
+    unsigned long long pendFence, pendSeq, pendGpu;
+    volatile SInt32 busy;                  // 1 while the poll thread waits for pendSeq to latch
+    volatile SInt32 result;                // kLatch*
+    struct thread_call *call;
+    NmxImport imp[kNmxFlipImports];
+    unsigned long long tick;
+    unsigned errRun, frontWrites, logs;
+};
+static NmxFlip gFl;
+static const OSSymbol *gFlSym[kFnCount];
+#define FLIPLOG(fmt, ...) do { if (gFl.logs < 48) { gFl.logs++; ALOG("iop: flip: " fmt, ##__VA_ARGS__); } } while (0)
+
+static bool nmxFlipInit()
+{
+    if (gFl.inited) return gFl.lock != nullptr;
+    IOLock *l = IOLockAlloc();
+    if (!l) return false;
+    if (!OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gFl.lock)) IOLockFree(l);
+    gFl.front = NMX_FLIP_HOME; gFl.pend = NMX_FLIP_NONE;
+    gFl.inited = true;
+    return true;
+}
+static IOReturn nmxFlipCall(unsigned fn, struct NMXFlipRequest *r)
+{
+    static const char *const names[kFnCount] = { NMX_FLIP_FN_CAPS, NMX_FLIP_FN_IMPORT, NMX_FLIP_FN_BUFFERS,
+                                                 NMX_FLIP_FN_RELEASE, NMX_FLIP_FN_SUBMIT, NMX_FLIP_FN_STATUS };
+    if (fn >= kFnCount || !gFl.fb) return kIOReturnNotAttached;
+    if (!gFlSym[fn]) {
+        const OSSymbol *sym = OSSymbol::withCString(names[fn]);
+        if (sym && !OSCompareAndSwapPtr(nullptr, (void *)sym, (void *volatile *)&gFlSym[fn])) sym->release();
+    }
+    if (!gFlSym[fn]) return kIOReturnNoMemory;
+    r->version = NMX_FLIP_ABI_VERSION;
+    return gFl.fb->callPlatformFunction(gFlSym[fn], false, r, nullptr, nullptr, nullptr);
+}
+static void nmxFlipTrip(const char *why)
+{
+    if (!gNmxFlipTripped) ALOG("iop: flip: OFF for this boot (%s) -- frames take the K6 copy; sysctl debug.nmxaccel_flip_tripped=0 re-arms", why);
+    gNmxFlipTripped = 1;
+}
+// HUBP0's programmed and in-use surface addresses (DCN 3.5, segment 2, HUBPREQ stride 0xdc), read only
+static void nmxHubp0(unsigned long long *addr, unsigned long long *inuse, bool *pending)
+{
+    *addr = *inuse = 0; *pending = false;
+    if (!gNmxMmio) return;
+    const UInt32 b = kDcn35Seg2;
+    *addr  = ((unsigned long long)(nmxReg(b + 0x060b) & 0xffff) << 32) | nmxReg(b + 0x060a);
+    *inuse = ((unsigned long long)(nmxReg(b + 0x0621) & 0xffff) << 32) | nmxReg(b + 0x0620);
+    *pending = (nmxReg(b + 0x061b) & 0x100) != 0;
+}
+static IOSurface *nmxFlipSurfaceOf(unsigned handle, unsigned long long *gpu)
+{
+    if (gpu) *gpu = 0;
+    if (handle == NMX_FLIP_HOME || handle == NMX_FLIP_NONE) return nullptr;
+    for (unsigned i = 0; i < kNmxFlipImports; i++)
+        if (gFl.imp[i].s && gFl.imp[i].handle == handle) { if (gpu) *gpu = gFl.imp[i].gpu; return gFl.imp[i].s; }
+    for (unsigned i = 0; i < gFl.nbuf; i++)
+        if (gFl.buf[i].handle == handle && gpu) *gpu = gFl.buf[i].gpuAddr;
+    return nullptr;
+}
+static int nmxFlipWaitLatch(unsigned long long seq, unsigned gen, uint64_t capNs, uint64_t *waitedNs)
+{
+    const uint64_t t0 = mach_absolute_time();
+    uint64_t ns = 0;
+    int res = kLatchTimeout;
+    for (;;) {
+        struct NMXFlipRequest st; memset(&st, 0, sizeof st);
+        if (nmxFlipCall(kFnStatus, &st) != kIOReturnSuccess) { res = kLatchNoStatus; break; }
+        if (st.seqLatched >= seq) { res = kLatchOk; break; }
+        if (st.generation != gen) { res = kLatchWentHome; break; }
+        absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+        if (ns > capNs) break;
+        IODelay(200);
+    }
+    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    if (waitedNs) *waitedNs = ns;
+    return res;
+}
+static void nmxFlipPoll(void *, void *)
+{
+    void *pipe = gFl.pipe;
+    uint64_t ns = 0;
+    const int res = nmxFlipWaitLatch(gFl.pendSeq, gFl.gen, kNmxFlipLatchCapNs, &ns);
+    OSAddAtomic64((SInt64)(ns / 1000), &gCntFlipWaitUs);
+    __atomic_store_n(&gFl.result, res, __ATOMIC_RELEASE);
+    __atomic_store_n(&gFl.busy, 0, __ATOMIC_RELEASE);
+    if (pipe) {
+        _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
+        ((OSObject *)pipe)->release();
+    }
+}
+static void nmxFlipResync(const char *why)
+{
+    struct NMXFlipRequest st; memset(&st, 0, sizeof st);
+    if (nmxFlipCall(kFnStatus, &st) != kIOReturnSuccess) { nmxFlipTrip("flip status failed"); return; }
+    OSAddAtomic64(1, &gCntFlipGen);
+    FLIPLOG("%s: generation %u -> %u, on screen handle %u (was %u)", why, gFl.gen, st.generation, st.current, gFl.front);
+    gFl.gen = st.generation;
+    gFl.front = st.current;
+    gFl.frontS = nmxFlipSurfaceOf(st.current, &gFl.frontGpu);
+    gFl.frontFence = gFl.frontS ? nmxSurfValue(gFl.frontS, "NMXFencePending") : 0;
+}
+// The pending flip has finished (poll thread done, or a synchronous wait): it becomes what is on screen. Lock held.
+static void nmxFlipRetire()
+{
+    if (gFl.pend == NMX_FLIP_NONE || __atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) return;
+    const int res = __atomic_load_n(&gFl.result, __ATOMIC_ACQUIRE);
+    const unsigned was = gFl.front;
+    if (res == kLatchOk || res == kLatchTimeout) {
+        // the surface leaving the screen was scanned until now: GPU work committed into it since its flip tore a refresh
+        if (gFl.frontS && gFl.frontS != gFl.pendS) {
+            const unsigned long long f = nmxSurfValue(gFl.frontS, "NMXFencePending");
+            if (f > gFl.frontFence) {
+                OSAddAtomic64(1, &gCntFlipFrontWritten);
+                FLIPLOG("surface 0x%x got GPU work (fence %llu -> %llu) before its replacement latched", gFl.frontS->getSurfaceID(),
+                        gFl.frontFence, f);
+                if (++gFl.frontWrites >= 16) nmxFlipTrip("CoreDisplay draws into the surface on screen; zero copy is not safe");
+            }
+        }
+        // a flip that missed 50 ms is assumed to land late; flips go off either way
+        gFl.front = gFl.pend; gFl.frontS = gFl.pendS; gFl.frontFence = gFl.pendFence; gFl.frontGpu = gFl.pendGpu;
+        if (res == kLatchOk) {
+            const SInt64 n = OSAddAtomic64(1, &gCntFlipLatched);
+            gFl.errRun = 0;
+            unsigned long long addr, inuse; bool pending;
+            nmxHubp0(&addr, &inuse, &pending);
+            if (gFl.frontGpu && gNmxMmio && inuse != gFl.frontGpu && addr != gFl.frontGpu) {
+                OSAddAtomic64(1, &gCntFlipHwMismatch);
+                FLIPLOG("latched handle %u gpu 0x%llx but HUBP0 has 0x%llx in use 0x%llx%s", gFl.front, gFl.frontGpu, addr, inuse,
+                        pending ? " (flip pending)" : "");
+            }
+            if (n < 3 || n == 600 || n == 60000)
+                FLIPLOG("#%lld latched: handle %u -> %u (surface 0x%x), HUBP0 addr 0x%llx in use 0x%llx%s", (long long)n, was, gFl.front,
+                        gFl.frontS ? gFl.frontS->getSurfaceID() : 0u, addr, inuse, pending ? " pending" : "");
+        } else {
+            OSAddAtomic64(1, &gCntFlipTimeouts);
+            nmxFlipTrip("a flip did not latch within 50 ms");
+        }
+    } else if (res == kLatchWentHome) {
+        nmxFlipResync("bridge went home while a flip was pending");
+    } else {
+        nmxFlipTrip("flip status failed while a flip was pending");
+        gFl.front = gFl.pend; gFl.frontS = gFl.pendS;
+    }
+    gFl.pend = NMX_FLIP_NONE; gFl.pendS = nullptr; gFl.pendGpu = 0;
+}
+static bool nmxFlipBusy(const void *pipe)
+{
+    return gFl.inited && gFl.pipe == pipe && __atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE) != 0;
+}
+// isTransactionComplete: true while this pipe's flip has not latched; once it has, it is retired here
+static bool nmxFlipPending(const void *pipe)
+{
+    if (!gFl.inited) return false;
+    if (nmxFlipBusy(pipe)) return true;
+    if (gFl.pend != NMX_FLIP_NONE && gFl.lock && IOLockTryLock(gFl.lock)) {
+        nmxFlipRetire();
+        IOLockUnlock(gFl.lock);
+    }
+    return false;
+}
+static void nmxFlipDrop(NmxImport *e)
+{
+    struct NMXFlipRequest r; memset(&r, 0, sizeof r);
+    r.handle = e->handle;
+    const IOReturn rr = nmxFlipCall(kFnRelease, &r);
+    if (rr == kIOReturnSuccess) {
+        e->md->complete();
+        e->md->release();
+        ((OSObject *)e->s)->release();
+    } else {
+        // the display may still reach these pages: keep them wired (leaked) rather than unwire memory DCN can fetch
+        FLIPLOG("release of handle %u (surface 0x%x) refused (0x%x, err %d) -- its pages stay wired", e->handle, e->sid, rr, r.err);
+    }
+    memset(e, 0, sizeof *e);
+}
+static void nmxFlipDropIdle()
+{
+    for (unsigned i = 0; i < kNmxFlipImports; i++)
+        if (gFl.imp[i].s && gFl.imp[i].handle != gFl.front && gFl.imp[i].handle != gFl.pend) nmxFlipDrop(&gFl.imp[i]);
+}
+static NmxImport *nmxFlipImportSurface(IOSurface *s, unsigned fmt, unsigned w, unsigned h, unsigned pitch)
+{
+    IOMemoryDescriptor *md = s->getMemoryDescriptor();
+    const unsigned sid = s->getSurfaceID();
+    if (!md) return nullptr;
+    int k = -1;
+    for (unsigned i = 0; i < kNmxFlipImports; i++)
+        if (gFl.imp[i].s == s && gFl.imp[i].md == md && gFl.imp[i].sid == sid && gFl.imp[i].fmt == fmt) {
+            gFl.imp[i].use = ++gFl.tick;
+            return &gFl.imp[i];
+        }
+    const unsigned slots = (gFl.maxImports && gFl.maxImports < kNmxFlipImports) ? gFl.maxImports : kNmxFlipImports;
+    for (unsigned i = 0; i < slots; i++) {
+        if (!gFl.imp[i].s) { k = (int)i; break; }
+        if (gFl.imp[i].handle == gFl.front || gFl.imp[i].handle == gFl.pend) continue;
+        if (k < 0 || gFl.imp[i].use < gFl.imp[k].use) k = (int)i;
+    }
+    if (k < 0) return nullptr;
+    NmxImport *e = &gFl.imp[k];
+    if (e->s) nmxFlipDrop(e);
+    if (md->getLength() < (unsigned long long)h * pitch) return nullptr;
+    if (md->prepare() != kIOReturnSuccess) { FLIPLOG("surface 0x%x would not wire for an import", sid); return nullptr; }
+    struct NMXFlipRequest r; memset(&r, 0, sizeof r);
+    r.md = md; r.offset = 0; r.width = w; r.height = h; r.pitch = pitch; r.format = fmt;
+    const IOReturn rr = nmxFlipCall(kFnImport, &r);
+    if (rr != kIOReturnSuccess || r.handle == NMX_FLIP_HOME || r.handle == NMX_FLIP_NONE) {
+        md->complete();
+        OSAddAtomic64(1, &gCntFlipImportFail);
+        FLIPLOG("import of surface 0x%x %ux%u pitch %u fmt %u refused (0x%x, err %d)", sid, w, h, pitch, fmt, rr, r.err);
+        return nullptr;
+    }
+    md->retain();
+    ((OSObject *)s)->retain();
+    e->s = s; e->md = md; e->sid = sid; e->handle = r.handle; e->fmt = fmt; e->gpu = r.gpuAddr; e->use = ++gFl.tick;
+    const SInt64 n = OSAddAtomic64(1, &gCntFlipImports);
+    if (n < 8 || (n & 255) == 0)
+        FLIPLOG("imported surface 0x%x %ux%u pitch %u fmt %u (%llu bytes) -> handle %u gpu 0x%llx (imports %lld)", sid, w, h, pitch, fmt,
+                (unsigned long long)md->getLength(), r.handle, r.gpuAddr, (long long)n + 1);
+    return e;
+}
+static void nmxCopyFrame(volatile unsigned int *d, unsigned dpitch, const volatile unsigned int *src, unsigned spitch,
+                         unsigned w, unsigned h, bool l10r)
+{
+    const unsigned spr = spitch / 4, dpr = dpitch / 4;
+    const unsigned words = (((spitch < dpitch) ? spitch : dpitch) & ~3u) / 4;
+    const unsigned n = (words < w) ? words : w;
+    for (unsigned y = 0; y < h; y++) {
+        const volatile unsigned int *sp = src + (unsigned long)y * spr;
+        volatile unsigned int *dp = d + (unsigned long)y * dpr;
+        if (l10r) {
+            for (unsigned x = 0; x < n; x++) {
+                const unsigned v = sp[x];
+                dp[x] = 0xff000000u | ((v >> 6) & 0xff0000u) | ((v >> 4) & 0xff00u) | ((v >> 2) & 0xffu);
+            }
+        } else memcpy((void *)dp, (const void *)sp, (size_t)n * 4);
+    }
+    __asm__ __volatile__("sfence" ::: "memory");
+}
+// Submit a flip to handle; lock held, nothing pending. True when it was queued (and, if wait, latched).
+static bool nmxFlipSubmit(void *pipe, unsigned handle, IOSurface *s, unsigned long long gpu, bool wait)
+{
+    struct NMXFlipRequest r; memset(&r, 0, sizeof r);
+    r.handle = handle;
+    const IOReturn rr = nmxFlipCall(kFnSubmit, &r);
+    if (rr != kIOReturnSuccess) {
+        OSAddAtomic64(1, &gCntFlipRefused);
+        gFl.errRun++;
+        FLIPLOG("submit of handle %u refused (0x%x, err %d)", handle, rr, r.err);
+        return false;
+    }
+    const SInt64 n = OSAddAtomic64(1, &gCntFlipSubmit);
+    if (n < 3) FLIPLOG("submitted handle %u seq %llu (surface 0x%x)%s", handle, r.seq, s ? s->getSurfaceID() : 0u, wait ? ", waiting for the latch" : "");
+    gFl.pend = handle; gFl.pendS = s; gFl.pendSeq = r.seq; gFl.pendGpu = gpu;
+    gFl.pendFence = s ? nmxSurfValue(s, "NMXFencePending") : 0;
+    __atomic_store_n(&gFl.result, kLatchNone, __ATOMIC_RELEASE);
+    if (!wait && pipe && !gFl.call) gFl.call = thread_call_allocate(nmxFlipPoll, nullptr);
+    if (wait || !pipe || !gFl.call) {
+        uint64_t ns = 0;
+        const int res = nmxFlipWaitLatch(r.seq, gFl.gen, kNmxFlipLatchCapNs, &ns);
+        OSAddAtomic64((SInt64)(ns / 1000), &gCntFlipWaitUs);
+        __atomic_store_n(&gFl.result, res, __ATOMIC_RELEASE);
+        nmxFlipRetire();
+        return true;
+    }
+    gFl.pipe = pipe;
+    ((OSObject *)pipe)->retain();
+    __atomic_store_n(&gFl.busy, 1, __ATOMIC_RELEASE);
+    thread_call_enter(gFl.call);
+    return true;
+}
+// True: the frame was presented here (flipped, re-presented, dropped, or copied into the home buffer and flipped home).
+// False: the home buffer is on screen and the caller does the K6 copy as before.
+static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *s, bool fenceOk,
+                           const volatile unsigned int *src, unsigned w, unsigned h, unsigned pitch, bool l10r,
+                           const struct NVRMVramRequest &q, IOPCIDevice *pci)
+{
+    const int mode = gNmxFlip;
+    if (!gFl.inited && mode == 0) return false;            // never turned on: not one extra instruction on the K6 path
+    if (!nmxFlipInit() || head != 0) return false;
+    IOLockLock(gFl.lock);
+    bool want = (mode == 1 || mode == 2) && !gNmxFlipTripped;
+    if (want && (gNmxFlipCaps < 0 || gFl.fb != fb)) {
+        gFl.fb = fb;
+        struct NMXFlipRequest r; memset(&r, 0, sizeof r);
+        const IOReturn rr = nmxFlipCall(kFnCaps, &r);
+        gNmxFlipCaps = (rr == kIOReturnSuccess) ? (int)(r.caps & 0x7fffffff) : 0;
+        gFl.caps = (unsigned)gNmxFlipCaps; gFl.maxImports = r.maxImports; gFl.gen = r.generation; gFl.w = r.width; gFl.h = r.height;
+        NmxScan sc;
+        (void)nmxScanFind(pci, h, &sc);   // maps BAR5 for the HUBP0 read-back
+        unsigned long long addr, inuse; bool pending;
+        nmxHubp0(&addr, &inuse, &pending);
+        ALOG("iop: flip: NMXGPU flip API %s (0x%x): caps 0x%x, %ux%u pitch %u, max imports %u, generation %u; HUBP0 addr 0x%llx in use 0x%llx%s",
+             gNmxFlipCaps ? "present" : "MISSING -- flips stay off, K6 copy", (unsigned)rr, gFl.caps, r.width, r.height, r.pitch,
+             r.maxImports, r.generation, addr, inuse, pending ? " pending" : "");
+    }
+    const unsigned caps = gFl.caps;
+    if (!(caps & NMX_FLIP_CAP_SUBMIT) || (mode == 1 && !(caps & NMX_FLIP_CAP_IMPORT)) || (mode == 2 && !(caps & NMX_FLIP_CAP_VRAM_CHAIN)))
+        want = false;
+    if (!want && gFl.front == NMX_FLIP_HOME && gFl.pend == NMX_FLIP_NONE && !gFl.busy) {
+        nmxFlipDropIdle();
+        IOLockUnlock(gFl.lock);
+        return false;
+    }
+
+    // 1. the previous flip must have latched before anything else is written or queued
+    if (gFl.pend != NMX_FLIP_NONE) {
+        const uint64_t t0 = mach_absolute_time();
+        uint64_t ns = 0;
+        while (__atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE) && ns < kNmxFlipBusyCapNs) {
+            IODelay(200);
+            absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+        }
+        if (__atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) {
+            OSAddAtomic64(1, &gCntFlipDrop);
+            FLIPLOG("previous flip (handle %u) still pending after 20 ms -- frame dropped", gFl.pend);
+            IOLockUnlock(gFl.lock);
+            return true;
+        }
+        nmxFlipRetire();
+    }
+    // 2. did the bridge put its own buffer back (display power, restore, hotplug)?
+    {
+        struct NMXFlipRequest st; memset(&st, 0, sizeof st);
+        if (nmxFlipCall(kFnStatus, &st) != kIOReturnSuccess) { nmxFlipTrip("flip status failed"); want = false; }
+        else if (st.generation != gFl.gen) nmxFlipResync("bridge went home");
+    }
+    // 3. zero copy: CoreDisplay must never draw into the surface on screen; its NVMTL fence mark says if it did
+    if (gFl.frontS && gFl.frontS != s) {
+        const unsigned long long f = nmxSurfValue(gFl.frontS, "NMXFencePending");
+        if (f > gFl.frontFence) {
+            OSAddAtomic64(1, &gCntFlipFrontWritten);
+            FLIPLOG("surface 0x%x got GPU work (fence %llu -> %llu) while on screen", gFl.frontS->getSurfaceID(), gFl.frontFence, f);
+            gFl.frontFence = f;
+            if (++gFl.frontWrites >= 16) nmxFlipTrip("CoreDisplay draws into the surface on screen; zero copy is not safe");
+        }
+    }
+    if (gNmxFlipTripped) want = false;
+
+    if (want && fenceOk && s && src && w == q.width && h == q.height) {
+        unsigned handle = NMX_FLIP_NONE;
+        unsigned long long gpu = 0;
+        IOSurface *ns = nullptr;
+        if (mode == 1) {
+            const unsigned fmt = l10r ? NMX_FLIP_FMT_XRGB2101010 : NMX_FLIP_FMT_XRGB8888;
+            const unsigned need = l10r ? NMX_FLIP_CAP_XRGB2101010 : NMX_FLIP_CAP_XRGB8888;
+            if (s == gFl.frontS) {
+                OSAddAtomic64(1, &gCntFlipSame);
+                gFl.frontFence = nmxSurfValue(s, "NMXFencePending");
+                IOLockUnlock(gFl.lock);
+                return true;
+            }
+            if ((caps & need) && (pitch & 255) == 0) {
+                if (NmxImport *e = nmxFlipImportSurface(s, fmt, w, h, pitch)) { handle = e->handle; gpu = e->gpu; ns = s; }
+                else gFl.errRun++;
+            }
+        } else {
+            if (!gFl.bufTried) {
+                gFl.bufTried = true;
+                struct NMXFlipRequest r; memset(&r, 0, sizeof r);
+                const IOReturn rr = nmxFlipCall(kFnBuffers, &r);
+                gFl.nbuf = 0;
+                for (unsigned i = 0; rr == kIOReturnSuccess && i < r.nbuffers && i < NMX_FLIP_MAX_BUFFERS; i++) {
+                    const struct NMXFlipBuffer &b = r.buf[i];
+                    if (b.kva && b.pitch >= 4 * w && b.size >= (unsigned long long)b.pitch * h && b.handle != NMX_FLIP_NONE)
+                        gFl.buf[gFl.nbuf++] = b;
+                }
+                ALOG("iop: flip: VRAM chain (0x%x, err %d): %u of %u buffers usable", (unsigned)rr, r.err, gFl.nbuf, r.nbuffers);
+                for (unsigned i = 0; i < gFl.nbuf; i++)
+                    ALOG("iop: flip:   buffer %u: handle %u phys 0x%llx gpu 0x%llx pitch %u (%llu bytes)", i, gFl.buf[i].handle,
+                         gFl.buf[i].phys, gFl.buf[i].gpuAddr, gFl.buf[i].pitch, gFl.buf[i].size);
+                if (gFl.nbuf < 2) nmxFlipTrip("NMXGPU gave fewer than two usable VRAM scan-out buffers");
+            }
+            for (unsigned i = 0; i < gFl.nbuf && handle == NMX_FLIP_NONE; i++)
+                if (gFl.buf[i].handle != gFl.front) {
+                    nmxCopyFrame((volatile unsigned int *)gFl.buf[i].kva, gFl.buf[i].pitch, src, pitch, w, h, l10r);
+                    handle = gFl.buf[i].handle; gpu = gFl.buf[i].gpuAddr;
+                }
+        }
+        if (handle != NMX_FLIP_NONE && nmxFlipSubmit(pipe, handle, ns, gpu, gNmxFlipSync != 0)) {
+            IOLockUnlock(gFl.lock);
+            return true;
+        }
+        if (gFl.errRun >= 8) nmxFlipTrip("8 flips in a row failed");
+    }
+
+    // 4. the K6 copy. The home buffer has to be on screen for it, so if it is not, copy into it while it is off screen
+    //    (no pacing needed) and flip home; then later frames take the paced copy as before.
+    OSAddAtomic64(1, &gCntFlipFallback);
+    if (gFl.front != NMX_FLIP_HOME) {
+        if (src && w == q.width && h == q.height) nmxCopyFrame((volatile unsigned int *)q.kva, q.pitch, src, pitch, w, h, l10r);
+        OSAddAtomic64(1, &gCntFlipHome);
+        if (!nmxFlipSubmit(pipe, NMX_FLIP_HOME, nullptr, 0, true))
+            nmxFlipTrip("could not flip back to the home buffer -- the panel keeps the last flipped frame");
+        FLIPLOG("back home (on screen now handle %u) for a copied frame", gFl.front);
+        IOLockUnlock(gFl.lock);
+        return true;
+    }
+    IOLockUnlock(gFl.lock);
+    return false;
+}
+#endif
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const SInt64 trace = OSAddAtomic64(1, &gCntIopPerform);
@@ -1146,7 +1773,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     OSObject  *ro = txn->getPlaneResource(0, 0);
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
 
-    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
+    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false, l10r = false;
+    bool fenceOk = true;
     NVResource *res = OSDynamicCast(NVResource, ro);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     static SInt32 gIopK6Logs;
@@ -1181,9 +1809,14 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // Such a frame now keeps the previous picture on the panel instead.
 #ifndef NMX_ACCEL
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+#else
+        fenceOk = nmxFenceWait(s);
 #endif
         const unsigned fmt = s->getPixelFormat();
-        if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
+        // WindowServer moves the display surface to 10-bit 'l10r' (ARGB2101010) once colour management is up; the panel
+        // is 8-bit XRGB, so those frames are narrowed while copied (the 780M's fix, nullarc 676445d)
+        l10r = fmt == 0x6C313072u;
+        if (fmt != 0x42475241u && !l10r) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA or l10r", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
         if (!W || !H || P < 4 || W > 16384 || H > 16384 || P > 16384ull * 8) NVIOP_FAIL(kIOReturnBadArgument, "surface geometry %llux%llu pitch %llu", W, H, P);
         if (P < 4 * W || (P & 3)) NVIOP_FAIL(kIOReturnBadArgument, "surface %llux%llu: row pitch %llu is under 4*W or not word-aligned", W, H, P);
@@ -1206,21 +1839,130 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
 #ifndef NMX_ACCEL
     nvAccelIopHome(fb, head);
+#else
+    if (nmxFlipPresent(this, fb, head, fromRes ? nullptr : s, fenceOk, src, w, h, pitch, l10r, q, a->fPCI)) {
+        OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+        OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+        return kIOReturnSuccess;
+    }
 #endif
     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
-    for (unsigned y = 0; y < h; y++) {
-        const volatile unsigned int *sp = src + (unsigned long)y * spr;
-        volatile unsigned int *dp = d + (unsigned long)y * dpr;
+    auto copyRows = [&](unsigned y0, unsigned y1) {
+        for (unsigned y = y0; y < y1; y++) {
+            const volatile unsigned int *sp = src + (unsigned long)y * spr;
+            volatile unsigned int *dp = d + (unsigned long)y * dpr;
+            if (l10r) {
+                for (unsigned x = 0; x < words; x++) {
+                    const unsigned v = sp[x];
+                    dp[x] = 0xff000000u | ((v >> 6) & 0xff0000u) | ((v >> 4) & 0xff00u) | ((v >> 2) & 0xffu);
+                }
+                continue;
+            }
 #ifdef NMX_ACCEL
-        memcpy((void *)dp, (const void *)sp, (size_t)words * 4);
+            memcpy((void *)dp, (const void *)sp, (size_t)words * 4);
 #else
-        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
+            for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
 #endif
-    }
+        }
+    };
 #ifdef NMX_ACCEL
-    __asm__ __volatile__("sfence" ::: "memory");
+    NmxScan sc;
+    if (gNmxBeam && nmxScanFind(a->fPCI, h, &sc)) {
+        // Lines are counted from row 0 of the refresh being scanned now (pass 0); row r of the next refresh is line
+        // vtotal + r. A line in the top blank belongs to the next refresh. Band [y0, y1) is written once the scan is past
+        // y1 + M in pass 0, and must be done before the scan reaches y0 - M of pass 1.
+        enum : unsigned { kBand = 48, kMargin = 8 };
+        const uint64_t t0 = mach_absolute_time();
+        uint64_t waitAbs = 0, toNs = 0;
+        UInt32 prev = nmxScanLine(sc);
+        long base = (prev < sc.vbe) ? (long)sc.vtotal : 0;
+        auto line = [&]() -> long {
+            const UInt32 v = nmxScanLine(sc);
+            if (v < prev) base += sc.vtotal;
+            prev = v;
+            return base + (long)v - (long)sc.vbe;
+        };
+        bool lapped = false, gaveUp = false;
+        // Waits used to spin with pause, about 3.4 ms of CPU per frame (debug.nmxaccel_beam_wait_us / frames). Now the
+        // wait sleeps until ~kWakeEarlyNs before the scan should reach the line, then spins the rest. The line period
+        // comes from earlier copies (scan lines over wall time); until it is known, waits spin as before.
+        static uint64_t gBeamNsPerLine;   // 0 = not measured yet
+        enum : uint64_t { kWakeEarlyNs = 150000, kMinSleepNs = 300000 };
+        auto waitLine = [&](long target) -> long {
+            long L = line();
+            if (L >= target || gaveUp) return L;
+            const uint64_t w0 = mach_absolute_time();
+            if (gBeamNsPerLine) {
+                const uint64_t ns = (uint64_t)(target - L) * gBeamNsPerLine;
+                // line() only sees a wrap if it reads the counter once per refresh: never sleep across one
+                const uint64_t maxNs = (uint64_t)(sc.vtotal > 64 ? sc.vtotal - 64 : 0) * gBeamNsPerLine;
+                if (ns > kMinSleepNs && ns < maxNs) IODelay((unsigned)((ns - kWakeEarlyNs) / 1000));
+            }
+            while ((L = line()) < target) {
+                __builtin_ia32_pause();
+                absolutetime_to_nanoseconds(mach_absolute_time() - w0, &toNs);
+                if (toNs > 40000000ull) { gaveUp = true; break; }   // 40 ms: the counter is not moving
+            }
+            waitAbs += mach_absolute_time() - w0;
+            return L;
+        };
+        // Too late in this refresh for the copy to finish ahead of the next one: trail the next refresh instead
+        static unsigned gBeamCopyLines;   // the last copies' length in scan lines, waits excluded; 0 = not measured yet
+        const long est = gBeamCopyLines ? (long)gBeamCopyLines + 32 : (long)h;
+        long Ls = line();
+        if (Ls + est > (long)sc.vtotal + (long)h - (long)kMargin) {
+            waitLine((long)sc.vtotal);
+            if (!gaveUp) base -= (long)sc.vtotal;
+            Ls = line();
+        }
+        // The copy outruns the scan, so every band would wait a little. Start it late enough that the last band only
+        // has to wait for the scan to pass h + kMargin: one sleep instead of ~h/kBand short spins.
+        if (gBeamCopyLines && !gaveUp) {
+            const long start = (long)h + (long)kMargin + 16 - (long)gBeamCopyLines;
+            if (start > Ls) Ls = waitLine(start);
+        }
+        const uint64_t tS = mach_absolute_time();
+        for (unsigned y0 = 0; y0 < h; y0 += kBand) {
+            const unsigned y1 = (y0 + kBand < h) ? y0 + kBand : h;
+            const long need = (y1 + kMargin >= h) ? (long)h : (long)(y1 + kMargin);
+            const long L = waitLine(need);
+            if (L > (long)sc.vtotal + (long)y0) lapped = true;   // the next refresh already scanned past this band
+            copyRows(y0, y1);
+        }
+        __asm__ __volatile__("sfence" ::: "memory");
+        uint64_t allNs = 0, waitNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - t0, &allNs);
+        absolutetime_to_nanoseconds(waitAbs, &waitNs);
+        const long Le = line();
+        uint64_t spanNs = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - tS, &spanNs);
+        if (!gaveUp && allNs > waitNs && spanNs >= allNs - waitNs && Le > Ls) {
+            // the scan's lines per ns over this copy, times the time spent copying
+            const unsigned cl = (unsigned)((unsigned long long)(Le - Ls) * (allNs - waitNs) / spanNs);
+            gBeamCopyLines = (cl > gBeamCopyLines) ? cl : gBeamCopyLines - gBeamCopyLines / 8 + cl / 8;
+            // the scan is constant-rate, so the whole span (waits included) over the lines it covered is the period
+            if (Le - Ls >= 64) gBeamNsPerLine = spanNs / (uint64_t)(Le - Ls);
+        }
+        OSAddAtomic64(1, (lapped || gaveUp) ? &gCntBeamLapped : &gCntBeamOk);
+        OSAddAtomic64((SInt64)(waitNs / 1000), &gCntBeamWaitUs);
+        OSAddAtomic64((SInt64)(allNs / 1000), &gCntBeamCopyUs);
+        static SInt32 gBeamLogs;
+        const SInt64 nb = gCntBeamOk + gCntBeamLapped;
+        if ((nb <= 3 || nb == 600 || nb == 6000) && gBeamLogs < 8) {
+            OSIncrementAtomic(&gBeamLogs);
+            ALOG("iop: beam: OTG%u vtotal %u active %u-%u: copy %llu us, waited %llu us, copy ~%u lines, %llu ns/line%s%s (ok %lld lapped %lld)",
+                 sc.otg, sc.vtotal, sc.vbe, sc.vbs, allNs / 1000, waitNs / 1000, gBeamCopyLines, gBeamNsPerLine, lapped ? ", LAPPED" : "",
+                 gaveUp ? ", scan counter stuck" : "", (long long)gCntBeamOk, (long long)gCntBeamLapped);
+        }
+    } else {
+        OSAddAtomic64(1, &gCntBeamOff);
+        copyRows(0, h);
+        __asm__ __volatile__("sfence" ::: "memory");
+    }
+#else
+    copyRows(0, h);
 #endif
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
@@ -1360,6 +2102,35 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_validate);
     sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_complete);
     sysctl_register_oid(&sysctl__debug_nmxaccel_pipe_perform);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_ok);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_lapped);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_off);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_wait_us);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_beam_copy_us);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_wait);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_frames);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_waited);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_wait_us);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_timeouts);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_sync);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_api);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_tripped);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_submitted);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_latched);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_fallback);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_refused);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_timeouts);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_home);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_imports);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_import_fail);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_front_written);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_wait_us);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_same);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_drop);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_generation);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_hw_mismatch);
     gSysctlInstalled = true;
 #else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);

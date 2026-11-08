@@ -1,5 +1,5 @@
 /*
- * AGDC service for the 890M (NMXGPUFB). Derived from NVRMAGDC (NullMoth NVIDIA driver for macOS)
+ * AGDC service for the 890M (NMXAMDFB). Derived from NVRMAGDC (NullMoth NVIDIA driver for macOS)
  * Copyright (c) 2026 NullMoth Systems.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
@@ -182,7 +182,7 @@ static void nmxAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdc
 static void nmxAgdcTargets(IOService **pci, IOService **fb)
 {
     *pci = nullptr; *fb = nullptr;
-    OSDictionary *m = IOService::serviceMatching("NMXGPUFB"); if (!m) return;
+    OSDictionary *m = IOService::serviceMatching("NMXAMDFB"); if (!m) return;
     IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
     IOService *p = f->getProvider(); int hops = 0;
     while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
@@ -196,7 +196,7 @@ static void nmxAgdcScan(IOService *pci)
 {
     nmxAgdcDropTable(); gAgdcScanLogged = 0;
     IOService *tab[kAgdcMaxFB] = {}; unsigned seen = 0, noidx = 0, range = 0, dup = 0, other = 0, hole = 0;
-    OSDictionary *m = IOService::serviceMatching("NMXGPUFB");
+    OSDictionary *m = IOService::serviceMatching("NMXAMDFB");
     OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr; OSSafeReleaseNULL(m);
     if (!it) { snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)"); FBLOG("AGDC: slot table %s", gAgdcFBMap); return; }
     OSObject *o;
@@ -243,7 +243,7 @@ static void nmxAgdcWorkBody(void)
         if (!pci || !fb) {
             gAgdcState = -1;
             if (gAgdcTries++ % 20 == 0) FBLOG("AGDC: no PCI device or no framebuffer yet (pci %p fb %p), try %u", pci, fb, gAgdcTries);
-            // NMXGPUFB starts after this loader; look again until it is there (2 minutes at most).
+            // NMXAMDFB starts after this loader; look again until it is there (2 minutes at most).
             if (gAgdcTries < 240 && gAgdcCall && !gAgdcStopping) {
                 uint64_t dl = 0; clock_interval_to_deadline(500, 1000000, &dl); thread_call_enter_delayed(gAgdcCall, dl);
             }
@@ -333,7 +333,7 @@ bool NMXAGDCLoader::start(IOService *provider)
     gAgdcStopping = false; gAgdcWant = 1;
     gAgdcCall = thread_call_allocate(nmxAgdcWork, nullptr);
     if (gAgdcCall) thread_call_enter(gAgdcCall);
-    FBLOG("loaded; AGDC for the 890M starts when NMXGPUFB is up"); return true;
+    FBLOG("loaded; AGDC for the 890M starts when NMXAMDFB is up"); return true;
 }
 void NMXAGDCLoader::stop(IOService *provider)
 {

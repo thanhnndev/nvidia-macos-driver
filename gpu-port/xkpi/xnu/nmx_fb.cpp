@@ -21,8 +21,11 @@ static IOPMPowerState kFbPowerStates[2] = {
     { kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
 };
 
-class NMXGPUFB : public IOFramebuffer {
-    OSDeclareDefaultStructors(NMXGPUFB)
+// The class name carries "AMD": CoreDisplay tells the GPU vendor from the framebuffer's class name (Intel, AMD,
+// AppleParavirt); any other name turns IOPresentment off and WindowServer composites the panel with CompositorSW,
+// which asserts in CA::OGL::Context::push_surface once a Metal device exists (2026-11-02 boot loop).
+class NMXAMDFB : public IOFramebuffer {
+    OSDeclareDefaultStructors(NMXAMDFB)
     void *fDev = nullptr;
     nmx_fb_info fInfo = {};
     nmx_fb_display_info fDisplay = {};
@@ -49,7 +52,7 @@ class NMXGPUFB : public IOFramebuffer {
     }
 
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
-        NMXGPUFB *me = (NMXGPUFB *)p0;
+        NMXAMDFB *me = (NMXAMDFB *)p0;
         if (me->fStopping) return;
         if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
         uint64_t period;
@@ -168,7 +171,13 @@ public:
     }
 
     /* Display-pipe adapter only. CPU physical addresses are not NVIDIA
-     * VRAM handles or RADV GPU virtual addresses: never export them as such. */
+     * VRAM handles or RADV GPU virtual addresses: never export them as such.
+     * The scanout's physical address (in the 890M's BAR) is still reported: with
+     * phys 0 the accelerator made no framebuffer resource, IOAcceleratorFamily
+     * never marked the display pipe active, and every WindowServer transaction
+     * ended "Fallback GPU Display Pipe transaction submission failed" before
+     * performTransaction ran; the login window never reached the panel
+     * (2026-11-02, same fix as the 780M's PhxAMDFB). */
     IOReturn callPlatformFunction(const OSSymbol *fn, bool wait,
                                   void *p1, void *p2, void *p3, void *p4) override {
         if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
@@ -181,7 +190,7 @@ public:
                 return kIOReturnNotReady;
             }
             r->kva = reinterpret_cast<void *>(fInfo.kva);
-            r->phys = 0;
+            r->phys = fInfo.phys;
             r->handle = nullptr;
             r->actualSize = fInfo.size;
             r->width = fInfo.width; r->height = fInfo.height; r->pitch = fInfo.pitch;
@@ -339,7 +348,7 @@ public:
         }
     }
 };
-OSDefineMetaClassAndStructors(NMXGPUFB, IOFramebuffer)
+OSDefineMetaClassAndStructors(NMXAMDFB, IOFramebuffer)
 
 /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
 IOService *nmx_fb_publish(IOService *gpu, void *dev)
@@ -350,7 +359,7 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev)
         FBLOG("no framebuffer (%d)", err);
         return nullptr;
     }
-    NMXGPUFB *fb = OSTypeAlloc(NMXGPUFB);
+    NMXAMDFB *fb = OSTypeAlloc(NMXAMDFB);
     if (fb == nullptr || !fb->initWith(dev, info) || !fb->attach(gpu)) {
         OSSafeReleaseNULL(fb);
         nmx_fb_close(dev);
