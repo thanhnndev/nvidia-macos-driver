@@ -186,6 +186,12 @@ NMX_CNT(nmx_jobs_no_flush, gNmxJobsNoFlush, "of those, submissions with no VM fl
 NMX_CNT(nmx_timeouts, gNmxTimeouts, "AMD submissions the scheduler reported as timed out");
 NMX_CNT(nmx_grab_flushed, gNmxGrabFlushed, "VMID assignments that asked for a flush");
 NMX_CNT(nmx_grab_skipped, gNmxGrabSkipped, "VMID assignments that skipped the flush");
+extern "C" volatile SInt64 gNmxPinWriteFail, gNmxPinWriteRetryOk, gNmxPinRoRetry, gNmxPinLastRc, gNmxPinLastRc2;
+NMX_CNT(nmx_pin_write_fail, gNmxPinWriteFail, "Step132: writable user-page wires that failed the first time");
+NMX_CNT(nmx_pin_write_retry_ok, gNmxPinWriteRetryOk, "Step132: of those, wires that worked after a read fault-in");
+NMX_CNT(nmx_pin_ro_retry, gNmxPinRoRetry, "Step96/132: userptr BOs pinned read-only after a failed writable pin");
+NMX_CNT(nmx_pin_last_rc, gNmxPinLastRc, "Step132: IOReturn of the last failed first writable wire");
+NMX_CNT(nmx_pin_last_rc2, gNmxPinLastRc2, "Step132: IOReturn of the last writable wire that failed again after fault-in");
 NMX_CNT(nmx_grab_stray, gNmxGrabStray,
         "VMID assignments that skipped the flush while the VMID still belonged to another VM");
 
@@ -225,6 +231,11 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_grab_flushed);
     sysctl_register_oid(&sysctl__debug_nmx_grab_skipped);
     sysctl_register_oid(&sysctl__debug_nmx_grab_stray);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_write_fail);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_write_retry_ok);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_ro_retry);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_last_rc);
+    sysctl_register_oid(&sysctl__debug_nmx_pin_last_rc2);
     sysctl_register_oid(&sysctl__debug_nmx_umap_cache);
     sysctl_register_oid(&sysctl__debug_nmx_wbinvd);
     sysctl_register_oid(&sysctl__debug_nmx_umap_flush);

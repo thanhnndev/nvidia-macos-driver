@@ -15,6 +15,12 @@
 #include <sys/systm.h>
 #include "nmx_xnu.h"
 
+/* Step132 pin counters (debug.nmx_pin_*, registered in nmx_kext.cpp) */
+extern "C" {
+volatile SInt64 gNmxPinWriteFail, gNmxPinWriteRetryOk, gNmxPinRoRetry, gNmxPinLastRc, gNmxPinLastRc2;
+}
+static volatile SInt32 gNmxPinSay;
+
 namespace {
 struct MmTask {
     void *mm;
@@ -125,11 +131,40 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
      * keeps this wiring keeps the mm, whose record keeps the task */
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE,
                                                                   write ? kIODirectionOutIn : kIODirectionOut, task);
+    if (md == nullptr) {
+        if (mm != nullptr)
+            task_deallocate(task);
+        return ENOMEM;
+    }
+    IOReturn rc = md->prepare();
+    if (rc != kIOReturnSuccess && write) {
+        /* ga403wm Step132: a writable wire of a fresh IOSurface (none of its pages resident yet) failed, and the
+         * userptr ioctl then fell back to a read-only pin (Step96) of memory the GPU is asked to write: the write
+         * faulted (PERMISSION_FAULTS 0x5) and the gfx ring hung for the 3 s timeout (mediaanalysisd, 12:42). Wire the
+         * range read-only once to fault it in, then wire it for write again; only a second failure goes on to the
+         * read-only fallback. The return codes are kept in debug.nmx_pin_* so the cause stays visible. */
+        __atomic_add_fetch(&gNmxPinWriteFail, 1, __ATOMIC_RELAXED);
+        gNmxPinLastRc = (SInt64)(uint32_t)rc;
+        IOMemoryDescriptor *rd = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, npages * PAGE_SIZE,
+                                                                      kIODirectionOut, task);
+        if (rd != nullptr) {
+            if (rd->prepare() == kIOReturnSuccess)
+                rd->complete();
+            rd->release();
+        }
+        rc = md->prepare();
+        if (rc == kIOReturnSuccess)
+            __atomic_add_fetch(&gNmxPinWriteRetryOk, 1, __ATOMIC_RELAXED);
+        else
+            gNmxPinLastRc2 = (SInt64)(uint32_t)rc;
+        if (__atomic_add_fetch(&gNmxPinSay, 1, __ATOMIC_RELAXED) <= 16)
+            IOLog("NMX pin: write wire of %llx (%zu pages) failed %#x, after a read fault-in %s %#x\n",
+                  (unsigned long long)uaddr, npages, (unsigned)gNmxPinLastRc, rc == kIOReturnSuccess ? "ok" : "failed",
+                  (unsigned)rc);
+    }
     if (mm != nullptr)
         task_deallocate(task);
-    if (md == nullptr)
-        return ENOMEM;
-    if (md->prepare() != kIOReturnSuccess) {
+    if (rc != kIOReturnSuccess) {
         md->release();
         return EFAULT;
     }

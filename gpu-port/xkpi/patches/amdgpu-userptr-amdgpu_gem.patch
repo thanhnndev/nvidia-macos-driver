@@ -1,12 +1,13 @@
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-07 15:10:56
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-07 15:15:56
-@@ -410,7 +410,103 @@
+@@ -410,7 +410,107 @@
  	args->out.handle = handle;
  	return 0;
  }
 +
 +#ifdef NMXKPI
 +void nmx_cs_report_name(const char *what, int r, bool always);	/* amdgpu_cs.c, Step95 */
++extern volatile long long gNmxPinRoRetry;	/* nmx_mm.cpp, Step132 */
  
 +/*
 + * macOS port (ga403wm Step92): userptr without HMM. This build has no CONFIG_HMM_MIRROR, so amdgpu_hmm_register() is
@@ -97,6 +98,9 @@
 +	if (!r)
 +		r = nmx_userptr_pin(bo, args, filp, handle);
 +	nmx_cs_report_name("userptr_ro_retry", r, true);	/* "-> 0" when the read-only pin worked */
++	if (!r)	/* Step132: counted (debug.nmx_pin_ro_retry); the log budget runs out at boot. args->flags now
++		 * carries READONLY and goes back to userspace with the ioctl, so a caller can tell. */
++		__atomic_add_fetch(&gNmxPinRoRetry, 1, __ATOMIC_RELAXED);
 +	return r;
 +}
 +#endif
@@ -104,7 +108,7 @@
  int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
  			     struct drm_file *filp)
  {
-@@ -457,6 +553,13 @@
+@@ -457,6 +557,13 @@
  	if (r)
  		goto release_object;
  
