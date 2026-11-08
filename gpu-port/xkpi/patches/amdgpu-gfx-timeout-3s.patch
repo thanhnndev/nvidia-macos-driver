@@ -1,0 +1,17 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4040,7 +4040,13 @@
+ 	 * In SR-IOV or passthrough mode, timeout for compute
+ 	 * jobs are 60000 by default.
+ 	 */
+-	adev->gfx_timeout = msecs_to_jiffies(10000);
++	/*
++	 * NullMoth (ga403wm Step130): 3 s, not 10 s. One app's faulting GFX job (a GPU write to a read-only userptr page)
++	 * stalls the shared ring; WindowServer's Metal backend (NVMTL) gives up on a fence after 5 s and the next window
++	 * capture aborts WindowServer (2026-11-07 23:18: soft recovery came at 10 s). Soft recovery of the guilty job must
++	 * finish inside that budget. The lockup_timeout parameter still overrides this.
++	 */
++	adev->gfx_timeout = msecs_to_jiffies(3000);
+ 	adev->sdma_timeout = adev->video_timeout = adev->gfx_timeout;
+ 	if (amdgpu_sriov_vf(adev))
+ 		adev->compute_timeout = amdgpu_sriov_is_pp_one_vf(adev) ?
