@@ -980,7 +980,7 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // the application lets the surface go. Clients render into a pool of 2-3 IOSurfaces and WindowServer only holds the
 // one on screen, so dropping an entry as soon as its surface is unheld re-imported a 2880x1800 surface (5085 pages
 // pinned, then put) every frame: ~20% of WindowServer's main thread on the 890M (docs/890M-TRACE.md Step93). Unheld
-// host entries stay for NVMTL_KEEP_MS (default 3000) and at most NVMTL_KEEP_IDLE (default 48) of them; the backing
+// host entries stay for NVMTL_KEEP_MS (default 30000) and at most NVMTL_KEEP_IDLE (default 48) of them; the backing
 // still holds the surface, so its memory and ID stay valid meanwhile.
 //
 // The maps are keyed by NVMTLSurfKey, not by an NSArray of NSNumbers: -[NSArray hash] is the element count, so every
@@ -1076,9 +1076,11 @@ static size_t nvmtl_sk_bytes(NVMTLTexture *b) { return b->_surf ? IOSurfaceGetAl
 // rendering into a pool of 2-3 surfaces, WindowServer holding only the one on screen) evicted surfaces that came
 // back a frame later: ~1000 re-imports per 30 s, each a pin + GPU map + unmap + free. NVMTL_KEEP_MS (3 s) still drops
 // every idle entry the GPU has not touched for that long, so the extra room only holds surfaces in use.
+// 2026-11-08 YouTube spindump: 46 % of the WS main thread was re-imports of entries idle 4-9 s at the drop (mostly
+// 2880x1800 layers) that came back right after; NVMTL_KEEP_MS is now 30 s, NVMTL_KEEP_IDLE_MAX / _MB still bound it.
 static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1; static uint64_t keepIdleBytes;
-    if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 3000;
+    if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 30000;
                       e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48;
                       e = getenv("NVMTL_KEEP_IDLE_MAX"); keepIdleMax = e ? atol(e) : 512; if (keepIdleMax < keepIdle) keepIdleMax = keepIdle;
                       e = getenv("NVMTL_KEEP_IDLE_MB"); keepIdleBytes = (uint64_t)(e ? atol(e) : 1024) << 20;
