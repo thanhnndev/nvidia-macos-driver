@@ -1034,7 +1034,7 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // under another key, or a surface whose entry the sweep dropped, and why). Under @synchronized(device) like the rest.
 enum { NVMTL_GONE_UNHELD = 1, NVMTL_GONE_EXPIRED = 2, NVMTL_GONE_CAP = 3 };
 static struct { uint64_t hits, misses, fresh, otherKey, gone[4], sweeps, sweepNsMax, sweepNsSum, logged, lastLogMs, drops, idleBytes, maxSweepDrops,
-                expBack[4], expLogged, heldRefresh, viewRefresh, capBack[4], capLogged, sweepSkips, okLogged; } nvmtl_sk;
+                expBack[4], expLogged, heldRefresh, viewRefresh, useRefresh, capBack[4], capLogged, sweepSkips, okLogged; } nvmtl_sk;
 // surface ID -> (drop time ms << 20) | idle ms at the drop (clamped), so an expired miss says how long the entry had been
 // idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
 static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropAt;
@@ -1047,13 +1047,13 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
     nvlog("surface keep: %llu s: hits %llu, misses %llu (new surface %llu, same surface other key %llu, after drop: "
           "unheld %llu, expired %llu, idle cap %llu), %lu entries, sweep avg %llu us max %llu us; %llu dropped (released off the "
           "main thread), idle %llu MB at the last sweep, slowest sweep dropped %llu; expired came back < 250 ms %llu, < 1 s %llu, "
-          "< 3 s %llu, later %llu; held entries refreshed %llu (by a live wrapper %llu); idle-cap drops came back < 250 ms %llu, "
+          "< 3 s %llu, later %llu; held entries refreshed %llu (by a live wrapper %llu, by IOSurfaceIsInUse %llu); idle-cap drops came back < 250 ms %llu, "
           "< 1 s %llu, < 3 s %llu, later %llu; sweeps skipped (rate limit) %llu",
           (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.hits, nvmtl_sk.misses, nvmtl_sk.fresh,
           nvmtl_sk.otherKey, nvmtl_sk.gone[NVMTL_GONE_UNHELD], nvmtl_sk.gone[NVMTL_GONE_EXPIRED], nvmtl_sk.gone[NVMTL_GONE_CAP],
           (unsigned long)keep.count, nvmtl_sk.sweeps ? nvmtl_sk.sweepNsSum / nvmtl_sk.sweeps / 1000 : 0,
           nvmtl_sk.sweepNsMax / 1000, nvmtl_sk.drops, nvmtl_sk.idleBytes >> 20, nvmtl_sk.maxSweepDrops,
-          nvmtl_sk.expBack[0], nvmtl_sk.expBack[1], nvmtl_sk.expBack[2], nvmtl_sk.expBack[3], nvmtl_sk.heldRefresh, nvmtl_sk.viewRefresh,
+          nvmtl_sk.expBack[0], nvmtl_sk.expBack[1], nvmtl_sk.expBack[2], nvmtl_sk.expBack[3], nvmtl_sk.heldRefresh, nvmtl_sk.viewRefresh, nvmtl_sk.useRefresh,
           nvmtl_sk.capBack[0], nvmtl_sk.capBack[1], nvmtl_sk.capBack[2], nvmtl_sk.capBack[3], nvmtl_sk.sweepSkips);
     const uint64_t logged = nvmtl_sk.logged;
     memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
@@ -1177,6 +1177,14 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
         // NVMTL_KEEP_VIEW_MS (60 s) after the last wrap, so a reference that never goes cannot pin a surface forever.
         if (b->_surf && b->_hostOn && CFGetRetainCount((__bridge CFTypeRef)b) > 1 && now - e->_wrap < (uint64_t)keepViewMs) {
             if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; nvmtl_sk.viewRefresh++; } return; }
+        // In use by this process through another IOSurfaceRef or a mach port, or by the window server (use count).
+        // IOSurfaceLookupFromMachPort returns a new IOSurfaceRef on every lookup, so the retain count above misses a
+        // surface the caller keeps as a port and looks up per use (Chrome's GPU process: GpuMemoryBuffer handles).
+        // IOSurfaceIsInUse sees that (a port or a second object in this process, or a non-zero use count), costs ~4 ns
+        // (no kernel call) and does not see other processes' references, so WindowServer does not hold every client
+        // surface through it (docs/890M-TRACE.md part 31). Same NVMTL_KEEP_VIEW_MS bound after the last wrap as above.
+        if (b->_surf && b->_hostOn && IOSurfaceIsInUse(b->_surf) && now - e->_wrap < (uint64_t)keepViewMs) {
+            if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; nvmtl_sk.useRefresh++; } return; }
         // Small surfaces (Electron / CoreAnimation tiles, <= NVMTL_KEEP_SMALL_KB) stay NVMTL_KEEP_SMALL_MS (120 s): on
         // 2026-11-08 1472x256 / 768x64 / 320x64 tiles came back 40-200 ms after a drop at ~28 s idle (CPU-THERMALS.md).
         if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)((long)nvmtl_sk_bytes(b) <= smallBytes ? MAX(keepMs, keepSmallMs) : keepMs)) {
