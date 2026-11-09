@@ -30,7 +30,15 @@ void nmx_malloc_forget_contig(void *addr);
 MALLOC_DEFINE(M_NMXPAGE, "nmxpage", "page records");
 
 #define CHUNK_PAGES 512                    /* 2 MB of 4 KB pages */
-#define REG_BUCKETS 65536                  /* page registry hash: page frame number -> struct vm_page */
+/*
+ * page registry hash: page frame number -> struct vm_page.
+ * ga403wm Step140: 65536 buckets held ~1.7M records (854k port pages + 826k pinned user pages on the 2026-11-09 13:06
+ * boot), so chains averaged ~26 heap nodes and every new user page walked one twice (miss, then the re-check after the
+ * malloc). A kernel spindump of maximised 1080p60 Chrome had 171 of 216 import samples (79 %) on the chain compare in
+ * nmx_user_pages_pin (inlined reg_find_locked), against 27 in the xnu wire. 2M buckets (16 MB of pointers) keep the
+ * average chain below one at today's counts.
+ */
+#define REG_BUCKETS (1u << 21)
 #define DMA32_LIMIT 0xffffffffULL
 
 enum backing_kind { BK_CHUNK = 1, BK_RUN = 2, BK_FICTITIOUS = 3, BK_USER = 4 };
@@ -80,7 +88,7 @@ uint64_t gNmxPagesLive;                   /* pages currently handed out (all kin
 
 static unsigned reg_bucket(vm_paddr_t pfn)
 {
-    return (unsigned)((pfn ^ (pfn >> 16)) & (REG_BUCKETS - 1));
+    return (unsigned)((pfn ^ (pfn >> 21)) & (REG_BUCKETS - 1));
 }
 
 static lck_spin_t *reg_lock_of(vm_paddr_t pfn)
