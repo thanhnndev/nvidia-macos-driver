@@ -1191,11 +1191,26 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     uint64_t idleBytes = 0;
     for (NVMTLSurfKey *k in idle) idleBytes += nvmtl_sk_bytes(keep[k]->_tex);
     if ((long)idle.count > keepIdle && ((long)idle.count > keepIdleMax || idleBytes > keepIdleBytes)) {
-        // Drop order: idle age x bytes, largest first. Plain LRU dropped small tiles idle ~28 s (back in 40-200 ms) while the
-        // byte cap was full of 20 MB display-size surfaces; re-importing a tile costs as much fixed overhead as a big one.
+        // Drop order. Large surfaces (> NVMTL_KEEP_SMALL_KB) go before small tiles: plain LRU dropped tiles idle ~28 s (back
+        // in 40-200 ms) while the byte cap was full of 20 MB display-size surfaces, and re-importing a tile costs as much
+        // fixed overhead as a big one. Small tiles among themselves: idle age x bytes, costliest first.
+        // Large surfaces among themselves: bytes first, then the most recently idle first (MRU). A browser compositor
+        // cycles a pool larger than the cap: Chrome's GPU process on 2026-11-09, ~65 window-size 2816x1472 surfaces in
+        // turn while a video plays, idle 3-4 s each at the drop and back < 1 s. Oldest-first dropped exactly the next one
+        // to come back: 0 hits, ~14 re-imports/s, ~56k page records/s made and freed in NMXGPU. Dropping the newest idle
+        // keeps a fixed part of the cycle resident, so only the overflow re-imports. A large surface that is really gone
+        // still leaves at NVMTL_KEEP_MS.
         [idle sortUsingComparator:^NSComparisonResult(NVMTLSurfKey *a, NVMTLSurfKey *b) {
-            const double ca = (double)(now - keep[a]->_last + 1) * (double)(nvmtl_sk_bytes(keep[a]->_tex) + 65536),
-                         cb = (double)(now - keep[b]->_last + 1) * (double)(nvmtl_sk_bytes(keep[b]->_tex) + 65536);
+            const uint64_t ba = nvmtl_sk_bytes(keep[a]->_tex), bb = nvmtl_sk_bytes(keep[b]->_tex);
+            const int la = (long)ba > smallBytes, lb = (long)bb > smallBytes;
+            if (la != lb) return la ? NSOrderedAscending : NSOrderedDescending;
+            if (la) {
+                if (ba != bb) return ba > bb ? NSOrderedAscending : NSOrderedDescending;
+                const uint64_t xa = keep[a]->_last, xb = keep[b]->_last;    // newest idle (largest _last) first
+                return xa > xb ? NSOrderedAscending : xa < xb ? NSOrderedDescending : NSOrderedSame;
+            }
+            const double ca = (double)(now - keep[a]->_last + 1) * (double)(ba + 65536),
+                         cb = (double)(now - keep[b]->_last + 1) * (double)(bb + 65536);
             return ca > cb ? NSOrderedAscending : ca < cb ? NSOrderedDescending : NSOrderedSame; }];
         NSUInteger i = 0, n = idle.count;   // costliest first, until both the count and the bytes fit (never below keepIdle)
         while (n - i > (NSUInteger)keepIdle && ((long)(n - i) > keepIdleMax || idleBytes > keepIdleBytes)) {
