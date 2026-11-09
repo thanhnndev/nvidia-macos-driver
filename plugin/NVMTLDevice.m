@@ -1048,13 +1048,16 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
           "unheld %llu, expired %llu, idle cap %llu, dead %llu), %lu entries, sweep avg %llu us max %llu us; %llu dropped (released off the "
           "main thread), idle %llu MB at the last sweep, slowest sweep dropped %llu; expired came back < 250 ms %llu, < 1 s %llu, "
           "< 3 s %llu, later %llu; held entries refreshed %llu (by a live wrapper %llu, by IOSurfaceIsInUse %llu); idle-cap drops came back < 250 ms %llu, "
-          "< 1 s %llu, < 3 s %llu, later %llu; sweeps skipped (rate limit) %llu; dead entries dropped at once %llu (%llu MB)",
+          "< 1 s %llu, < 3 s %llu, later %llu; sweeps skipped (rate limit) %llu",
           (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.hits, nvmtl_sk.misses, nvmtl_sk.fresh,
           nvmtl_sk.otherKey, nvmtl_sk.gone[NVMTL_GONE_UNHELD], nvmtl_sk.gone[NVMTL_GONE_EXPIRED], nvmtl_sk.gone[NVMTL_GONE_CAP], nvmtl_sk.gone[NVMTL_GONE_DEAD],
           (unsigned long)keep.count, nvmtl_sk.sweeps ? nvmtl_sk.sweepNsSum / nvmtl_sk.sweeps / 1000 : 0,
           nvmtl_sk.sweepNsMax / 1000, nvmtl_sk.drops, nvmtl_sk.idleBytes >> 20, nvmtl_sk.maxSweepDrops,
           nvmtl_sk.expBack[0], nvmtl_sk.expBack[1], nvmtl_sk.expBack[2], nvmtl_sk.expBack[3], nvmtl_sk.heldRefresh, nvmtl_sk.viewRefresh, nvmtl_sk.useRefresh,
-          nvmtl_sk.capBack[0], nvmtl_sk.capBack[1], nvmtl_sk.capBack[2], nvmtl_sk.capBack[3], nvmtl_sk.sweepSkips, nvmtl_sk.deadDrops, nvmtl_sk.deadBytes >> 20);
+          nvmtl_sk.capBack[0], nvmtl_sk.capBack[1], nvmtl_sk.capBack[2], nvmtl_sk.capBack[3], nvmtl_sk.sweepSkips);
+    // Own line: the report above already fills the log line buffer, which cut this field off (2026-11-09, part 34).
+    nvlog("surface keep: dead entries dropped at once %llu (%llu MB), idle %llu MB", nvmtl_sk.deadDrops,
+          nvmtl_sk.deadBytes >> 20, nvmtl_sk.idleBytes >> 20);
     const uint64_t logged = nvmtl_sk.logged;
     memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
 }
