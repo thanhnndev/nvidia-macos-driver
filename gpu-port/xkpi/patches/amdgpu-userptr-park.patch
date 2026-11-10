@@ -1,0 +1,331 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -212,6 +212,12 @@
+ #endif
+ 
+ void amdgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct page **pages);
++#ifdef NMXKPI
++/* ga403wm Step142: userptr pins owned by the BO, parked while it is idle (amdgpu_ttm.c) */
++int amdgpu_ttm_tt_nmx_pin(struct ttm_tt *ttm, uint64_t addr, bool write);
++void amdgpu_ttm_tt_nmx_unpin(struct ttm_tt *ttm);
++void amdgpu_ttm_tt_nmx_touch(struct ttm_tt *ttm);
++#endif
+ int amdgpu_ttm_tt_get_userptr(const struct ttm_buffer_object *tbo,
+ 			      uint64_t *user_addr);
+ int amdgpu_ttm_tt_set_userptr(struct ttm_buffer_object *bo,
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -686,9 +686,185 @@
+ 	uint32_t		userflags;
+ 	bool			bound;
+ 	int32_t			pool_id;
++#ifdef NMXKPI
++	void			*nmx_pin;	/* Step142: owned userptr pin (nmx_upin_*), NULL if none */
++	unsigned long		nmx_used;	/* jiffies of the last CS that listed the BO */
++	bool			nmx_parking;	/* this unpopulate parks the pin (idle sweep) */
++	bool			nmx_norec;	/* page records dropped; populate restores them */
++	struct list_head	nmx_link;	/* on nmx_park_list while nmx_pin is set */
++#endif
+ };
+ 
+ #define ttm_to_amdgpu_ttm_tt(ptr)	container_of(ptr, struct amdgpu_ttm_tt, ttm)
++
++#ifdef NMXKPI
++/*
++ * ga403wm Step142: unwire idle IOSurface userptr BOs.
++ * Step92 pins a userptr BO's pages at the ioctl and drops them in TT unpopulate, i.e. when the BO is destroyed. A BO
++ * lives as long as the process's texture cache keeps it, so every IOSurface imported by WindowServer or an app stayed
++ * wired for as long as the cache held its texture, used or not: 1.4 GB of zprint's IOSurface tag 35 min after boot
++ * (debug.nmx_userwire 1.31 GB). The pin is now owned by the BO (nmx_upin_*, xkpi nmx_page.c):
++ * - a sweep (every second while there is anything to park) takes each BO whose pin is an IOSurface's own memory,
++ *   unused by any CS for debug.nmx_userptr_park_ms (default 10 s), idle (no fence), not pinned, not exported, and
++ *   whose reservation it gets without waiting; it moves the BO to system placement (GART unbound, VM mappings marked
++ *   for update by the next CS) and unpopulates it, which drops the page records and the wiring. The IOSurface
++ *   descriptor stays held, so the memory stays allocated but becomes pageable/compressible;
++ * - the next CS that lists the BO validates it into GTT, and populate wires the descriptor again and rebuilds the
++ *   page records (the physical pages may have changed; bind and the VM update use the new ones). This is upstream's
++ *   userptr flow (re-fetch pages, then validate), with the IOSurface descriptor in place of HMM;
++ * - a plain user range is never parked (wiring it again needs the process's map).
++ * The pin's calls are serialised by the BO's reservation (sweep, CS, populate/unpopulate) or by its destruction.
++ */
++int nmx_upin_create(uintptr_t start, int npages, int write, struct page **pages, void **pin);
++void nmx_upin_put_pages(void *pin, struct page **pages, int npages);
++int nmx_upin_parkable(void *pin);
++int nmx_upin_park(void *pin);
++int nmx_upin_restore(void *pin, struct page **pages, int npages);
++void nmx_upin_destroy(void *pin);
++extern int nmx_userptr_park_ms;
++extern volatile long long gNmxUpinDestroyRec, gNmxParkSkipBusy, gNmxParkFail;
++
++static LIST_HEAD(nmx_park_list);
++static spinlock_t nmx_park_lock;
++static struct delayed_work nmx_park_work;
++static atomic_t nmx_park_state;		/* 0 not set up, 1 being set up, 2 ready */
++
++static void nmx_park_sweep(struct work_struct *work);
++
++static void nmx_park_setup(void)
++{
++	if (atomic_read(&nmx_park_state) == 2)
++		return;
++	if (atomic_cmpxchg(&nmx_park_state, 0, 1) == 0) {
++		spin_lock_init(&nmx_park_lock);
++		INIT_DELAYED_WORK(&nmx_park_work, nmx_park_sweep);
++		atomic_set(&nmx_park_state, 2);
++		return;
++	}
++	while (atomic_read(&nmx_park_state) != 2)
++		cpu_relax();
++}
++
++static void nmx_park_kick(void)
++{
++	if (atomic_read(&nmx_park_state) == 2)
++		schedule_delayed_work(&nmx_park_work, HZ);
++}
++
++int amdgpu_ttm_tt_nmx_pin(struct ttm_tt *ttm, uint64_t addr, bool write)
++{
++	struct amdgpu_ttm_tt *gtt = ttm_to_amdgpu_ttm_tt(ttm);
++	int r;
++
++	if (gtt->nmx_pin)
++		return -EBUSY;
++	nmx_park_setup();
++	r = nmx_upin_create((uintptr_t)addr, (int)ttm->num_pages, write, ttm->pages, &gtt->nmx_pin);
++	if (r < 0)
++		return r;
++	gtt->nmx_used = jiffies;
++	gtt->nmx_norec = false;
++	spin_lock(&nmx_park_lock);
++	list_add_tail(&gtt->nmx_link, &nmx_park_list);
++	spin_unlock(&nmx_park_lock);
++	if (nmx_upin_parkable(gtt->nmx_pin))
++		nmx_park_kick();
++	return r;
++}
++
++/* drops the BO's pin: its page records, then the wiring (or the parked descriptor). Thread context. */
++void amdgpu_ttm_tt_nmx_unpin(struct ttm_tt *ttm)
++{
++	struct amdgpu_ttm_tt *gtt = ttm_to_amdgpu_ttm_tt(ttm);
++
++	if (!gtt->nmx_pin)
++		return;
++	nmx_upin_put_pages(gtt->nmx_pin, ttm->pages, (int)ttm->num_pages);
++	spin_lock(&nmx_park_lock);
++	list_del_init(&gtt->nmx_link);
++	spin_unlock(&nmx_park_lock);
++	nmx_upin_destroy(gtt->nmx_pin);
++	gtt->nmx_pin = NULL;
++	gtt->nmx_norec = false;
++}
++
++/* a CS lists the BO (its reservation is held) */
++void amdgpu_ttm_tt_nmx_touch(struct ttm_tt *ttm)
++{
++	if (ttm)
++		ttm_to_amdgpu_ttm_tt(ttm)->nmx_used = jiffies;
++}
++
++static void nmx_park_one(struct ttm_buffer_object *bo)
++{
++	struct ttm_operation_ctx ctx = { .interruptible = false, .no_wait_gpu = true };
++	struct amdgpu_bo *abo = ttm_to_amdgpu_bo(bo);
++	struct amdgpu_ttm_tt *gtt;
++	int ms = READ_ONCE(nmx_userptr_park_ms);
++
++	if (!dma_resv_trylock(bo->base.resv)) {
++		__atomic_add_fetch(&gNmxParkSkipBusy, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	if (ms <= 0 || !bo->ttm || !bo->resource)
++		goto out;
++	gtt = ttm_to_amdgpu_ttm_tt(bo->ttm);
++	if (!gtt->nmx_pin || gtt->nmx_norec || !nmx_upin_parkable(gtt->nmx_pin) ||
++	    !ttm_tt_is_populated(bo->ttm) || time_before(jiffies, gtt->nmx_used + msecs_to_jiffies(ms)))
++		goto out;
++	if (bo->pin_count || bo->base.dma_buf || bo->base.import_attach ||
++	    !dma_resv_test_signaled(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP)) {
++		__atomic_add_fetch(&gNmxParkSkipBusy, 1, __ATOMIC_RELAXED);
++		goto out;
++	}
++	if (bo->resource->mem_type != TTM_PL_SYSTEM) {
++		amdgpu_bo_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_CPU);
++		if (ttm_bo_validate(bo, &abo->placement, &ctx)) {
++			__atomic_add_fetch(&gNmxParkFail, 1, __ATOMIC_RELAXED);
++			goto out;
++		}
++	}
++	gtt->nmx_parking = true;
++	ttm_tt_unpopulate(bo->bdev, bo->ttm);
++	gtt->nmx_parking = false;
++out:
++	dma_resv_unlock(bo->base.resv);
++}
++
++static void nmx_park_sweep(struct work_struct *work)
++{
++	struct ttm_buffer_object *cand[32];
++	struct amdgpu_ttm_tt *gtt;
++	int ms = READ_ONCE(nmx_userptr_park_ms), n = 0, i;
++	unsigned long now = jiffies;
++	bool more = false;
++
++	if (ms <= 0) {
++		schedule_delayed_work(&nmx_park_work, 5 * HZ);	/* the knob may come back on */
++		return;
++	}
++	spin_lock(&nmx_park_lock);
++	list_for_each_entry(gtt, &nmx_park_list, nmx_link) {
++		struct ttm_buffer_object *bo;
++
++		if (gtt->nmx_norec || !nmx_upin_parkable(gtt->nmx_pin))
++			continue;
++		more = true;	/* still wired: look again later */
++		if (n == ARRAY_SIZE(cand) || time_before(now, gtt->nmx_used + msecs_to_jiffies(ms)))
++			continue;
++		bo = container_of(gtt->gobj, struct ttm_buffer_object, base);
++		if (ttm_bo_get_unless_zero(bo))
++			cand[n++] = bo;
++	}
++	spin_unlock(&nmx_park_lock);
++	for (i = 0; i < n; i++) {
++		nmx_park_one(cand[i]);
++		ttm_bo_put(cand[i]);
++	}
++	if (more)
++		schedule_delayed_work(&nmx_park_work, HZ);
++}
++#endif
+ 
+ #ifdef CONFIG_DRM_AMDGPU_USERPTR
+ /*
+@@ -1087,7 +1263,21 @@
+ 				       struct ttm_tt *ttm)
+ {
+ 	struct amdgpu_ttm_tt *gtt = ttm_to_amdgpu_ttm_tt(ttm);
++
++#ifdef NMXKPI
++	if (gtt->nmx_pin) {
++		/* Step142: still holding page records = pinned but never populated (no unpopulate ran); before the owned
++		 * pin those pages stayed wired for good */
++		pgoff_t k;
+ 
++		for (k = 0; k < ttm->num_pages; k++)
++			if (ttm->pages[k]) {
++				__atomic_add_fetch(&gNmxUpinDestroyRec, 1, __ATOMIC_RELAXED);
++				break;
++			}
++		amdgpu_ttm_tt_nmx_unpin(ttm);
++	}
++#endif
+ 	if (gtt->usertask)
+ 		put_task_struct(gtt->usertask);
+ 
+@@ -1163,6 +1353,18 @@
+ 
+ 	/* user pages are bound by amdgpu_ttm_tt_pin_userptr() */
+ 	if (gtt->userptr) {
++#ifdef NMXKPI
++		/* Step142: a parked (or otherwise unpopulated) owned pin gets its wiring and page records back */
++		if (gtt->nmx_pin && gtt->nmx_norec) {
++			ret = nmx_upin_restore(gtt->nmx_pin, ttm->pages, (int)ttm->num_pages);
++			if (ret)
++				return ret;
++			gtt->nmx_norec = false;
++			gtt->nmx_used = jiffies;
++			if (nmx_upin_parkable(gtt->nmx_pin))
++				nmx_park_kick();
++		}
++#endif
+ 		ttm->sg = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
+ 		if (!ttm->sg)
+ 			return -ENOMEM;
+@@ -1209,7 +1411,13 @@
+ 	if (gtt->userptr) {
+ #ifdef NMXKPI
+ 		/* ga403wm Step92: the pages were pinned when the BO was made; put them */
+-		{
++		if (gtt->nmx_pin) {
++			/* Step142: drop the page records; the pin keeps the wiring until destroy, or parks it */
++			nmx_upin_put_pages(gtt->nmx_pin, ttm->pages, (int)ttm->num_pages);
++			gtt->nmx_norec = true;
++			if (gtt->nmx_parking)
++				nmx_upin_park(gtt->nmx_pin);
++		} else {
+ 			pgoff_t k;
+ 
+ 			for (k = 0; k < ttm->num_pages; k++)
+@@ -2077,6 +2285,10 @@
+ 	if (!adev->mman.initialized)
+ 		return;
+ 
++#ifdef NMXKPI
++	if (atomic_read(&nmx_park_state) == 2)
++		cancel_delayed_work_sync(&nmx_park_work);
++#endif
+ 	amdgpu_ttm_pools_fini(adev);
+ 
+ 	amdgpu_ttm_training_reserve_vram_fini(adev);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -974,6 +974,7 @@
+ 		usermm = amdgpu_ttm_tt_get_usermm(e->bo->tbo.ttm);
+ #ifdef NMXKPI
+ 		usermm = NULL;	/* Step92: pinned per process at creation; the CS does not use the mm */
++		amdgpu_ttm_tt_nmx_touch(e->bo->tbo.ttm);	/* Step142: in use, not idle */
+ #endif
+ 		if (usermm && usermm != current->mm) {
+ 			r = -EPERM;
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -431,15 +431,10 @@
+ 		       (unsigned long long)size, v);
+ }
+ 
+-static void nmx_userptr_drop(struct page **pages, u32 n)
++/* Step142: the BO owns its pin (amdgpu_ttm_tt_nmx_pin); this drops it on a failed import */
++static void nmx_userptr_drop(struct ttm_tt *ttm)
+ {
+-	u32 i;
+-
+-	for (i = 0; i < n; i++)
+-		if (pages[i]) {
+-			release_pages(&pages[i], 1);
+-			pages[i] = NULL;
+-		}
++	amdgpu_ttm_tt_nmx_unpin(ttm);
+ }
+ 
+ static int nmx_userptr_pin(struct amdgpu_bo *bo, struct drm_amdgpu_gem_userptr *args, struct drm_file *filp,
+@@ -452,17 +447,17 @@
+ 	int r;
+ 
+ 	/* pinned even without AMDGPU_GEM_USERPTR_VALIDATE: nothing else fills the page array in this model */
+-	got = get_user_pages(args->addr, n, (args->flags & AMDGPU_GEM_USERPTR_READONLY) ? 0 : FOLL_WRITE, ttm->pages);
++	got = amdgpu_ttm_tt_nmx_pin(ttm, args->addr, !(args->flags & AMDGPU_GEM_USERPTR_READONLY));
+ 	if (got != (long)n) {
+ 		if (got > 0)
+-			nmx_userptr_drop(ttm->pages, (u32)got);
++			nmx_userptr_drop(ttm);
+ 		nmx_userptr_say("pin FAILED", args->addr, args->size, got);
+ 		return got < 0 ? (int)got : -EFAULT;
+ 	}
+ 	if (args->flags & AMDGPU_GEM_USERPTR_VALIDATE) {
+ 		r = amdgpu_bo_reserve(bo, true);
+ 		if (r) {
+-			nmx_userptr_drop(ttm->pages, n);
++			nmx_userptr_drop(ttm);
+ 			nmx_userptr_say("reserve FAILED", args->addr, args->size, r);
+ 			return r;
+ 		}
+@@ -471,7 +466,7 @@
+ 		amdgpu_bo_unreserve(bo);
+ 		if (r) {
+ 			/* not bound; unpopulate skips the NULL entries if the TT was populated */
+-			nmx_userptr_drop(ttm->pages, n);
++			nmx_userptr_drop(ttm);
+ 			nmx_userptr_say("validate FAILED", args->addr, args->size, r);
+ 			return r;
+ 		}

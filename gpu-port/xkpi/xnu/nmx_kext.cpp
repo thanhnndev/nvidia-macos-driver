@@ -181,6 +181,19 @@ static int nmx_pin_by_proc_sysctl SYSCTL_HANDLER_ARGS
     buf[n] = 0;
     return sysctl_handle_string(oidp, buf, sizeof buf, req);
 }
+extern "C" int nmx_userwire_format(char *buf, size_t size);
+static int nmx_userwire_by_kind_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[1024];
+    int n = nmx_userwire_format(buf, sizeof buf);
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    buf[n] = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_userwire_by_kind, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_userwire_by_kind_sysctl, "A",
+            "Step142: user wirings by kind (surface/plain), age, parked, orphaned surfaces, and per process (pages)");
 SYSCTL_PROC(_debug, OID_AUTO, nmx_pin_by_proc, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             0, 0, nmx_pin_by_proc_sysctl, "A", "Step139: user-page pin calls and pages per process name");
 SYSCTL_PROC(_debug, OID_AUTO, nmx_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
@@ -219,6 +232,24 @@ NMX_CNT(nmx_page_free, gNmxPageFree, "Step141: free pages pooled in those chunks
 NMX_CNT(nmx_page_chunks_freed, gNmxPageChunksFreed, "Step141: chunks given back to the system");
 NMX_CNT(nmx_userwire_count, gNmxUserWires, "Step138: user-memory wirings (IOMemoryDescriptors) held for the GPU now");
 NMX_CNT(nmx_userwire_pages, gNmxUserWirePages, "Step138: pages covered by those wirings");
+extern "C" volatile SInt64 gNmxSurfWires, gNmxSurfWirePages, gNmxUserParked, gNmxUserParkedPages, gNmxUserParks,
+    gNmxUserUnparks, gNmxUserUnparkFail;
+NMX_CNT(nmx_surfwire_count, gNmxSurfWires, "Step142: of the user wirings, IOSurface descriptors wired now");
+NMX_CNT(nmx_surfwire_pages, gNmxSurfWirePages, "Step142: pages of those (the NMX share of zprint's IOSurface tag)");
+NMX_CNT(nmx_userwire_parked, gNmxUserParked, "Step142: IOSurface wirings parked now (BO idle: held, not wired)");
+NMX_CNT(nmx_userwire_parked_pages, gNmxUserParkedPages, "Step142: pages of those");
+NMX_CNT(nmx_userwire_parks, gNmxUserParks, "Step142: wirings parked since boot");
+NMX_CNT(nmx_userwire_unparks, gNmxUserUnparks, "Step142: parked wirings wired again for the GPU since boot");
+NMX_CNT(nmx_userwire_unpark_fail, gNmxUserUnparkFail, "Step142: parked wirings that could not be wired again");
+extern "C" volatile SInt64 gNmxUpinRestoreFail, gNmxUpinDestroyRec, gNmxParkSkipBusy, gNmxParkFail;
+NMX_CNT(nmx_upin_restore_fail, gNmxUpinRestoreFail, "Step142: userptr BO page restores that failed");
+NMX_CNT(nmx_upin_destroy_rec, gNmxUpinDestroyRec,
+        "Step142: userptr BOs destroyed still holding their pages (never populated: they leaked before Step142)");
+NMX_CNT(nmx_park_skip_busy, gNmxParkSkipBusy, "Step142: idle-park candidates skipped (locked, busy, pinned or shared)");
+NMX_CNT(nmx_park_fail, gNmxParkFail, "Step142: idle parks whose move to system memory failed");
+extern "C" int nmx_userptr_park_ms;
+SYSCTL_INT(_debug, OID_AUTO, nmx_userptr_park_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_userptr_park_ms, 0,
+           "Step142: unwire an IOSurface userptr BO's memory after this many ms without GPU use; 0 = never");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -287,6 +318,19 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_page_chunks_freed);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_count);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_pages);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_by_kind);
+    sysctl_register_oid(&sysctl__debug_nmx_surfwire_count);
+    sysctl_register_oid(&sysctl__debug_nmx_surfwire_pages);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_parked);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_parked_pages);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_parks);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_unparks);
+    sysctl_register_oid(&sysctl__debug_nmx_userwire_unpark_fail);
+    sysctl_register_oid(&sysctl__debug_nmx_upin_restore_fail);
+    sysctl_register_oid(&sysctl__debug_nmx_upin_destroy_rec);
+    sysctl_register_oid(&sysctl__debug_nmx_park_skip_busy);
+    sysctl_register_oid(&sysctl__debug_nmx_park_fail);
+    sysctl_register_oid(&sysctl__debug_nmx_userptr_park_ms);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);

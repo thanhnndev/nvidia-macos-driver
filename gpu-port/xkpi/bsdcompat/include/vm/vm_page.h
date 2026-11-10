@@ -66,6 +66,18 @@ void vm_page_wire(vm_page_t m);
 bool vm_page_unwire_noq(vm_page_t m);
 /* pins npages of a process's memory at 'start' (mm NULL = the calling process); returns npages or -errno */
 int nmx_user_pages_pin(void *mm, uintptr_t start, int npages, int write, vm_page_t *pages);
+/*
+ * ga403wm Step142: a pin owned by one BO (amdgpu userptr), see nmx_page.c. create: npages or -errno, *pin for the
+ * calls below. put_pages: drops the pin's page records (pages[] NULLed); the wiring stays with the pin. park: drops
+ * the wiring too (0, or -ENOTSUP when the pin is not parkable). restore: records again, wiring again if parked (0 or
+ * -errno). destroy: releases the pin (call put_pages first if the records are still held).
+ */
+int nmx_upin_create(uintptr_t start, int npages, int write, vm_page_t *pages, void **pin);
+void nmx_upin_put_pages(void *pin, vm_page_t *pages, int npages);
+int nmx_upin_parkable(void *pin);
+int nmx_upin_park(void *pin);
+int nmx_upin_restore(void *pin, vm_page_t *pages, int npages);
+void nmx_upin_destroy(void *pin);
 void vm_page_unwire(vm_page_t m, uint8_t queue);
 #define vm_page_xbusy(m) do { } while (0)
 #define vm_page_xunbusy(m) do { } while (0)

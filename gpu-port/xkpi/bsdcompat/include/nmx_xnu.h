@@ -59,6 +59,16 @@ int nmx_xnu_mm_copy(void *mm, uint64_t uaddr, void *kbuf, size_t len, int to_use
  */
 int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle);
 void nmx_xnu_user_unwire(void *handle);
+/*
+ * ga403wm Step142: dropping a wiring while its BO is idle and taking it again when the GPU needs it. Only an IOSurface's
+ * own descriptor is parkable (no task behind it). park: 0 or ENOTSUP; the descriptor stays held (memory allocated,
+ * pageable). rewire: wires a parked handle again (a wired one is left as it is) and returns the physical address of
+ * each of its first npages pages, which may differ from before. Park, rewire and unwire of one handle must not run at
+ * the same time (the caller serialises them).
+ */
+int nmx_xnu_user_parkable(void *handle);
+int nmx_xnu_user_park(void *handle);
+int nmx_xnu_user_rewire(void *handle, size_t npages, uint64_t *phys);
 
 /* ---- DMA (nmx_dma.cpp) -------------------------------------------------------------------------------------------- */
 

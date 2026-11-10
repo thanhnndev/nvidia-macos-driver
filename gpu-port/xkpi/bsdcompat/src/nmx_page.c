@@ -53,6 +53,11 @@ enum backing_kind { BK_CHUNK = 1, BK_RUN = 2, BK_FICTITIOUS = 3, BK_USER = 4 };
  * virt_to_page), it may keep the pointer without a reference, so the record turns permanent (BK_FICTITIOUS) as before.
  */
 volatile long long gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
+/* Step142 (owned userptr pins, see nmx_upin_create): restores that failed, BOs destroyed while still holding page
+ * records (pinned but never populated: the TT unpopulate that drops them was skipped), and the park sweep's knobs and
+ * counters. nmx_userptr_park_ms: idle time after which an IOSurface userptr BO is parked; 0 = never (debug.*). */
+volatile long long gNmxUpinRestoreFail, gNmxUpinDestroyRec, gNmxParkSkipBusy, gNmxParkFail;
+int nmx_userptr_park_ms = 10000;
 
 struct backing {
     int kind;
@@ -425,6 +430,8 @@ void vm_page_wire(vm_page_t m)
 struct user_pin {
     void *handle;                          /* nmx_xnu_user_wire descriptor */
     volatile u_int remaining;              /* page puts still to come */
+    u_int owned;                           /* Step142: owned by one BO, released by nmx_upin_destroy only */
+    int npages, write;
 };
 struct pin_ref {
     struct user_pin *pin;
@@ -433,7 +440,7 @@ struct pin_ref {
 
 static void pin_put(struct user_pin *pin)
 {
-    if (__atomic_sub_fetch(&pin->remaining, 1, __ATOMIC_SEQ_CST) == 0) {
+    if (__atomic_sub_fetch(&pin->remaining, 1, __ATOMIC_SEQ_CST) == 0 && !pin->owned) {
         nmx_xnu_user_unwire(pin->handle);
         free(pin, M_NMXPAGE);
     }
@@ -603,6 +610,169 @@ void vm_page_unwire(vm_page_t m, uint8_t queue)
 {
     if (vm_page_unwire_noq(m))
         vm_page_free(m);
+}
+
+/*
+ * ---- ga403wm Step142: userptr pins owned by one BO ------------------------------------------------------------------
+ * The plain pin above lives exactly as long as its page puts: amdgpu's userptr BO pinned at the ioctl and put the
+ * pages in TT unpopulate, so an imported IOSurface stayed wired for the BO's whole life, however long the BO sat
+ * idle in a process's texture cache (1.3-1.4 GB of IOSurface wired 35 min after boot). An owned pin separates the two:
+ * - the BO's page records can be dropped (put_pages) without dropping the wiring, and the wiring (an IOSurface's own
+ *   descriptor) can then be dropped while the BO is idle (park) and taken again when the GPU needs it (restore);
+ * - put_pages takes this pin's own entry off each page, not whichever entry is first, so a BO never consumes another
+ *   request's pins (a plain put that took this pin's entry earlier is settled with that request's entry instead);
+ * - only nmx_upin_destroy releases it.
+ * The caller serialises calls on one pin (amdgpu: the BO's reservation, or its destruction).
+ */
+/* page records for phys[0..npages) with one entry each naming pin; 0, or ENOMEM with nothing left behind */
+static int pin_attach(struct user_pin *pin, const uint64_t *phys, int npages, vm_page_t *pages)
+{
+    struct pin_ref **refs = malloc(sizeof(*refs) * (size_t)npages, M_NMXPAGE, M_WAITOK | M_ZERO);
+    int i;
+    if (refs == NULL)
+        return ENOMEM;
+    for (i = 0; i < npages; i++)
+        if ((refs[i] = malloc(sizeof(struct pin_ref), M_NMXPAGE, M_WAITOK)) == NULL)
+            goto fail;
+    for (i = 0; i < npages; i++) {
+        pages[i] = user_page_get(phys[i]);
+        if (pages[i] == NULL) {
+            for (int k = 0; k < i; k++) {
+                if (page_unref(pages[k]))
+                    vm_page_free(pages[k]);
+                pages[k] = NULL;
+            }
+            goto fail;
+        }
+    }
+    __atomic_add_fetch(&pin->remaining, (u_int)npages, __ATOMIC_SEQ_CST);
+    for (i = 0; i < npages; i++) {
+        refs[i]->pin = pin;
+        lck_spin_t *l = reg_lock_of(pages[i]->phys_addr >> PAGE_SHIFT);
+        lck_spin_lock(l);
+        refs[i]->next = pages[i]->nmx_pins;
+        pages[i]->nmx_pins = refs[i];
+        lck_spin_unlock(l);
+    }
+    free(refs, M_NMXPAGE);
+    return 0;
+fail:
+    for (i = 0; i < npages; i++)
+        free(refs[i], M_NMXPAGE);
+    free(refs, M_NMXPAGE);
+    return ENOMEM;
+}
+
+/* takes pin's own entry off a page if it is there, else the first entry; the request it named, or NULL */
+static struct user_pin *page_take_pin(vm_page_t m, struct user_pin *pin)
+{
+    struct pin_ref *r, **pp;
+    lck_spin_t *l = reg_lock_of(m->phys_addr >> PAGE_SHIFT);
+    lck_spin_lock(l);
+    for (pp = (struct pin_ref **)&m->nmx_pins; *pp != NULL; pp = &(*pp)->next)
+        if ((*pp)->pin == pin)
+            break;
+    if (*pp == NULL)
+        pp = (struct pin_ref **)&m->nmx_pins;
+    r = *pp;
+    if (r != NULL)
+        *pp = r->next;
+    lck_spin_unlock(l);
+    if (r == NULL)
+        return NULL;
+    struct user_pin *got = r->pin;
+    free(r, M_NMXPAGE);
+    return got;
+}
+
+int nmx_upin_create(uintptr_t start, int npages, int write, vm_page_t *pages, void **pinp)
+{
+    *pinp = NULL;
+    if (npages <= 0)
+        return -EINVAL;
+    uint64_t *phys = malloc(sizeof(uint64_t) * (size_t)npages, M_NMXPAGE, M_WAITOK);
+    struct user_pin *pin = malloc(sizeof(*pin), M_NMXPAGE, M_WAITOK | M_ZERO);
+    int err = ENOMEM;
+    if (phys == NULL || pin == NULL)
+        goto out;
+    err = nmx_xnu_user_wire(NULL, start, (size_t)npages, write, phys, &pin->handle);
+    if (err != 0)
+        goto out;
+    pin->owned = 1;
+    pin->npages = npages;
+    pin->write = write;
+    err = pin_attach(pin, phys, npages, pages);
+    if (err != 0) {
+        nmx_xnu_user_unwire(pin->handle);
+        goto out;
+    }
+    free(phys, M_NMXPAGE);
+    *pinp = pin;
+    return npages;
+out:
+    free(pin, M_NMXPAGE);
+    free(phys, M_NMXPAGE);
+    return -err;
+}
+
+void nmx_upin_put_pages(void *p, vm_page_t *pages, int npages)
+{
+    struct user_pin *pin = p;
+    for (int i = 0; i < npages; i++) {
+        vm_page_t m = pages[i];
+        if (m == NULL)
+            continue;
+        pages[i] = NULL;
+        struct user_pin *got = page_take_pin(m, pin);
+        if (got == pin)
+            __atomic_sub_fetch(&pin->remaining, 1, __ATOMIC_SEQ_CST);
+        else if (got != NULL)
+            pin_put(got);
+        if (page_unref(m))
+            vm_page_free(m);
+    }
+}
+
+int nmx_upin_parkable(void *p)
+{
+    struct user_pin *pin = p;
+    return pin != NULL && nmx_xnu_user_parkable(pin->handle);
+}
+
+int nmx_upin_park(void *p)
+{
+    struct user_pin *pin = p;
+    return -nmx_xnu_user_park(pin->handle);
+}
+
+int nmx_upin_restore(void *p, vm_page_t *pages, int npages)
+{
+    struct user_pin *pin = p;
+    int err = EINVAL;
+    if (npages != pin->npages)
+        goto fail;
+    uint64_t *phys = malloc(sizeof(uint64_t) * (size_t)npages, M_NMXPAGE, M_WAITOK);
+    err = ENOMEM;
+    if (phys == NULL)
+        goto fail;
+    err = nmx_xnu_user_rewire(pin->handle, (size_t)npages, phys);
+    if (err == 0)
+        err = pin_attach(pin, phys, npages, pages);
+    free(phys, M_NMXPAGE);
+    if (err == 0)
+        return 0;
+fail:
+    __atomic_add_fetch(&gNmxUpinRestoreFail, 1, __ATOMIC_RELAXED);
+    return -err;
+}
+
+void nmx_upin_destroy(void *p)
+{
+    struct user_pin *pin = p;
+    if (pin == NULL)
+        return;
+    nmx_xnu_user_unwire(pin->handle);
+    free(pin, M_NMXPAGE);
 }
 
 /*

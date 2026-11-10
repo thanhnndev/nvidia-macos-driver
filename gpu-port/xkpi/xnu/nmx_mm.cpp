@@ -218,16 +218,82 @@ IOService *surf_root()
     return gSurfRoot;
 }
 
-/* 0 and the prepared surface descriptor in *handle, or an errno (the caller then wires the user range) */
 /* Step138: user-memory wirings held for the GPU right now (descriptors and their bytes): debug.nmx_userwire_* */
 extern "C" volatile SInt64 gNmxUserWires, gNmxUserWirePages;
 volatile SInt64 gNmxUserWires, gNmxUserWirePages;
-static void wire_note(IOMemoryDescriptor *md, int dir)
+/*
+ * ga403wm Step142: every wiring is a record on one list (kind, owner process, age) instead of a bare descriptor.
+ * - debug.nmx_userwire_by_kind splits the wired bytes by kind (IOSurface descriptor / plain user range) and process,
+ *   and counts IOSurface wirings whose descriptor nobody but NMX holds any more (the surface itself is gone).
+ * - An IOSurface wiring can be dropped while its BO sits idle and taken again when the GPU needs the BO
+ *   (nmx_xnu_user_park / nmx_xnu_user_rewire): the descriptor is the surface's own memory, with no task behind it, so
+ *   it can be prepared again at any time. The descriptor stays retained while parked, so the memory stays allocated;
+ *   it is only pageable/compressible instead of wired. A plain user range is not parkable (re-wiring it needs the
+ *   task's map).
+ * The handle the callers keep is the record. Park, rewire and unwire of one handle are serialised by its owner (the
+ * BO's reservation, or its destruction).
+ */
+extern "C" volatile SInt64 gNmxSurfWires, gNmxSurfWirePages, gNmxUserParked, gNmxUserParkedPages, gNmxUserParks,
+    gNmxUserUnparks, gNmxUserUnparkFail;
+volatile SInt64 gNmxSurfWires, gNmxSurfWirePages, gNmxUserParked, gNmxUserParkedPages, gNmxUserParks, gNmxUserUnparks,
+    gNmxUserUnparkFail;
+struct UserWire {
+    IOMemoryDescriptor *md;
+    UserWire *prev, *next;
+    uint64_t when;          /* mach_absolute_time of the wire */
+    uint32_t pages;         /* the descriptor's length in pages: what prepare() wires */
+    uint8_t surface;        /* the IOSurface's own descriptor */
+    uint8_t parked;         /* complete()d while the descriptor is still held */
+    char who[22];           /* process that made the wiring */
+};
+static UserWire *gWires;
+static IOLock *gWireLock;
+
+static IOLock *wire_lock()
 {
-    SInt64 pages = (SInt64)((md->getLength() + PAGE_SIZE - 1) / PAGE_SIZE);
-    __atomic_add_fetch(&gNmxUserWires, dir, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&gNmxUserWirePages, dir * pages, __ATOMIC_RELAXED);
+    if (gWireLock == nullptr) {
+        IOLock *l = IOLockAlloc();
+        if (!OSCompareAndSwapPtr(nullptr, l, (void * volatile *)&gWireLock))
+            IOLockFree(l);
+    }
+    return gWireLock;
 }
+
+/* the wired-now counters; parked records are counted apart */
+static void wire_count(const UserWire *w, int dir)
+{
+    __atomic_add_fetch(&gNmxUserWires, dir, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&gNmxUserWirePages, dir * (SInt64)w->pages, __ATOMIC_RELAXED);
+    if (w->surface) {
+        __atomic_add_fetch(&gNmxSurfWires, dir, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&gNmxSurfWirePages, dir * (SInt64)w->pages, __ATOMIC_RELAXED);
+    }
+}
+
+/* the record for a prepared descriptor, or nullptr (the caller then completes and releases it) */
+static UserWire *wire_make(IOMemoryDescriptor *md, bool surface)
+{
+    IOLock *l = wire_lock();
+    UserWire *w = l != nullptr ? (UserWire *)IOMalloc(sizeof(UserWire)) : nullptr;
+    if (w == nullptr)
+        return nullptr;
+    *w = UserWire{};
+    w->md = md;
+    w->when = mach_absolute_time();
+    w->pages = (uint32_t)((md->getLength() + PAGE_SIZE - 1) / PAGE_SIZE);
+    w->surface = surface;
+    proc_name(proc_pid(current_proc()), w->who, (int)sizeof w->who);
+    IOLockLock(l);
+    w->next = gWires;
+    if (gWires != nullptr)
+        gWires->prev = w;
+    gWires = w;
+    wire_count(w, 1);
+    IOLockUnlock(l);
+    return w;
+}
+
+/* 0 and the surface wiring's record in *handle, or an errno (the caller then wires the user range) */
 
 int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
 {
@@ -284,8 +350,13 @@ int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write
         }
         phys[i] = pa;
     }
-    wire_note(md, 1);
-    *handle = md;           /* nmx_xnu_user_unwire: complete + release, as for a user range */
+    UserWire *w = wire_make(md, true);
+    if (w == nullptr) {
+        md->complete();
+        md->release();
+        return ENOMEM;
+    }
+    *handle = w;            /* nmx_xnu_user_unwire: complete + release, as for a user range */
     return 0;
 }
 }
@@ -449,17 +520,177 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         }
         phys[i] = pa;
     }
-    wire_note(md, 1);
-    *handle = md;
+    UserWire *w = wire_make(md, false);
+    if (w == nullptr) {
+        md->complete();
+        md->release();
+        return ENOMEM;
+    }
+    *handle = w;
     return 0;
 }
 
 extern "C" void nmx_xnu_user_unwire(void *handle)
 {
-    IOMemoryDescriptor *md = (IOMemoryDescriptor *)handle;
-    if (md == nullptr)
+    UserWire *w = (UserWire *)handle;
+    if (w == nullptr)
         return;
-    wire_note(md, -1);
-    md->complete();
-    md->release();
+    IOLockLock(gWireLock);
+    if (w->prev != nullptr)
+        w->prev->next = w->next;
+    else
+        gWires = w->next;
+    if (w->next != nullptr)
+        w->next->prev = w->prev;
+    if (w->parked) {
+        __atomic_sub_fetch(&gNmxUserParked, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&gNmxUserParkedPages, (SInt64)w->pages, __ATOMIC_RELAXED);
+    } else {
+        wire_count(w, -1);
+    }
+    IOLockUnlock(gWireLock);
+    if (!w->parked)
+        w->md->complete();
+    w->md->release();
+    IOFree(w, sizeof(UserWire));
+}
+
+/* Step142: 1 when the wiring can be dropped and taken again later (an IOSurface's own descriptor). Boot-arg
+ * nmxpark=0 makes nothing parkable (every wiring then lives as long as its BO, as before Step142). */
+static int gParkOn = -1;
+extern "C" int nmx_xnu_user_parkable(void *handle)
+{
+    if (gParkOn < 0) {
+        int v = 1;
+        gParkOn = (PE_parse_boot_argn("nmxpark", &v, sizeof v) && v == 0) ? 0 : 1;
+    }
+    UserWire *w = (UserWire *)handle;
+    return gParkOn && w != nullptr && w->surface;
+}
+
+/* Step142: drops the wiring and keeps the descriptor (the memory stays allocated, now pageable). 0 or ENOTSUP. */
+extern "C" int nmx_xnu_user_park(void *handle)
+{
+    UserWire *w = (UserWire *)handle;
+    if (!nmx_xnu_user_parkable(handle))
+        return ENOTSUP;
+    if (w->parked)
+        return 0;
+    IOLockLock(gWireLock);
+    w->parked = 1;
+    wire_count(w, -1);
+    __atomic_add_fetch(&gNmxUserParked, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&gNmxUserParkedPages, (SInt64)w->pages, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&gNmxUserParks, 1, __ATOMIC_RELAXED);
+    IOLockUnlock(gWireLock);
+    w->md->complete();
+    return 0;
+}
+
+/*
+ * Step142: wires a parked record again (a wired one is left as it is) and returns the physical address of each of
+ * its first npages pages; they may differ from the ones it had before it was parked. 0 or an errno; on an error the
+ * record keeps whatever state it reached and nmx_xnu_user_unwire still releases it.
+ */
+extern "C" int nmx_xnu_user_rewire(void *handle, size_t npages, uint64_t *phys)
+{
+    UserWire *w = (UserWire *)handle;
+    if (w == nullptr || npages > w->pages)
+        return EINVAL;
+    if (w->parked) {
+        if (w->md->prepare() != kIOReturnSuccess) {
+            __atomic_add_fetch(&gNmxUserUnparkFail, 1, __ATOMIC_RELAXED);
+            return EFAULT;
+        }
+        IOLockLock(gWireLock);
+        w->parked = 0;
+        wire_count(w, 1);
+        __atomic_sub_fetch(&gNmxUserParked, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&gNmxUserParkedPages, (SInt64)w->pages, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&gNmxUserUnparks, 1, __ATOMIC_RELAXED);
+        IOLockUnlock(gWireLock);
+    }
+    for (size_t i = 0; i < npages; i++) {
+        IOByteCount len = 0;
+        addr64_t pa = w->md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
+        if (pa == 0)
+            return EFAULT;
+        phys[i] = pa;
+    }
+    return 0;
+}
+
+/*
+ * Step142: debug.nmx_userwire_by_kind. Per kind (surface = the IOSurface's own descriptor, plain = a user range):
+ * records wired now and their pages, of those older than 60 s, and parked records. "orphan" = surface wirings whose
+ * descriptor has no holder but NMX (retain count <= NMX's own records on it): the IOSurface is gone and only the BO
+ * keeps its memory. Then the 8 processes with the most pages (wired + parked; surface / plain / parked).
+ */
+extern "C" int nmx_userwire_format(char *buf, size_t size)
+{
+    struct Row { char who[22]; SInt64 surf, plain, parked; };
+    Row rows[8] = {};
+    SInt64 cnt[2] = {}, pg[2] = {}, old[2] = {}, pold[2] = {}, pk[2] = {}, ppk[2] = {}, orph = 0, porph = 0;
+    uint64_t now = mach_absolute_time(), minute;
+    nanoseconds_to_absolutetime(60ULL * 1000 * 1000 * 1000, &minute);
+    IOLock *l = wire_lock();
+    if (l == nullptr)
+        return snprintf(buf, size, "no lock\n");
+    IOLockLock(l);
+    unsigned total = 0;
+    for (UserWire *w = gWires; w != nullptr; w = w->next)
+        total++;
+    for (UserWire *w = gWires; w != nullptr; w = w->next) {
+        int k = w->surface ? 0 : 1;
+        if (w->parked) {
+            pk[k]++;
+            ppk[k] += w->pages;
+        } else {
+            cnt[k]++;
+            pg[k] += w->pages;
+            if (now - w->when > minute) {
+                old[k]++;
+                pold[k] += w->pages;
+            }
+        }
+        if (w->surface && total <= 4096) {
+            int ours = 0;
+            for (UserWire *v = gWires; v != nullptr; v = v->next)
+                if (v->md == w->md)
+                    ours++;
+            if (w->md->getRetainCount() <= ours) {
+                orph++;
+                porph += w->pages;
+            }
+        }
+        int hit = -1, low = 0;
+        for (int i = 0; i < 8; i++) {
+            if (strncmp(rows[i].who, w->who, sizeof rows[i].who) == 0) { hit = i; break; }
+            if (rows[i].surf + rows[i].plain + rows[i].parked < rows[low].surf + rows[low].plain + rows[low].parked)
+                low = i;
+        }
+        if (hit < 0) {
+            hit = low;
+            rows[hit] = Row{};
+            strlcpy(rows[hit].who, w->who, sizeof rows[hit].who);
+        }
+        if (w->parked)
+            rows[hit].parked += w->pages;
+        else if (w->surface)
+            rows[hit].surf += w->pages;
+        else
+            rows[hit].plain += w->pages;
+    }
+    IOLockUnlock(l);
+    int n = snprintf(buf, size, "kind wired pages old60 old60pages parked parkedpages\n"
+                     "surface %lld %lld %lld %lld %lld %lld\nplain %lld %lld %lld %lld %lld %lld\n"
+                     "surface orphan %lld %lld\nprocess surf plain parked (pages)\n",
+                     (long long)cnt[0], (long long)pg[0], (long long)old[0], (long long)pold[0], (long long)pk[0],
+                     (long long)ppk[0], (long long)cnt[1], (long long)pg[1], (long long)old[1], (long long)pold[1],
+                     (long long)pk[1], (long long)ppk[1], (long long)orph, (long long)porph);
+    for (int i = 0; i < 8 && n > 0 && (size_t)n < size - 1; i++)
+        if (rows[i].surf + rows[i].plain + rows[i].parked != 0)
+            n += snprintf(buf + n, size - (size_t)n, "%s %lld %lld %lld\n", rows[i].who[0] ? rows[i].who : "?",
+                          (long long)rows[i].surf, (long long)rows[i].plain, (long long)rows[i].parked);
+    return n;
 }
