@@ -96,7 +96,7 @@ static struct backing *chunks;
 #define CHUNK_RESERVE 16384                /* 64 MB of free pages kept for the next allocations */
 static struct backing *avail;
 static struct backing *release_q;
-static void *release_call;                 /* thread_call_t */
+static thread_call_t release_call;
 static u_int free_count;
 uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;   /* debug.nmx_page_chunks / _free / _chunks_freed */
 uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
@@ -144,17 +144,12 @@ static struct vm_page *reg_find_locked(vm_paddr_t pfn)
     return NULL;
 }
 
-typedef void (*nmx_tc_func_t)(void *, void *);
-extern void *thread_call_allocate(nmx_tc_func_t func, void *param0);
-extern int thread_call_enter(void *call);
-extern int thread_call_cancel_wait(void *call);
-extern int thread_call_free(void *call);
 static void backing_release(struct backing *bk);
 static void release_worker(void *a, void *b);
 
 int nmx_page_init(void)
 {
-    release_call = thread_call_allocate(release_worker, NULL);
+    release_call = thread_call_allocate((thread_call_func_t)release_worker, NULL);
     pg_lock = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL);
     for (int i = 0; i < REG_LOCKS; i++)
         if ((reg_locks[i] = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL)) == NULL)
@@ -1017,7 +1012,7 @@ void nmx_page_fini(void)
     if (pages_live)
         printf("NullMoth xkpi: %llu page(s) still held at unload\n", (unsigned long long)pages_live);
     if (release_call != NULL) {
-        thread_call_cancel_wait(release_call);
+        thread_call_cancel(release_call);   /* unload only; cancel_wait is not exported to kexts */
         thread_call_free(release_call);
         release_call = NULL;
     }
