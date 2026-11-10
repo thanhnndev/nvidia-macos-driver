@@ -213,6 +213,10 @@ extern "C" volatile SInt64 gNmxSurfHint, gNmxSurfWire, gNmxSurfMiss, gNmxSurfBad
 extern "C" volatile SInt64 gNmxUserWires, gNmxUserWirePages;
 extern "C" uint64_t gNmxPagesLive;
 NMX_CNT(nmx_pages_live, gNmxPagesLive, "Step138: port page records handed out now (GTT/system pages, all kinds)");
+extern "C" uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;
+NMX_CNT(nmx_page_chunks, gNmxPageChunks, "Step141: 2 MB page chunks held now");
+NMX_CNT(nmx_page_free, gNmxPageFree, "Step141: free pages pooled in those chunks");
+NMX_CNT(nmx_page_chunks_freed, gNmxPageChunksFreed, "Step141: chunks given back to the system");
 NMX_CNT(nmx_userwire_count, gNmxUserWires, "Step138: user-memory wirings (IOMemoryDescriptors) held for the GPU now");
 NMX_CNT(nmx_userwire_pages, gNmxUserWirePages, "Step138: pages covered by those wirings");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
@@ -278,6 +282,9 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_pin_other_name);
     sysctl_register_oid(&sysctl__debug_nmx_pin_by_proc);
     sysctl_register_oid(&sysctl__debug_nmx_pages_live);
+    sysctl_register_oid(&sysctl__debug_nmx_page_chunks);
+    sysctl_register_oid(&sysctl__debug_nmx_page_free);
+    sysctl_register_oid(&sysctl__debug_nmx_page_chunks_freed);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_count);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_pages);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);

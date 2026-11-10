@@ -1,0 +1,14 @@
+--- a/drivers/gpu/drm/ttm/ttm_device.c	2026-11-10 20:26:50
++++ b/drivers/gpu/drm/ttm/ttm_device.c	2026-11-10 20:26:50
+@@ -93,7 +93,10 @@
+ 		>> PAGE_SHIFT;
+ 	num_dma32 = min(num_dma32, 2UL << (30 - PAGE_SHIFT));
+ 
+-	ttm_pool_mgr_init(num_pages);
++	/* macOS port (ga403wm Step141): the pool of freed WC/UC pages is only trimmed by the MM shrinker, and xnu never
++	 * fires vm_lowmem, so at 50 % of RAM the pool only ever grew (pages freed by every closed surface stayed wired).
++	 * Cap it at 128 MB: ttm_pool_free() trims to the cap after every free. The TT page limit below is unchanged. */
++	ttm_pool_mgr_init(min_t(u64, num_pages, 32768));
+ 	ttm_tt_mgr_init(num_pages, num_dma32);
+ 
+ 	glob->dummy_read_page = alloc_page(__GFP_ZERO | GFP_DMA32 |

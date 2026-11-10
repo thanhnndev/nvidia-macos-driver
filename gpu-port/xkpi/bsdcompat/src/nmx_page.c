@@ -3,7 +3,8 @@
  *
  * xnu gives kexts no page array and no direct map, so every page handed out is a struct vm_page this file creates:
  *   - single pages come from 2 MB chunks of wired kernel memory (nmx_xnu_mem_alloc), carved page by page and
- *     recycled through a free list; a chunk is returned to the system when all its pages are free again;
+ *     recycled through a per-chunk free list; a chunk whose pages are all free again goes back to the system once
+ *     more than CHUNK_RESERVE free pages are pooled (ga403wm Step141; before, chunks only went back at unload);
  *   - multi-page, 32-bit-DMA, or explicitly contiguous requests get one physically contiguous run of their own.
  * Every page is registered by physical page number, so PHYS_TO_VM_PAGE and PHYS_TO_DMAP work for all of them.
  * Pages start wired once (ref_count 1); the last unwire frees them, which is LinuxKPI's put_page/__free_page rule.
@@ -59,7 +60,11 @@ struct backing {
     void *kva;
     size_t npages;
     u_int live;                            /* pages handed out and not yet freed */
-    struct backing *next;                  /* chunk list */
+    struct backing *next;                  /* chunk list (and the release queue once unlinked) */
+    struct backing *prev;                  /* chunk list */
+    struct backing *anext, *aprev;         /* BK_CHUNK: list of chunks with free pages */
+    struct vm_page *cfree;                 /* BK_CHUNK: this chunk's free pages, linked through plinks.s.ss */
+    u_int nfree;                           /* BK_CHUNK: pages on cfree */
     struct vm_page pages[];                /* BK_CHUNK / BK_RUN: one record per page */
 };
 
@@ -81,8 +86,19 @@ static lck_spin_t *pg_lock;               /* chunk list, free list and the live 
 #define REG_LOCKS 256                      /* power of two dividing REG_BUCKETS */
 static lck_spin_t *reg_locks[REG_LOCKS];
 static struct backing *chunks;
-static struct vm_page *free_pages;         /* free single pages, linked through plinks.s.ss */
+/*
+ * ga403wm Step141: free single pages live on their own chunk's list, and the chunks that have any are on `avail`.
+ * Before, one global free list mixed pages of every chunk, so a chunk could never be taken out and the pool only grew
+ * to its peak (with TTM's pool on top, uncapped because xnu never fires vm_lowmem). Now a chunk that is wholly free
+ * again is unlinked and queued for release when the pool already holds CHUNK_RESERVE free pages without it; the
+ * release itself (registry removal, descriptor free) runs from a thread call, never under the caller's locks.
+ */
+#define CHUNK_RESERVE 16384                /* 64 MB of free pages kept for the next allocations */
+static struct backing *avail;
+static struct backing *release_q;
+static void *release_call;                 /* thread_call_t */
 static u_int free_count;
+uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;   /* debug.nmx_page_chunks / _free / _chunks_freed */
 uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
 #define pages_live gNmxPagesLive
 
@@ -128,8 +144,17 @@ static struct vm_page *reg_find_locked(vm_paddr_t pfn)
     return NULL;
 }
 
+typedef void (*nmx_tc_func_t)(void *, void *);
+extern void *thread_call_allocate(nmx_tc_func_t func, void *param0);
+extern int thread_call_enter(void *call);
+extern int thread_call_cancel_wait(void *call);
+extern int thread_call_free(void *call);
+static void backing_release(struct backing *bk);
+static void release_worker(void *a, void *b);
+
 int nmx_page_init(void)
 {
+    release_call = thread_call_allocate(release_worker, NULL);
     pg_lock = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL);
     for (int i = 0; i < REG_LOCKS; i++)
         if ((reg_locks[i] = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL)) == NULL)
@@ -213,15 +238,64 @@ static void backing_release(struct backing *bk)
 
 /* ---- allocation --------------------------------------------------------------------------------------------------- */
 
+static void avail_add(struct backing *bk)
+{
+    bk->aprev = NULL;
+    bk->anext = avail;
+    if (avail)
+        avail->aprev = bk;
+    avail = bk;
+}
+
+static void avail_del(struct backing *bk)
+{
+    if (bk->aprev)
+        bk->aprev->anext = bk->anext;
+    else
+        avail = bk->anext;
+    if (bk->anext)
+        bk->anext->aprev = bk->aprev;
+    bk->anext = bk->aprev = NULL;
+}
+
+static void chunk_unlink(struct backing *bk)
+{
+    if (bk->prev)
+        bk->prev->next = bk->next;
+    else
+        chunks = bk->next;
+    if (bk->next)
+        bk->next->prev = bk->prev;
+    bk->next = bk->prev = NULL;
+}
+
+/* frees the chunks queued by vm_page_free, from thread context */
+static void release_worker(void *a, void *b)
+{
+    lck_spin_lock(pg_lock);
+    struct backing *q = release_q;
+    release_q = NULL;
+    lck_spin_unlock(pg_lock);
+    while (q) {
+        struct backing *n = q->next;
+        backing_release(q);
+        q = n;
+    }
+}
+
 static struct vm_page *single_alloc(void)
 {
     for (;;) {
         lck_spin_lock(pg_lock);
-        struct vm_page *m = free_pages;
-        if (m) {
-            free_pages = (struct vm_page *)(uintptr_t)m->plinks.s.ss.sle_next;
+        struct backing *c = avail;
+        if (c) {
+            struct vm_page *m = c->cfree;
+            c->cfree = (struct vm_page *)(uintptr_t)m->plinks.s.ss.sle_next;
+            if (--c->nfree == 0)
+                avail_del(c);
             free_count--;
-            ((struct backing *)m->nmx_alloc)->live++;
+            gNmxPageFree = free_count;
+            c->live++;
             pages_live++;
             lck_spin_unlock(pg_lock);
             m->plinks.s.ss.sle_next = NULL;
@@ -232,14 +306,22 @@ static struct vm_page *single_alloc(void)
         struct backing *bk = backing_alloc(BK_CHUNK, CHUNK_PAGES, 0, 0, PAGE_SIZE);
         if (bk == NULL)
             return NULL;
-        lck_spin_lock(pg_lock);
-        bk->next = chunks;
-        chunks = bk;
-        for (size_t i = 0; i < bk->npages; i++) {
-            bk->pages[i].plinks.s.ss.sle_next = free_pages;
-            free_pages = &bk->pages[i];
-            free_count++;
+        bk->cfree = NULL;
+        for (size_t i = bk->npages; i-- > 0;) {
+            bk->pages[i].plinks.s.ss.sle_next = (void *)bk->cfree;
+            bk->cfree = &bk->pages[i];
         }
+        bk->nfree = (u_int)bk->npages;
+        lck_spin_lock(pg_lock);
+        bk->prev = NULL;
+        bk->next = chunks;
+        if (chunks)
+            chunks->prev = bk;
+        chunks = bk;
+        avail_add(bk);
+        free_count += bk->nfree;
+        gNmxPageFree = free_count;
+        gNmxPageChunks++;
         lck_spin_unlock(pg_lock);
     }
 }
@@ -291,10 +373,25 @@ void vm_page_free(vm_page_t m)
     pages_live--;
     bk->live--;
     if (bk->kind == BK_CHUNK) {
-        m->plinks.s.ss.sle_next = free_pages;
-        free_pages = m;
+        m->plinks.s.ss.sle_next = (void *)bk->cfree;
+        bk->cfree = m;
+        if (bk->nfree++ == 0)
+            avail_add(bk);
         free_count++;
+        int queue = bk->live == 0 && release_call != NULL && free_count - bk->nfree >= CHUNK_RESERVE;
+        if (queue) {
+            avail_del(bk);
+            chunk_unlink(bk);
+            free_count -= bk->nfree;
+            gNmxPageChunks--;
+            gNmxPageChunksFreed++;
+            bk->next = release_q;
+            release_q = bk;
+        }
+        gNmxPageFree = free_count;
         lck_spin_unlock(pg_lock);
+        if (queue)
+            thread_call_enter(release_call);
         return;
     }
     int last = bk->live == 0;
@@ -919,6 +1016,12 @@ void nmx_page_fini(void)
         return;
     if (pages_live)
         printf("NullMoth xkpi: %llu page(s) still held at unload\n", (unsigned long long)pages_live);
+    if (release_call != NULL) {
+        thread_call_cancel_wait(release_call);
+        thread_call_free(release_call);
+        release_call = NULL;
+    }
+    release_worker(NULL, NULL);
     /* fully free chunks go back; a chunk with pages still held is leaked deliberately rather than freed under them */
     struct backing *bk = chunks;
     chunks = NULL;
