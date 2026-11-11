@@ -109,6 +109,7 @@ static struct backing *chunks;
 #define CHUNK_RESERVE 65536                /* 256 MB of free pages kept for the next allocations */
 #define CHUNK_IDLE_NS (5ull * 1000000000ull) /* a free chunk must stay unused this long before it goes back */
 #define CHUNK_SWEEP_MS 1000
+#define CHUNK_HELD_MS 10000               /* Step141e: re-check every 10 s while only a recent peak holds chunks */
 static struct backing *avail;
 static thread_call_t release_call;
 static int sweep_armed;                   /* release_call is scheduled (pg_lock) */
@@ -131,15 +132,47 @@ static u_int free_count;
  * free - its pages >= CHUNK_RESERVE + (hwm - chunk_live). The peak is re-based to the current use once it is older.
  */
 #define CHUNK_HWM_NS (60ull * 1000000000ull)
+#define CHUNK_SLOW_NS (600ull * 1000000000ull)
+#define CHUNK_FAST_CAP 262144              /* Step141e: the 60 s peak keeps at most 1 GB above the reserve */
+#define CHUNK_SLOW_CAP 131072              /* Step141e: the 10 min peak keeps at most 512 MB above the reserve */
+/*
+ * Step141e (review of 141d): each peak is the max of two back-to-back windows, so a roll-over that lands on a dip in
+ * use does not drop the floor mid-video; a slow 10 min peak (capped) covers a video restart after a short break; both
+ * are capped so that closing a big client does not keep gigabytes wired.
+ */
 static u_int chunk_live;                  /* chunk pages handed out (pg_lock) */
-static u_int chunk_hwm;                   /* peak of chunk_live since chunk_hwm_at (pg_lock) */
-static uint64_t chunk_hwm_at;
-uint64_t gNmxPageHwm;                     /* debug.nmx_page_hwm */
+static u_int hwm_cur, hwm_prev, slow_cur, slow_prev;   /* peaks of chunk_live per window (pg_lock) */
+static uint64_t hwm_start, slow_start;
+uint64_t gNmxPageHwm;                     /* debug.nmx_page_hwm: pages kept above the reserve right now */
 
-/* free pages the pool must keep (pg_lock) */
+static void window_roll(u_int *cur, u_int *prev, uint64_t *start, uint64_t now, uint64_t len)
+{
+    if (now - *start < len)
+        return;
+    *prev = (now - *start < 2 * len) ? *cur : chunk_live;   /* two windows gone: the old peak is stale too */
+    *cur = chunk_live;
+    *start = now;
+}
+
+/* free pages the pool must keep (pg_lock); rolls the peak windows */
 static u_int pool_floor(void)
 {
-    return CHUNK_RESERVE + (chunk_hwm > chunk_live ? chunk_hwm - chunk_live : 0);
+    uint64_t now = mach_absolute_time(), fast, slow;
+    nanoseconds_to_absolutetime(CHUNK_HWM_NS, &fast);
+    nanoseconds_to_absolutetime(CHUNK_SLOW_NS, &slow);
+    window_roll(&hwm_cur, &hwm_prev, &hwm_start, now, fast);
+    window_roll(&slow_cur, &slow_prev, &slow_start, now, slow);
+    u_int f = hwm_cur > hwm_prev ? hwm_cur : hwm_prev;
+    u_int sl = slow_cur > slow_prev ? slow_cur : slow_prev;
+    f = f > chunk_live ? f - chunk_live : 0;
+    sl = sl > chunk_live ? sl - chunk_live : 0;
+    if (f > CHUNK_FAST_CAP)
+        f = CHUNK_FAST_CAP;
+    if (sl > CHUNK_SLOW_CAP)
+        sl = CHUNK_SLOW_CAP;
+    u_int keep = f > sl ? f : sl;
+    gNmxPageHwm = keep;
+    return CHUNK_RESERVE + keep;
 }
 uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;   /* debug.nmx_page_chunks / _free / _chunks_freed */
 uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
@@ -310,10 +343,10 @@ static void chunk_unlink(struct backing *bk)
 }
 
 /* call: release_call as read under pg_lock with sweep_busy raised, so unload cannot free it under us */
-static void sweep_arm(thread_call_t call)
+static void sweep_arm(thread_call_t call, uint32_t ms)
 {
     uint64_t deadline;
-    clock_interval_to_deadline(CHUNK_SWEEP_MS, 1000000 /* ns per ms */, &deadline);
+    clock_interval_to_deadline(ms, 1000000 /* ns per ms */, &deadline);
     thread_call_enter_delayed(call, deadline);
     lck_spin_lock(pg_lock);
     sweep_busy--;
@@ -333,22 +366,16 @@ static void release_worker(void *a, void *b)
     lck_spin_lock(pg_lock);
     sweep_busy++;
     uint64_t now = mach_absolute_time();
-    uint64_t hold;
-    nanoseconds_to_absolutetime(CHUNK_HWM_NS, &hold);
-    if (now - chunk_hwm_at >= hold) {     /* the peak is old: re-base it to what is in use now */
-        chunk_hwm = chunk_live;
-        chunk_hwm_at = now;
-        gNmxPageHwm = chunk_hwm;
-    }
-    int waiting = 0;
+    u_int floor = pool_floor();
+    int waiting = 0, held = 0;
     for (struct backing *c = avail, *n; c; c = n) {
         n = c->anext;
         if (c->live != 0)
             continue;
         if (free_count - c->nfree < CHUNK_RESERVE)
             continue;
-        if (free_count - c->nfree < pool_floor()) {
-            waiting = 1;                  /* held by the recent peak; look again once it is re-based */
+        if (free_count - c->nfree < floor) {
+            held = 1;                     /* kept by a recent peak; look again later (slowly) */
             continue;
         }
         if (now - c->empty_at < idle) {
@@ -365,13 +392,14 @@ static void release_worker(void *a, void *b)
     }
     gNmxPageFree = free_count;
     thread_call_t call = release_call;
-    int rearm = waiting && call != NULL && !sweep_stopping;
+    int rearm = (waiting || held) && call != NULL && !sweep_stopping;
+    uint32_t next_ms = waiting ? CHUNK_SWEEP_MS : CHUNK_HELD_MS;
     sweep_armed = rearm;
     if (rearm)
         sweep_busy++;                     /* dropped by sweep_arm */
     lck_spin_unlock(pg_lock);
     if (rearm)
-        sweep_arm(call);
+        sweep_arm(call, next_ms);
     while (q) {
         struct backing *n = q->next;
         backing_release(q);
@@ -443,11 +471,10 @@ static struct vm_page *single_alloc(void)
             gNmxPageFree = free_count;
             c->live++;
             pages_live++;
-            if (++chunk_live > chunk_hwm) {
-                chunk_hwm = chunk_live;
-                chunk_hwm_at = mach_absolute_time();
-                gNmxPageHwm = chunk_hwm;
-            }
+            if (++chunk_live > hwm_cur)
+                hwm_cur = chunk_live;
+            if (chunk_live > slow_cur)
+                slow_cur = chunk_live;
             thread_call_t call = fill_call;
             int fill = free_count < CHUNK_RESERVE / 2 && !fill_armed && !sweep_stopping && call != NULL;
             if (fill) {
@@ -537,7 +564,7 @@ void vm_page_free(vm_page_t m)
         gNmxPageFree = free_count;
         lck_spin_unlock(pg_lock);
         if (arm)
-            sweep_arm(call);
+            sweep_arm(call, CHUNK_SWEEP_MS);
         return;
     }
     int last = bk->live == 0;
