@@ -113,7 +113,16 @@ static struct backing *avail;
 static thread_call_t release_call;
 static int sweep_armed;                   /* release_call is scheduled (pg_lock) */
 static int sweep_stopping;                /* unload: nobody arms release_call again (pg_lock) */
-static int sweep_busy;                    /* sweeps running + arms in flight; unload waits for 0 (pg_lock) */
+static int sweep_busy;                    /* sweeps/fills running + arms in flight; unload waits for 0 (pg_lock) */
+/*
+ * ga403wm Step141c: with 1080p60 Chrome, single_alloc made 165 chunks itself in 3 s (free 62k -> 494 pages) and the
+ * frames of that second dropped. Each chunk is a 2 MB wired descriptor plus 512 registry inserts, paid by the GPU path
+ * that asked for one page. Now an allocation that leaves fewer than CHUNK_RESERVE/2 free pages wakes a fill thread
+ * call that tops the pool back up to CHUNK_RESERVE, so the allocation path rarely has to make a chunk itself.
+ */
+static thread_call_t fill_call;
+static int fill_armed;                    /* fill_call is scheduled or running (pg_lock) */
+uint64_t gNmxPageChunksFilled, gNmxPageChunksInline; /* debug.nmx_page_chunks_filled / _inline */
 static u_int free_count;
 uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;   /* debug.nmx_page_chunks / _free / _chunks_freed */
 uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
@@ -167,6 +176,7 @@ static void release_worker(void *a, void *b);
 int nmx_page_init(void)
 {
     release_call = thread_call_allocate((thread_call_func_t)release_worker, NULL);
+    fill_call = thread_call_allocate((thread_call_func_t)fill_worker, NULL);
     pg_lock = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL);
     for (int i = 0; i < REG_LOCKS; i++)
         if ((reg_locks[i] = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL)) == NULL)
@@ -343,6 +353,53 @@ static void release_worker(void *a, void *b)
     lck_spin_unlock(pg_lock);
 }
 
+/* makes one chunk and puts all its pages in the pool; thread context (may block) */
+static int chunk_new(uint64_t *counter)
+{
+    struct backing *bk = backing_alloc(BK_CHUNK, CHUNK_PAGES, 0, 0, PAGE_SIZE);
+    if (bk == NULL)
+        return ENOMEM;
+    bk->cfree = NULL;
+    for (size_t i = bk->npages; i-- > 0;) {
+        bk->pages[i].plinks.s.ss.sle_next = (void *)bk->cfree;
+        bk->cfree = &bk->pages[i];
+    }
+    bk->nfree = (u_int)bk->npages;
+    bk->empty_at = mach_absolute_time();
+    lck_spin_lock(pg_lock);
+    bk->prev = NULL;
+    bk->next = chunks;
+    if (chunks)
+        chunks->prev = bk;
+    chunks = bk;
+    avail_add(bk);
+    free_count += bk->nfree;
+    gNmxPageFree = free_count;
+    gNmxPageChunks++;
+    (*counter)++;
+    lck_spin_unlock(pg_lock);
+    return 0;
+}
+
+/* the fill thread call: tops the pool up to CHUNK_RESERVE free pages (bounded per run) */
+static void fill_worker(void *a, void *b)
+{
+    lck_spin_lock(pg_lock);
+    sweep_busy++;
+    lck_spin_unlock(pg_lock);
+    for (int i = 0; i < CHUNK_RESERVE / CHUNK_PAGES; i++) {
+        lck_spin_lock(pg_lock);
+        int need = free_count < CHUNK_RESERVE && !sweep_stopping;
+        lck_spin_unlock(pg_lock);
+        if (!need || chunk_new(&gNmxPageChunksFilled) != 0)
+            break;
+    }
+    lck_spin_lock(pg_lock);
+    fill_armed = 0;
+    sweep_busy--;
+    lck_spin_unlock(pg_lock);
+}
+
 static struct vm_page *single_alloc(void)
 {
     for (;;) {
@@ -357,33 +414,25 @@ static struct vm_page *single_alloc(void)
             gNmxPageFree = free_count;
             c->live++;
             pages_live++;
+            thread_call_t call = fill_call;
+            int fill = free_count < CHUNK_RESERVE / 2 && !fill_armed && !sweep_stopping && call != NULL;
+            if (fill) {
+                fill_armed = 1;
+                sweep_busy++;
+            }
             lck_spin_unlock(pg_lock);
             m->plinks.s.ss.sle_next = NULL;
+            if (fill) {
+                thread_call_enter(call);
+                lck_spin_lock(pg_lock);
+                sweep_busy--;
+                lck_spin_unlock(pg_lock);
+            }
             return m;
         }
         lck_spin_unlock(pg_lock);
-
-        struct backing *bk = backing_alloc(BK_CHUNK, CHUNK_PAGES, 0, 0, PAGE_SIZE);
-        if (bk == NULL)
+        if (chunk_new(&gNmxPageChunksInline) != 0)
             return NULL;
-        bk->cfree = NULL;
-        for (size_t i = bk->npages; i-- > 0;) {
-            bk->pages[i].plinks.s.ss.sle_next = (void *)bk->cfree;
-            bk->cfree = &bk->pages[i];
-        }
-        bk->nfree = (u_int)bk->npages;
-        bk->empty_at = mach_absolute_time();
-        lck_spin_lock(pg_lock);
-        bk->prev = NULL;
-        bk->next = chunks;
-        if (chunks)
-            chunks->prev = bk;
-        chunks = bk;
-        avail_add(bk);
-        free_count += bk->nfree;
-        gNmxPageFree = free_count;
-        gNmxPageChunks++;
-        lck_spin_unlock(pg_lock);
     }
 }
 
@@ -1248,9 +1297,12 @@ void nmx_page_fini(void)
      */
     lck_spin_lock(pg_lock);
     sweep_stopping = 1;
-    thread_call_t call = release_call;
+    thread_call_t calls[2] = { release_call, fill_call };
     lck_spin_unlock(pg_lock);
-    if (call != NULL) {
+    for (int k = 0; k < 2; k++) {
+        thread_call_t call = calls[k];
+        if (call == NULL)
+            continue;
         int freed = 0;
         for (int i = 0; i < 500 && !freed; i++) {
             thread_call_cancel(call);
@@ -1263,11 +1315,12 @@ void nmx_page_fini(void)
                 IOSleep(10);
         }
         if (!freed)
-            printf("NullMoth xkpi: chunk release sweep still busy at unload, call leaked\n");
-        lck_spin_lock(pg_lock);
-        release_call = NULL;
-        lck_spin_unlock(pg_lock);
+            printf("NullMoth xkpi: chunk sweep/fill call still busy at unload, call leaked\n");
     }
+    lck_spin_lock(pg_lock);
+    release_call = NULL;
+    fill_call = NULL;
+    lck_spin_unlock(pg_lock);
     release_worker(NULL, NULL);
     /* fully free chunks go back; a chunk with pages still held is leaked deliberately rather than freed under them */
     struct backing *bk = chunks;
