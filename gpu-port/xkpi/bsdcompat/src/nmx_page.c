@@ -58,7 +58,7 @@ volatile long long gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserR
  * records (pinned but never populated: the TT unpopulate that drops them was skipped), and the park sweep's knobs and
  * counters. nmx_userptr_park_ms: idle time after which an IOSurface userptr BO is parked; 0 = never (debug.*). */
 volatile long long gNmxUpinRestoreFail, gNmxUpinDestroyRec, gNmxParkSkipBusy, gNmxParkFail;
-int nmx_userptr_park_ms = 10000;
+int nmx_userptr_park_ms = 60000;      /* Step142b: 10 s re-wired whole swap chains at once mid-video (part 39) */
 
 struct backing {
     int kind;
@@ -124,6 +124,23 @@ static thread_call_t fill_call;
 static int fill_armed;                    /* fill_call is scheduled or running (pg_lock) */
 uint64_t gNmxPageChunksFilled, gNmxPageChunksInline; /* debug.nmx_page_chunks_filled / _inline */
 static u_int free_count;
+/*
+ * ga403wm Step141d: the aged release gave back 194 chunks in a short pause between two videos; the next video start then
+ * took ~490 MB in 3 s and the allocation path made 107 chunks (142 drops). The pool now keeps, besides the reserve, what
+ * chunk pages were in use at their peak over the last CHUNK_HWM_NS: a chunk is released only while
+ * free - its pages >= CHUNK_RESERVE + (hwm - chunk_live). The peak is re-based to the current use once it is older.
+ */
+#define CHUNK_HWM_NS (60ull * 1000000000ull)
+static u_int chunk_live;                  /* chunk pages handed out (pg_lock) */
+static u_int chunk_hwm;                   /* peak of chunk_live since chunk_hwm_at (pg_lock) */
+static uint64_t chunk_hwm_at;
+uint64_t gNmxPageHwm;                     /* debug.nmx_page_hwm */
+
+/* free pages the pool must keep (pg_lock) */
+static u_int pool_floor(void)
+{
+    return CHUNK_RESERVE + (chunk_hwm > chunk_live ? chunk_hwm - chunk_live : 0);
+}
 uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;   /* debug.nmx_page_chunks / _free / _chunks_freed */
 uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
 #define pages_live gNmxPagesLive
@@ -316,6 +333,13 @@ static void release_worker(void *a, void *b)
     lck_spin_lock(pg_lock);
     sweep_busy++;
     uint64_t now = mach_absolute_time();
+    uint64_t hold;
+    nanoseconds_to_absolutetime(CHUNK_HWM_NS, &hold);
+    if (now - chunk_hwm_at >= hold) {     /* the peak is old: re-base it to what is in use now */
+        chunk_hwm = chunk_live;
+        chunk_hwm_at = now;
+        gNmxPageHwm = chunk_hwm;
+    }
     int waiting = 0;
     for (struct backing *c = avail, *n; c; c = n) {
         n = c->anext;
@@ -323,6 +347,10 @@ static void release_worker(void *a, void *b)
             continue;
         if (free_count - c->nfree < CHUNK_RESERVE)
             continue;
+        if (free_count - c->nfree < pool_floor()) {
+            waiting = 1;                  /* held by the recent peak; look again once it is re-based */
+            continue;
+        }
         if (now - c->empty_at < idle) {
             waiting = 1;
             continue;
@@ -415,6 +443,11 @@ static struct vm_page *single_alloc(void)
             gNmxPageFree = free_count;
             c->live++;
             pages_live++;
+            if (++chunk_live > chunk_hwm) {
+                chunk_hwm = chunk_live;
+                chunk_hwm_at = mach_absolute_time();
+                gNmxPageHwm = chunk_hwm;
+            }
             thread_call_t call = fill_call;
             int fill = free_count < CHUNK_RESERVE / 2 && !fill_armed && !sweep_stopping && call != NULL;
             if (fill) {
@@ -484,6 +517,7 @@ void vm_page_free(vm_page_t m)
     pages_live--;
     bk->live--;
     if (bk->kind == BK_CHUNK) {
+        chunk_live--;
         m->plinks.s.ss.sle_next = (void *)bk->cfree;
         bk->cfree = m;
         if (bk->nfree++ == 0)
@@ -494,6 +528,7 @@ void vm_page_free(vm_page_t m)
         if (bk->live == 0) {
             bk->empty_at = mach_absolute_time();
             arm = !sweep_armed && !sweep_stopping && call != NULL && free_count - bk->nfree >= CHUNK_RESERVE;
+            /* (CHUNK_RESERVE, not pool_floor: the sweep re-checks the floor and keeps running while the peak holds) */
             if (arm) {
                 sweep_armed = 1;
                 sweep_busy++;             /* dropped by sweep_arm */

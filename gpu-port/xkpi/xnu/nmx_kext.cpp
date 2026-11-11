@@ -226,12 +226,13 @@ extern "C" volatile SInt64 gNmxSurfHint, gNmxSurfWire, gNmxSurfMiss, gNmxSurfBad
 extern "C" volatile SInt64 gNmxUserWires, gNmxUserWirePages;
 extern "C" uint64_t gNmxPagesLive;
 NMX_CNT(nmx_pages_live, gNmxPagesLive, "Step138: port page records handed out now (GTT/system pages, all kinds)");
-extern "C" uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed, gNmxPageChunksFilled, gNmxPageChunksInline;
+extern "C" uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed, gNmxPageChunksFilled, gNmxPageChunksInline, gNmxPageHwm;
 NMX_CNT(nmx_page_chunks, gNmxPageChunks, "Step141: 2 MB page chunks held now");
 NMX_CNT(nmx_page_free, gNmxPageFree, "Step141: free pages pooled in those chunks");
 NMX_CNT(nmx_page_chunks_freed, gNmxPageChunksFreed, "Step141: chunks given back to the system");
 NMX_CNT(nmx_page_chunks_filled, gNmxPageChunksFilled, "Step141c: chunks made ahead by the fill thread call");
 NMX_CNT(nmx_page_chunks_inline, gNmxPageChunksInline, "Step141c: chunks made in the allocation path");
+NMX_CNT(nmx_page_hwm, gNmxPageHwm, "Step141d: peak chunk pages in use over the last 60 s (kept pooled)");
 NMX_CNT(nmx_userwire_count, gNmxUserWires, "Step138: user-memory wirings (IOMemoryDescriptors) held for the GPU now");
 NMX_CNT(nmx_userwire_pages, gNmxUserWirePages, "Step138: pages covered by those wirings");
 extern "C" volatile SInt64 gNmxSurfWires, gNmxSurfWirePages, gNmxUserParked, gNmxUserParkedPages, gNmxUserParks,
@@ -320,6 +321,7 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_page_chunks_freed);
     sysctl_register_oid(&sysctl__debug_nmx_page_chunks_filled);
     sysctl_register_oid(&sysctl__debug_nmx_page_chunks_inline);
+    sysctl_register_oid(&sysctl__debug_nmx_page_hwm);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_count);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_pages);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_by_kind);
