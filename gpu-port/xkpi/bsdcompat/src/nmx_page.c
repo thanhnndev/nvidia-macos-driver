@@ -112,6 +112,8 @@ static struct backing *chunks;
 static struct backing *avail;
 static thread_call_t release_call;
 static int sweep_armed;                   /* release_call is scheduled (pg_lock) */
+static int sweep_stopping;                /* unload: nobody arms release_call again (pg_lock) */
+static int sweep_busy;                    /* sweeps running + arms in flight; unload waits for 0 (pg_lock) */
 static u_int free_count;
 uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;   /* debug.nmx_page_chunks / _free / _chunks_freed */
 uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
@@ -279,11 +281,15 @@ static void chunk_unlink(struct backing *bk)
     bk->next = bk->prev = NULL;
 }
 
-static void sweep_arm(void)
+/* call: release_call as read under pg_lock with sweep_busy raised, so unload cannot free it under us */
+static void sweep_arm(thread_call_t call)
 {
     uint64_t deadline;
     clock_interval_to_deadline(CHUNK_SWEEP_MS, 1000000 /* ns per ms */, &deadline);
-    thread_call_enter_delayed(release_call, deadline);
+    thread_call_enter_delayed(call, deadline);
+    lck_spin_lock(pg_lock);
+    sweep_busy--;
+    lck_spin_unlock(pg_lock);
 }
 
 /*
@@ -297,6 +303,7 @@ static void release_worker(void *a, void *b)
     uint64_t idle;
     nanoseconds_to_absolutetime(CHUNK_IDLE_NS, &idle);
     lck_spin_lock(pg_lock);
+    sweep_busy++;
     uint64_t now = mach_absolute_time();
     int waiting = 0;
     for (struct backing *c = avail, *n; c; c = n) {
@@ -318,16 +325,22 @@ static void release_worker(void *a, void *b)
         q = c;
     }
     gNmxPageFree = free_count;
-    int rearm = waiting && release_call != NULL;
+    thread_call_t call = release_call;
+    int rearm = waiting && call != NULL && !sweep_stopping;
     sweep_armed = rearm;
+    if (rearm)
+        sweep_busy++;                     /* dropped by sweep_arm */
     lck_spin_unlock(pg_lock);
     if (rearm)
-        sweep_arm();
+        sweep_arm(call);
     while (q) {
         struct backing *n = q->next;
         backing_release(q);
         q = n;
     }
+    lck_spin_lock(pg_lock);
+    sweep_busy--;
+    lck_spin_unlock(pg_lock);
 }
 
 static struct vm_page *single_alloc(void)
@@ -359,6 +372,7 @@ static struct vm_page *single_alloc(void)
             bk->cfree = &bk->pages[i];
         }
         bk->nfree = (u_int)bk->npages;
+        bk->empty_at = mach_absolute_time();
         lck_spin_lock(pg_lock);
         bk->prev = NULL;
         bk->next = chunks;
@@ -426,16 +440,19 @@ void vm_page_free(vm_page_t m)
             avail_add(bk);
         free_count++;
         int arm = 0;
+        thread_call_t call = release_call;
         if (bk->live == 0) {
             bk->empty_at = mach_absolute_time();
-            arm = !sweep_armed && release_call != NULL && free_count - bk->nfree >= CHUNK_RESERVE;
-            if (arm)
+            arm = !sweep_armed && !sweep_stopping && call != NULL && free_count - bk->nfree >= CHUNK_RESERVE;
+            if (arm) {
                 sweep_armed = 1;
+                sweep_busy++;             /* dropped by sweep_arm */
+            }
         }
         gNmxPageFree = free_count;
         lck_spin_unlock(pg_lock);
         if (arm)
-            sweep_arm();
+            sweep_arm(call);
         return;
     }
     int last = bk->live == 0;
@@ -1225,10 +1242,31 @@ void nmx_page_fini(void)
         return;
     if (pages_live)
         printf("NullMoth xkpi: %llu page(s) still held at unload\n", (unsigned long long)pages_live);
-    if (release_call != NULL) {
-        thread_call_cancel(release_call);   /* unload only; cancel_wait is not exported to kexts */
-        thread_call_free(release_call);
+    /*
+     * Step141b: stop new arms, then wait (bounded) until no sweep runs and no arm is in flight before freeing the call;
+     * cancel_wait is not exported to kexts. thread_call_free fails while the call is still pending, so retry the cancel.
+     */
+    lck_spin_lock(pg_lock);
+    sweep_stopping = 1;
+    thread_call_t call = release_call;
+    lck_spin_unlock(pg_lock);
+    if (call != NULL) {
+        int freed = 0;
+        for (int i = 0; i < 500 && !freed; i++) {
+            thread_call_cancel(call);
+            lck_spin_lock(pg_lock);
+            int busy = sweep_busy;
+            lck_spin_unlock(pg_lock);
+            if (busy == 0 && thread_call_free(call))
+                freed = 1;
+            else
+                IOSleep(10);
+        }
+        if (!freed)
+            printf("NullMoth xkpi: chunk release sweep still busy at unload, call leaked\n");
+        lck_spin_lock(pg_lock);
         release_call = NULL;
+        lck_spin_unlock(pg_lock);
     }
     release_worker(NULL, NULL);
     /* fully free chunks go back; a chunk with pages still held is leaked deliberately rather than freed under them */
