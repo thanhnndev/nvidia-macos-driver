@@ -172,6 +172,7 @@ static struct vm_page *reg_find_locked(vm_paddr_t pfn)
 
 static void backing_release(struct backing *bk);
 static void release_worker(void *a, void *b);
+static void fill_worker(void *a, void *b);
 
 int nmx_page_init(void)
 {
