@@ -3,8 +3,9 @@
  *
  * xnu gives kexts no page array and no direct map, so every page handed out is a struct vm_page this file creates:
  *   - single pages come from 2 MB chunks of wired kernel memory (nmx_xnu_mem_alloc), carved page by page and
- *     recycled through a per-chunk free list; a chunk whose pages are all free again goes back to the system once
- *     more than CHUNK_RESERVE free pages are pooled (ga403wm Step141; before, chunks only went back at unload);
+ *     recycled through a per-chunk free list; a chunk whose pages have all been free for CHUNK_IDLE_NS goes back to
+ *     the system once more than CHUNK_RESERVE free pages are pooled (ga403wm Step141/141b; before, chunks only went
+ *     back at unload);
  *   - multi-page, 32-bit-DMA, or explicitly contiguous requests get one physically contiguous run of their own.
  * Every page is registered by physical page number, so PHYS_TO_VM_PAGE and PHYS_TO_DMAP work for all of them.
  * Pages start wired once (ref_count 1); the last unwire frees them, which is LinuxKPI's put_page/__free_page rule.
@@ -70,6 +71,7 @@ struct backing {
     struct backing *anext, *aprev;         /* BK_CHUNK: list of chunks with free pages */
     struct vm_page *cfree;                 /* BK_CHUNK: this chunk's free pages, linked through plinks.s.ss */
     u_int nfree;                           /* BK_CHUNK: pages on cfree */
+    uint64_t empty_at;                     /* BK_CHUNK: mach_absolute_time when live last dropped to 0 */
     struct vm_page pages[];                /* BK_CHUNK / BK_RUN: one record per page */
 };
 
@@ -98,10 +100,18 @@ static struct backing *chunks;
  * again is unlinked and queued for release when the pool already holds CHUNK_RESERVE free pages without it; the
  * release itself (registry removal, descriptor free) runs from a thread call, never under the caller's locks.
  */
-#define CHUNK_RESERVE 16384                /* 64 MB of free pages kept for the next allocations */
+/*
+ * ga403wm Step141b: releasing a chunk the moment it emptied (above a 64 MB reserve) made 1080p60 Chrome drop 21 frames a
+ * minute instead of 7: Chrome's GPU buffers come and go in ~120 MB bursts, so the pool was released and then refilled
+ * (93 new chunks in the 13-drop second). Now a wholly free chunk is released only after CHUNK_IDLE_NS without use, by a
+ * sweep that runs every second while there is anything to release, and the reserve is 256 MB.
+ */
+#define CHUNK_RESERVE 65536                /* 256 MB of free pages kept for the next allocations */
+#define CHUNK_IDLE_NS (5ull * 1000000000ull) /* a free chunk must stay unused this long before it goes back */
+#define CHUNK_SWEEP_MS 1000
 static struct backing *avail;
-static struct backing *release_q;
 static thread_call_t release_call;
+static int sweep_armed;                   /* release_call is scheduled (pg_lock) */
 static u_int free_count;
 uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed;   /* debug.nmx_page_chunks / _free / _chunks_freed */
 uint64_t gNmxPagesLive;                   /* pages currently handed out (all kinds); debug.nmx_pages_live */
@@ -269,13 +279,50 @@ static void chunk_unlink(struct backing *bk)
     bk->next = bk->prev = NULL;
 }
 
-/* frees the chunks queued by vm_page_free, from thread context */
+static void sweep_arm(void)
+{
+    uint64_t deadline;
+    clock_interval_to_deadline(CHUNK_SWEEP_MS, 1000000 /* ns per ms */, &deadline);
+    thread_call_enter_delayed(release_call, deadline);
+}
+
+/*
+ * the release sweep (thread call): unlinks every chunk that has been wholly free for CHUNK_IDLE_NS while the pool keeps
+ * CHUNK_RESERVE free pages without it, frees them outside pg_lock, and runs again in a second while free chunks above
+ * the reserve are still waiting. Also called once at unload with release_call already gone.
+ */
 static void release_worker(void *a, void *b)
 {
+    struct backing *q = NULL;
+    uint64_t idle;
+    nanoseconds_to_absolutetime(CHUNK_IDLE_NS, &idle);
     lck_spin_lock(pg_lock);
-    struct backing *q = release_q;
-    release_q = NULL;
+    uint64_t now = mach_absolute_time();
+    int waiting = 0;
+    for (struct backing *c = avail, *n; c; c = n) {
+        n = c->anext;
+        if (c->live != 0)
+            continue;
+        if (free_count - c->nfree < CHUNK_RESERVE)
+            continue;
+        if (now - c->empty_at < idle) {
+            waiting = 1;
+            continue;
+        }
+        avail_del(c);
+        chunk_unlink(c);
+        free_count -= c->nfree;
+        gNmxPageChunks--;
+        gNmxPageChunksFreed++;
+        c->next = q;
+        q = c;
+    }
+    gNmxPageFree = free_count;
+    int rearm = waiting && release_call != NULL;
+    sweep_armed = rearm;
     lck_spin_unlock(pg_lock);
+    if (rearm)
+        sweep_arm();
     while (q) {
         struct backing *n = q->next;
         backing_release(q);
@@ -378,20 +425,17 @@ void vm_page_free(vm_page_t m)
         if (bk->nfree++ == 0)
             avail_add(bk);
         free_count++;
-        int queue = bk->live == 0 && release_call != NULL && free_count - bk->nfree >= CHUNK_RESERVE;
-        if (queue) {
-            avail_del(bk);
-            chunk_unlink(bk);
-            free_count -= bk->nfree;
-            gNmxPageChunks--;
-            gNmxPageChunksFreed++;
-            bk->next = release_q;
-            release_q = bk;
+        int arm = 0;
+        if (bk->live == 0) {
+            bk->empty_at = mach_absolute_time();
+            arm = !sweep_armed && release_call != NULL && free_count - bk->nfree >= CHUNK_RESERVE;
+            if (arm)
+                sweep_armed = 1;
         }
         gNmxPageFree = free_count;
         lck_spin_unlock(pg_lock);
-        if (queue)
-            thread_call_enter(release_call);
+        if (arm)
+            sweep_arm();
         return;
     }
     int last = bk->live == 0;
