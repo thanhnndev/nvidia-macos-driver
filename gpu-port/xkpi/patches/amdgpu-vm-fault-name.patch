@@ -1,6 +1,6 @@
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
-@@ -1512,7 +1512,106 @@
+@@ -1512,7 +1512,117 @@
   * Returns:
   * 0 for success.
   *
@@ -48,7 +48,9 @@
 +	struct amdgpu_bo *root = NULL;
 +	struct amdgpu_vm *vm;
 +	unsigned long fl;
++	struct nmx_vafree hit[4];
 +	u64 now = ktime_get_ns();
++	u32 last;
 +	int i, hits = 0;
 +
 +	xa_lock_irqsave(&adev->vm_manager.pasids, fl);
@@ -73,41 +75,50 @@
 +			dev_err(adev->dev, "  NMX: no live mapping at 0x%llx\n", addr);
 +		} else {
 +			struct amdgpu_bo *bo = m->bo_va ? m->bo_va->base.bo : NULL;
++			/* review 3: tbo.resource / tbo.ttm change under the BO's own reservation; a per-VM BO shares the
++			 * root's (held), any other is tried, and its placement is not read when someone holds it */
++			bool own = bo && bo->tbo.base.resv != root->tbo.base.resv;
++			bool locked = bo && (!own || dma_resv_trylock(bo->tbo.base.resv));
 +
 +			dev_err(adev->dev, "  NMX: live mapping 0x%llx-0x%llx flags 0x%llx bo %p size %lu placement %d "
-+				"(0 SYSTEM = evicted/parked, 1 GTT, 2 VRAM) userptr %d pin %u prefer 0x%x\n",
++				"(0 SYSTEM = evicted/parked, 1 GTT, 2 VRAM, -2 BO busy) userptr %d pin %u prefer 0x%x\n",
 +				m->start << AMDGPU_GPU_PAGE_SHIFT, (m->last + 1) << AMDGPU_GPU_PAGE_SHIFT,
 +				(unsigned long long)m->flags, bo, bo ? (unsigned long)amdgpu_bo_size(bo) : 0UL,
-+				bo && bo->tbo.resource ? (int)bo->tbo.resource->mem_type : -1,
-+				bo && bo->tbo.ttm ? (int)amdgpu_ttm_tt_is_userptr(bo->tbo.ttm) : -1,
++				!bo ? -1 : !locked ? -2 : bo->tbo.resource ? (int)bo->tbo.resource->mem_type : -1,
++				!bo ? -1 : !locked ? -2 : bo->tbo.ttm ? (int)amdgpu_ttm_tt_is_userptr(bo->tbo.ttm) : -1,
 +				bo ? bo->tbo.pin_count : 0, bo ? bo->preferred_domains : 0);
++			if (own && locked)
++				dma_resv_unlock(bo->tbo.base.resv);
 +		}
 +		dma_resv_unlock(root->tbo.base.resv);
 +	}
 +	if (root)
 +		amdgpu_bo_unref(&root);
 +
++	/* review 4: copy the hits under the lock, print after it (clear_freed notes under it from CS threads) */
 +	spin_lock_irqsave(&nmx_vafree_lock, fl);
++	last = nmx_vafree_seq;
 +	for (i = 0; i < NMX_VAFREE_N && hits < 4; i++) {
-+		struct nmx_vafree *e = &nmx_vafrees[(nmx_vafree_seq - 1 - i) % NMX_VAFREE_N];
++		struct nmx_vafree *e = &nmx_vafrees[(last - 1 - i) % NMX_VAFREE_N];
 +
 +		if (e->seq == 0 || e->pasid != pasid || addr < e->start || addr >= e->end)
 +			continue;
-+		hits++;
-+		dev_err(adev->dev, "  NMX: 0x%llx was FREED: range 0x%llx-0x%llx invalidated %llu ms ago (free #%u of %u)\n",
-+			addr, e->start, e->end, (now - e->ns) / 1000000ULL, e->seq, nmx_vafree_seq);
++		hit[hits++] = *e;
 +	}
 +	spin_unlock_irqrestore(&nmx_vafree_lock, fl);
++	for (i = 0; i < hits; i++)
++		dev_err(adev->dev, "  NMX: 0x%llx was FREED: range 0x%llx-0x%llx invalidated %llu ms ago (free #%u of %u)\n",
++			addr, hit[i].start, hit[i].end, (now - hit[i].ns) / 1000000ULL, hit[i].seq, last);
 +	if (hits == 0)
 +		dev_err(adev->dev, "  NMX: 0x%llx is in none of the last %u freed ranges\n", addr,
-+			nmx_vafree_seq < NMX_VAFREE_N ? nmx_vafree_seq : NMX_VAFREE_N);
++			last < NMX_VAFREE_N ? last : NMX_VAFREE_N);
 +}
 +#endif
 +
  int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
  			  struct amdgpu_vm *vm,
  			  struct dma_fence **fence)
-@@ -1537,6 +1636,9 @@
+@@ -1537,6 +1647,9 @@
  		mapping = list_first_entry(&vm->freed,
  			struct amdgpu_bo_va_mapping, list);
  		list_del(&mapping->list);
