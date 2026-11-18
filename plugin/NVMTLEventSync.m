@@ -125,8 +125,12 @@ static BOOL nvmtl_nmx_fence_on(void) {
 static _Atomic unsigned long long gNmxFenceSeq;
 static NSMapTable *nvmtl_nmx_fence_done;   // IOSurface (weak) -> NSNumber: the highest NMXFenceDone written
 static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
-    cb->_nmxFence = nil; cb->_nmxFenced = NO;
+    cb->_nmxFence = nil; cb->_nmxFenced = NO; cb->_nmxSubSent = NO; cb->_nmxLastSurfPart = -1;
     if (!nvmtl_nmx_fence_on()) return;
+    for (NSUInteger i = 0; i < cb->_parts.count; i++) {
+        NVMTLSubmissionPart *part = cb->_parts[i];
+        if ([part isKindOfClass:[NVMTLSubmissionPart class]] && part->surfaces.count) cb->_nmxLastSurfPart = (NSInteger)i;
+    }
     NSMutableSet *seen = [NSMutableSet new];
     for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
         if (!t->_surf || [seen containsObject:(__bridge id)t->_surf]) continue;
@@ -139,6 +143,18 @@ static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
         [cb->_nmxFence addObject:@[(__bridge id)t->_surf, @(n)]];
     }
     cb->_nmxFenced = cb->_nmxFence.count != 0;
+}
+// out-31 (FRAME-PATH row 1): NMXGPU records each CS job's fence against the IOSurfaces it writes, and NMXAccel lets the
+// display commit wait for it in the kernel - but only for a frame whose CS is already in the kernel. "Scheduled" is
+// marked before the CS ioctl and a surface may be written by a later part, so after the last part that writes a marked
+// surface has passed vkQueueSubmit (the CS ioctl; RADV on amdgpu submits immediately) this writes
+// NMXFenceSubmitted = n. NMXAccel flips with the kernel fence only when NMXFenceSubmitted >= NMXFencePending; otherwise
+// it waits for NMXFenceDone as before. Runs on the submitting thread, not the completion thread.
+static void nvmtl_nmx_fence_submitted(NVMTLCommandBuffer *cb, NSInteger partIndex) {
+    if (cb->_nmxSubSent || !cb->_nmxFence.count || partIndex < cb->_nmxLastSurfPart) return;
+    cb->_nmxSubSent = YES;
+    for (NSArray *m in cb->_nmxFence)
+        IOSurfaceSetValue((__bridge IOSurfaceRef)m[0], CFSTR("NMXFenceSubmitted"), (__bridge CFNumberRef)m[1]);
 }
 static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb, double gpuEndSeconds) {
     NSArray *marks = cb->_nmxFence; cb->_nmxFence = nil;
@@ -495,6 +511,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
             part->aheadFailed = r;
             return NO;
         }
+        nvmtl_nmx_fence_submitted(self, (NSInteger)_nextSubmit - 1);
         part->inflight = f;
         nvmtl_evfold_promise_part(part);
         const unsigned long long n = atomic_fetch_add(&gsub_inflight, 1) + 1;
@@ -573,6 +590,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
             result = nvmtl_vk_submit_wait(&part->commands);
         }
+        if (result == 0) nvmtl_nmx_fence_submitted(self, (NSInteger)_nextPart);
         if (result == -2) {
             if (!nvmtl_quarantined_parts) nvmtl_quarantined_parts = [NSMutableArray new];
             [nvmtl_quarantined_parts addObject:part];
