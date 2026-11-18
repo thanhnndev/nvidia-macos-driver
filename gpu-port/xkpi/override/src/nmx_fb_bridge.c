@@ -450,6 +450,7 @@ struct nmx_flip_import {
 
 static struct {
     spinlock_t lock;
+    struct mutex vbl_mtx;               /* out-31 row 2: nmx_fb_vbl_ref */
     int lock_ready;
     uint32_t inited, gen, cur, pending, nbuf, logs, tried;
     uint64_t seq_sub, seq_lat;
@@ -541,6 +542,7 @@ static int flip_init(void)
         return 0;
     if (!flip.lock_ready) {
         spin_lock_init(&flip.lock);
+        mutex_init(&flip.vbl_mtx);
         flip.lock_ready = 1;
     }
     flip.nfb = nfb;
@@ -1437,12 +1439,11 @@ void nmx_fb_vbl_set_sink(void (*fn)(void *, uint64_t), void *arg)
  * (released, or the CRTC is off: drm_crtc_vblank_get -EINVAL, the caller's timer is the fallback). Idempotent. */
 int nmx_fb_vbl_ref(int on)
 {
-    static DEFINE_MUTEX(vbl_mtx);
     int held;
 
     if (!flip_init())
         return 0;
-    mutex_lock(&vbl_mtx);
+    mutex_lock(&flip.vbl_mtx);
     if (on && !vbl.held && __atomic_load_n(&nmx_vbl_irq, __ATOMIC_RELAXED))
         vbl.held = drm_crtc_vblank_get(flip.crtc) == 0;
     else if (!on && vbl.held) {
@@ -1450,7 +1451,7 @@ int nmx_fb_vbl_ref(int on)
         vbl.held = 0;
     }
     held = vbl.held;
-    mutex_unlock(&vbl_mtx);
+    mutex_unlock(&flip.vbl_mtx);
     return held;
 }
 
