@@ -6286,6 +6286,27 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     const uint64_t sE = nvmtl_perf_now();
     if (pt[0]) { pt[1] = pt[0] + (sA - pt[0]) + (sD - sC); pt[2] = pt[1] + (sB - sA) + (sE - sD); pt[3] = pt[2] + (sC - sB); }
     result = g_state == 1 ? pvkQueueSubmit(g_queue, 1, &si, fence) : VK_ERROR_DEVICE_LOST;
+    /* ga403wm cs-enomem: an out-of-memory submit was not submitted and the device is fine (Vulkan spec; RADV returns
+     * VK_ERROR_OUT_OF_HOST_MEMORY for the kernel's "Not enough memory for command submission"). Under memory pressure
+     * that is transient: back off 1..64 ms and submit again for up to 2 s instead of taking WindowServer down
+     * (2026-11-18 10:35:15). Off with NVMTL_CS_OOM_RETRY=0. */
+    if ((result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) && g_state == 1) {
+        static int retry_on = -1;
+        if (retry_on < 0) { const char *e = getenv("NVMTL_CS_OOM_RETRY"); retry_on = !(e && e[0] == '0'); }
+        unsigned back_ms = 1, waited_ms = 0, tries = 0;
+        const VkResult first = result;
+        while (retry_on && (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) &&
+               g_state == 1 && waited_ms < 2000) {
+            usleep(back_ms * 1000);
+            waited_ms += back_ms;
+            if (back_ms < 64) back_ms *= 2;
+            tries++;
+            result = pvkQueueSubmit(g_queue, 1, &si, fence);
+        }
+        static unsigned oom_logs;
+        if (oom_logs++ < 32)
+            nvlog("vk: queue submit -> %d (out of memory); %u retries over %u ms -> %d", first, tries, waited_ms, result);
+    }
     pthread_mutex_unlock(&nvmtl_submit_mutex);
     pt[4] = nvmtl_perf_now();
     g_cmd_submitted++;
