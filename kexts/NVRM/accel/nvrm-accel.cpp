@@ -1523,10 +1523,47 @@ static IOReturn nmxFlipCall2(unsigned fn, struct NMXFlipRequest2 *r)
     r->v1.version = NMX_FLIP_ABI_VERSION2;
     return nmxFlipCall(fn, &r->v1);
 }
-static void nmxFlipTrip(const char *why)
+// 2026-11-18 20:34: one mediaanalysisd GPU fault (3 s gfx timeout) held WindowServer's fenced flip 2 s and turned flips
+// off for the rest of the boot (K6 CPU copy, WindowServer 22-50 % CPU) until main wrote the sysctl by hand. A trip for a
+// slow GPU job or a late latch is a circuit breaker, not a verdict: it re-arms by itself 10 s later once no flip is
+// stuck, at most kFlipAutoRearmMax times per boot (debug.nmxaccel_flip_auto_rearm counts them). Trips that say flips
+// cannot be right on this setup (CoreDisplay draws on screen, too few scan-out buffers, no way home, status calls
+// failing) stay off for the boot as before.
+enum : unsigned { kFlipAutoRearmMax = 16 };
+static const uint64_t kFlipAutoRearmNs = 10000000000ull;
+static bool gFlipTripTransient;
+static uint64_t gFlipTripT;
+static SInt64 gCntFlipAutoRearm;
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_auto_rearm, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipAutoRearm,
+            "flips turned on again by themselves after a transient trip (slow GPU job, late latch), max 16 per boot");
+static void nmxFlipTripEx(const char *why, bool transient)
 {
-    if (!gNmxFlipTripped) ALOG("iop: flip: OFF for this boot (%s) -- frames take the K6 copy; sysctl debug.nmxaccel_flip_tripped=0 re-arms", why);
+    if (!gNmxFlipTripped) {
+        gFlipTripTransient = transient && gCntFlipAutoRearm < kFlipAutoRearmMax;
+        gFlipTripT = mach_absolute_time();
+        if (gFlipTripTransient)
+            ALOG("iop: flip: OFF (%s) -- frames take the K6 copy; re-arms by itself in 10 s once nothing is stuck (%lld of %u)",
+                 why, (long long)gCntFlipAutoRearm + 1, (unsigned)kFlipAutoRearmMax);
+        else
+            ALOG("iop: flip: OFF for this boot (%s) -- frames take the K6 copy; sysctl debug.nmxaccel_flip_tripped=0 re-arms", why);
+    }
     gNmxFlipTripped = 1;
+}
+static void nmxFlipTrip(const char *why) { nmxFlipTripEx(why, false); }
+// gFl.lock held: a transient trip whose cause is over turns flips back on
+static void nmxFlipMaybeRearm()
+{
+    if (!gNmxFlipTripped || !gFlipTripTransient) return;
+    if (gFl.stuckHandle != NMX_FLIP_NONE || gFl.pend != NMX_FLIP_NONE || __atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) return;
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time() - gFlipTripT, &ns);
+    if (ns < kFlipAutoRearmNs) return;
+    gFlipTripTransient = false;
+    gFl.stuckTripped = false;
+    gFl.errRun = 0;
+    const SInt64 n = OSAddAtomic64(1, &gCntFlipAutoRearm) + 1;
+    ALOG("iop: flip: ON again after a transient trip (%lld of %u this boot)", (long long)n, (unsigned)kFlipAutoRearmMax);
+    gNmxFlipTripped = 0;
 }
 // HUBP0's programmed and in-use surface addresses (DCN 3.5, segment 2, HUBPREQ stride 0xdc), read only
 static void nmxHubp0(unsigned long long *addr, unsigned long long *inuse, bool *pending)
@@ -1705,7 +1742,7 @@ static void nmxFlipWatch(void *, void *)
             absolutetime_to_nanoseconds(mach_absolute_time() - gFl.stuckT0, &ns);
             if (ns > 2000000000ull && !gFl.stuckTripped) {
                 gFl.stuckTripped = true;    // N2: escalate; keep watching so front is right when it finally lands
-                nmxFlipTrip("a fenced flip has waited 2 s for its GPU job");
+                nmxFlipTripEx("a fenced flip has waited 2 s for its GPU job", true);
             }
             IOLockUnlock(gFl.lock);
             nmxFlipWatchArm(ns > 2000000000ull ? 100 : 4);
@@ -1817,7 +1854,7 @@ static void nmxFlipRetire()
                         gFl.frontS ? gFl.frontS->getSurfaceID() : 0u, addr, inuse, pending ? " pending" : "");
         } else {
             OSAddAtomic64(1, &gCntFlipTimeouts);
-            nmxFlipTrip("a flip did not latch within 50 ms");
+            nmxFlipTripEx("a flip did not latch within 50 ms", true);
         }
     } else if (res == kLatchWentHome) {
         nmxFlipResync("bridge went home while a flip was pending");
@@ -2042,6 +2079,7 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
     if (!gFl.inited && mode == 0) return false;            // never turned on: not one extra instruction on the K6 path
     if (!nmxFlipInit() || head != 0) return false;
     IOLockLock(gFl.lock);
+    nmxFlipMaybeRearm();
     bool want = (mode == 1 || mode == 2) && !gNmxFlipTripped;
     if (want && (gNmxFlipCaps < 0 || gFl.fb != fb)) {
         gFl.fb = fb;
@@ -2597,6 +2635,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_sync);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_api);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_tripped);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_flip_auto_rearm);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_submitted);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_latched);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_fallback);
