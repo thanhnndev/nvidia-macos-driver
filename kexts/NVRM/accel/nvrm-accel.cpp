@@ -1617,14 +1617,19 @@ static void nmxFlipPoll(void *, void *)
     if (seq != __atomic_load_n(&gFl.pendSeq, __ATOMIC_ACQUIRE) || !__atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) return;
     void *pipe = gFl.pipe;
     NmxFtRec *ft = gFl.pendFt;
-    if (res == kLatchOk && gFl.notifyOn && gNmxFlipNotify) {
+    // review of c1cf14d, item 3: learn from when the flip latched (the pageflip IRQ time), and only from flips the
+    // IRQ path reported; the time of our look would ratchet the net up to 20 ms whenever a notify is lost
+    if (res == kLatchOk && gFl.notifyOn && gNmxFlipNotify && gFl.latchNs > gFl.pendT0 &&
+        __atomic_load_n(&gFl.notifySeq, __ATOMIC_ACQUIRE) >= seq) {
+        uint64_t lat;                   // its own variable: ns stays the wait time for flip_wait_us
+        absolutetime_to_nanoseconds(gFl.latchNs - gFl.pendT0, &lat);
         // flip_rearm 1.21 of latched on out-34 (2026-11-18 20:18): a commit latches at the next vblank, 5.9 ms after
         // the submit on average and > 4 ms on 99 % of flips, so a fixed 4 ms net looked before the IRQ on nearly every
         // flip and re-armed 2 ms steps until the IRQ came. The net follows the latch delay instead: the largest recent
         // one + 2 ms (slow decay), 4..20 ms; a missed IRQ still completes within one net + 2 ms steps.
         uint64_t net = gFl.netNs ? gFl.netNs : 4000000ull;
         net -= net / 16;
-        if (ns + 2000000ull > net) net = ns + 2000000ull;
+        if (lat + 2000000ull > net) net = lat + 2000000ull;
         if (net < 4000000ull) net = 4000000ull;
         if (net > 20000000ull) net = 20000000ull;
         gFl.netNs = net;
@@ -1733,20 +1738,22 @@ static void nmxFlipWatch(void *, void *)
         nmxFlipWatchArm(4);
         return;
     }
+    IOSurface *held = nullptr;          // review 1: our own reference on rs while the lock was dropped
     if (!rk && rs) {
         // the GPU wait happens without gFl.lock (follow-up 5: the pipe thread must not stall behind it); redoHandle
         // stays set, so the import is kept, and any accepted submit meanwhile clears it
         // review 1: an accepted submit meanwhile clears redoS and may drop the last reference; hold our own
         ((OSObject *)rs)->retain();
+        held = rs;                      // released after the submit below uses rs (review of c1cf14d, item 5)
         IOLockUnlock(gFl.lock);
         const bool done = nmxFenceWait(rs);
         IOLockLock(gFl.lock);
-        ((OSObject *)rs)->release();    // gFl.redoS is only compared below, rs is not used past this point
         if (gFl.redoHandle != h || gFl.redoS != rs || !done || gFl.pend != NMX_FLIP_NONE ||
             __atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) {
             if (gFl.redoHandle == h && !done) { gFl.redoHandle = NMX_FLIP_NONE; gFl.redoS = nullptr; gFl.redoArmed = false; }
             const bool again = gFl.redoHandle == h;
             IOLockUnlock(gFl.lock);
+            ((OSObject *)held)->release();
             if (again) nmxFlipWatchArm(4);
             return;
         }
@@ -1760,11 +1767,13 @@ static void nmxFlipWatch(void *, void *)
     if (!done && noFence) {             // no kernel fence: wait the old way, outside the lock, next round
         gFl.redoHandle = h; gFl.redoS = rs; gFl.redoGpu = rg; gFl.redoKf = false; gFl.redoArmed = true;
         IOLockUnlock(gFl.lock);
+        if (held) ((OSObject *)held)->release();
         nmxFlipWatchArm(1);
         return;
     }
     if (done) OSAddAtomic64(1, &gCntFlipRedo);
     IOLockUnlock(gFl.lock);
+    if (held) ((OSObject *)held)->release();
 }
 static void nmxFlipRetire()
 {
