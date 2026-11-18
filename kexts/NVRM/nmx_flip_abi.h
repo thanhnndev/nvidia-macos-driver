@@ -25,6 +25,7 @@
  * Version 2 (out-31, FRAME-PATH rows 1 and 3) appends struct NMXFlipRequest2's fields; an NMXGPU that only knows
  * version 1 answers kIOReturnBadArgument to a version 2 call, and the caller drops back to version 1.
  *   nmxFlipCaps     v2 adds NMX_FLIP_CAP_FENCE / NMX_FLIP_CAP_NOTIFY when those paths are on in NMXGPU.
+ *   nmxFlipImport   v2 in: surfaceId (the IOSurface ID): NMXGPU records render fences only for imported surfaces.
  *   nmxFlipSubmit   v2 in: surfaceId and flags NMX_FLIP_SUBMIT_FENCE(_ONLY). The commit then waits for that IOSurface's
  *                   last GPU job in the kernel (drm_atomic_helper_wait_for_fences), out: fenced = 1. With FENCE_ONLY and
  *                   no job known for the surface, or the last one recorded before fenceAfterNs (an older frame's):
@@ -115,3 +116,10 @@ struct NMXFlipRequest2 {
     unsigned long long fenceAfterNs;    // in: submit, refuse a fence recorded before this mach time (0 = any)
     unsigned long long fenceSetNs;      // out: submit, when the attached fence was recorded
 };
+#ifdef __cplusplus
+static_assert(sizeof(struct NMXFlipRequest) == 240, "NMXFlipRequest v1 layout (NMXGPU nmx_flipreq)");
+static_assert(sizeof(struct NMXFlipRequest2) == 288, "NMXFlipRequest v2 layout (NMXGPU nmx_flipreq2)");
+#else
+_Static_assert(sizeof(struct NMXFlipRequest) == 240, "NMXFlipRequest v1 layout (NMXGPU nmx_flipreq)");
+_Static_assert(sizeof(struct NMXFlipRequest2) == 288, "NMXFlipRequest v2 layout (NMXGPU nmx_flipreq2)");
+#endif

@@ -155,6 +155,8 @@ class NMXAMDFB : public IOFramebuffer {
     volatile UInt32 fTimerIdle = 0;     // the timer did not re-arm itself (nothing to deliver)
     volatile int fRefHeld = 0;          // NMXGPU holds the DRM vblank reference for us
     unsigned fRefRetry = 0;
+    IOLock *fRefLock = nullptr;         // vblRefFire runs one at a time (a thread call can run on two threads at once)
+    volatile SInt32 fDelivering = 0;    // vblDeliver in progress (unregisterInterrupt waits it out)
     volatile bool fStopping = false;
     bool fPowerRegistered = false;
     bool fForeign = false;      // head 4 of NVAccel's display machine (the NV controller group)
@@ -304,15 +306,19 @@ private:
         return false;
     }
     void vblDeliver() {
+        OSIncrementAtomic(&fDelivering);
         if (!vblIrqMode()) {            // old path: the last registration, whatever its state
             Irq *l = fVblLast;
-            if (l && l->proc) l->proc(l->target, l->ref);
-            return;
+            IOFBInterruptProc pr = l ? __atomic_load_n(&l->proc, __ATOMIC_ACQUIRE) : nullptr;
+            if (pr) pr(l->target, l->ref);
+        } else {
+            for (int i = 0; i < kVblSlots; i++) {
+                Irq &q = fVblSlot[i];
+                IOFBInterruptProc pr = __atomic_load_n(&q.proc, __ATOMIC_ACQUIRE);   // read once
+                if (pr && q.on) pr(q.target, q.ref);
+            }
         }
-        for (int i = 0; i < kVblSlots; i++) {
-            Irq &q = fVblSlot[i];
-            if (q.proc && q.on) q.proc(q.target, q.ref);
-        }
+        OSDecrementAtomic(&fDelivering);
     }
     /* IH thread (dm_crtc_high_irq): no locks, no sleeping, only the hand-over */
     static void vblSink(void *p0, uint64_t now) {
@@ -335,11 +341,16 @@ private:
     /* thread call: take or drop the DRM vblank reference to match the registrations (drm_crtc_vblank_get may sleep) */
     static void vblRefFire(thread_call_param_t p0, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
-        if (me->fStopping) return;
-        const bool want = vblIrqMode() && me->vblWanted();
-        const int held = nmx_fb_vbl_ref(want ? 1 : 0);
-        if (held != me->fRefHeld) me->trace(held ? "vblank ref held" : "vblank ref dropped", (unsigned long long)want);
-        me->fRefHeld = held;
+        if (me->fStopping || !me->fRefLock) return;
+        IOLockLock(me->fRefLock);
+        bool want;
+        do {                            // until the registrations did not change under us
+            want = vblIrqMode() && me->vblWanted();
+            const int held = nmx_fb_vbl_ref(want ? 1 : 0);
+            if (held != me->fRefHeld) me->trace(held ? "vblank ref held" : "vblank ref dropped", (unsigned long long)want);
+            __atomic_store_n(&me->fRefHeld, held, __ATOMIC_RELEASE);
+        } while (!me->fStopping && want != (vblIrqMode() && me->vblWanted()));
+        IOLockUnlock(me->fRefLock);
         me->vblArmTimer();
     }
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
@@ -351,11 +362,16 @@ private:
         if (vblIrqMode()) {
             if (!me->vblWanted()) {
                 if (me->fRefHeld && me->fVblRef) thread_call_enter(me->fVblRef);
-                me->fTimerIdle = 1;     // vblRefFire re-arms when a registration turns on
+                __atomic_store_n(&me->fTimerIdle, 1, __ATOMIC_RELEASE);   // vblRefFire re-arms when one turns on
+                if (me->vblWanted()) me->vblArmTimer();   // ... unless that happened between the check and the store
                 return;
             }
             const uint64_t hw = __atomic_load_n(&me->fHwVblAt, __ATOMIC_ACQUIRE);
-            if (me->fRefHeld && hw && now - hw <= 2 * period) {
+            // stale = no CRTC vblank for 2 frames, but at least 50 ms: VRR may stretch a frame to the panel's minimum
+            uint64_t stale, floor50;
+            nanoseconds_to_absolutetime(50000000ull, &floor50);
+            stale = 2 * period > floor50 ? 2 * period : floor50;
+            if (me->fRefHeld && hw && now - hw <= stale) {
                 uint64_t watch;
                 nanoseconds_to_absolutetime(kVblWatchMs * 1000000ull, &watch);
                 me->fVblNext = now + watch;     // the CRTC delivers: only watch
@@ -450,6 +466,7 @@ public:
         setupWakeWork();
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
         if (fDisplay.edid_size) setProperty("NMXEDIDSource", "drm-connector");
+        fRefLock = IOLockAlloc();
         fVblHw = thread_call_allocate(vblHwFire, this);
         fVblRef = thread_call_allocate(vblRefFire, this);
         if (fVblHw && fVblRef) nmx_fb_vbl_set_sink(vblSink, this);
@@ -485,6 +502,7 @@ public:
             *tc = nullptr;
         }
         if (fRefHeld) { nmx_fb_vbl_ref(0); fRefHeld = 0; }
+        if (fRefLock) { IOLockFree(fRefLock); fRefLock = nullptr; }
         IOFramebuffer::stop(provider);
     }
 
@@ -646,6 +664,9 @@ public:
             q->on = false;
             __atomic_store_n(&q->proc, (IOFBInterruptProc)nullptr, __ATOMIC_RELEASE);
             if (fVblLast == q) fVblLast = nullptr;
+            // the caller may free target/refcon on return: wait out a delivery that read the old proc (IOFramebuffer's
+            // VBL handler is interrupt-safe and takes no gate, so this cannot wait on the caller)
+            for (int n = 0; __atomic_load_n(&fDelivering, __ATOMIC_ACQUIRE) && n < 1000; n++) IODelay(10);
             if (fVblRef) thread_call_enter(fVblRef);
         } else if (iref == &fConnect) {
             fConnect.proc = nullptr;

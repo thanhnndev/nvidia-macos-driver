@@ -58,7 +58,7 @@
 +		amdgpu_bo_list_for_each_userptr_entry(ne, p->bo_list) {
 +			uint32_t sid = amdgpu_ttm_tt_nmx_sid(ne->bo->tbo.ttm);
 +
-+			if (sid)
++			if (sid && !amdgpu_ttm_tt_is_readonly(ne->bo->tbo.ttm))	/* a read-only userptr is never written */
 +				nmx_surf_fence_set(sid, p->fence);
 +		}
 +	}
