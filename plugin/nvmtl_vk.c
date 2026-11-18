@@ -1516,7 +1516,7 @@ static void (*g_sl_use)(VkCommandBuffer, VkDeviceMemory);
 static void (*g_sl_exact)(VkCommandBuffer);
 static void (*g_sl_stats)(VkDevice, uint64_t *, uint32_t);
 static int (*g_sl_breakdown)(VkDevice, char *, size_t);
-static _Atomic unsigned long long g_sl_marked, g_sl_refused, g_sl_unmarked, g_sl_uses, g_sl_exacts;
+static _Atomic unsigned long long g_sl_marked, g_sl_refused, g_sl_unmarked, g_sl_uses, g_sl_exacts, g_sl_xfer;
 static int nvmtl_sl_on(void)
 {
     static int on = -1;
@@ -1542,9 +1542,9 @@ static void nvmtl_sl_census(void)
 {
     const unsigned long long m = atomic_load(&g_sl_marked);
     if (m && (m & 0x3FF) == 0)
-        nvlog("vk: surface list: %llu imports moved (%llu refused, %llu back to global for gpuResourceID), %llu command buffers exact, %llu surface uses listed",
+        nvlog("vk: surface list: %llu imports moved (%llu refused, %llu back to global for gpuResourceID), %llu command buffers exact, %llu surface uses listed, %llu transfer-only submits exact",
               m, (unsigned long long)atomic_load(&g_sl_refused), (unsigned long long)atomic_load(&g_sl_unmarked),
-              (unsigned long long)atomic_load(&g_sl_exacts), (unsigned long long)atomic_load(&g_sl_uses));
+              (unsigned long long)atomic_load(&g_sl_exacts), (unsigned long long)atomic_load(&g_sl_uses), (unsigned long long)atomic_load(&g_sl_xfer));
 }
 int nvmtl_vk_surface_list_mark(nvk_buffer *b)
 {
@@ -1752,6 +1752,36 @@ void nvmtl_vk_cmd_exact(nvk_cmdbuf *c)
     g_sl_exact((VkCommandBuffer)c->cb); atomic_fetch_add(&g_sl_exacts, 1);
 }
 static void nvmtl_vk_cb_exact_raw(VkCommandBuffer cb) { if (cb && nvmtl_sl_on() && g_sl_exact) g_sl_exact(cb); }
+/* FRAME-PATH row 13 (11.2): our own one-shot command buffers (surface upload, texture region upload/read, buffer and
+   image copies, fills, migrations) were never marked exact, so every one of them carried the whole surface list. In
+   WindowServer that is every uploaded video frame: each of its 170-520 IOSurface imports was listed, the kernel took it
+   as used (Step142 nmx_touch), and none ever stayed idle the 60 s it takes to park (2026-11-18: 439k pages wired, 0
+   parked). Marking them exact is complete, not a guess, because of what they record:
+   - only vkCmdPipelineBarrier, vkCmdCopyBuffer / CopyBufferToImage / CopyImageToBuffer / CopyImage and vkCmdFillBuffer
+     (each caller below; the nvmtl_vk_cmd_* helpers they use were read down to their pvkCmd* calls);
+   - RADV puts the BO of every source and destination of those commands on the command buffer's own list itself
+     (meta/radv_meta_copy.c: copy temp :73, buffer->image :347/:354/:423, image->buffer :561/:568/:613, image->image
+     :864/:865; meta/radv_meta_buffer.c: fill :246/:259, copy :344/:345); a barrier touches no memory.
+   So the surface list adds nothing such a submit needs. Anything that binds a pipeline, descriptors, a render pass or
+   blits (mipmap generation, timestamps, draws) is NOT marked here; those name their surfaces through
+   nvmtl_vk_cmd_use_memory or carry the list as before.
+   If a caller ever recorded more than transfers and an IOSurface it reads were missing from the list, the BO keeps its
+   VM mapping while it is wired (correct data); once Step142 has parked it its PTEs are invalid, so the GPU takes a
+   page fault naming the process (out-34 (d)) - loud, never a silent stale read.
+   NVMTL_SL_EXACT_XFER=0 restores the old behaviour (A/B). */
+static int nvmtl_sl_xfer_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SL_EXACT_XFER"); on = !(e && e[0] == '0');
+        nvlog("vk: surface list: transfer-only one-shot submits %s (NVMTL_SL_EXACT_XFER=%s)",
+              on ? "exact - they carry only the BOs they copy" : "carry the whole surface list", e ? e : "unset"); }
+    return on;
+}
+void nvmtl_vk_cmd_exact_xfer(nvk_cmdbuf *c)
+{
+    if (!c || !c->cb || !nvmtl_sl_on() || !g_sl_exact || !nvmtl_sl_xfer_on()) return;
+    g_sl_exact((VkCommandBuffer)c->cb); atomic_fetch_add(&g_sl_xfer, 1);
+}
 
 static pthread_key_t g_stage_key; static pthread_once_t g_stage_once = PTHREAD_ONCE_INIT;
 static void nvmtl_stage_free(void *p) { nvk_buffer *b = p; nvmtl_vk_buffer_destroy(b); free(b); }
@@ -5954,6 +5984,7 @@ int nvmtl_vk_fill_buffer(nvk_queue *q, nvk_buffer *b, size_t offset, size_t size
 {
     nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
     if (nvmtl_vk_cmd_fill_buffer(&c, b, offset, size, value)) { nvmtl_vk_cmd_abandon(&c); return -1; }
+    nvmtl_vk_cmd_exact_xfer(&c);
     return nvmtl_vk_submit_wait(&c);
 }
 static int nvmtl_counter_flush(nvk_cmdbuf *c);
@@ -6603,6 +6634,7 @@ int nvmtl_vk_mig_batch_end(void)
     t_mig_batch = NULL;
     if (!t_mig_n) { nvmtl_vk_cmd_abandon(c); return 0; }
     const unsigned n = t_mig_n; t_mig_n = 0;
+    nvmtl_vk_cmd_exact_xfer(c);   /* only the image migration's barriers and vkCmdCopyImage are batched here */
     const int r = nvmtl_vk_submit_wait(c);
     if (r) nvlog("residency (res2): evict-batch of %u copies FAILED to complete (%d) - those textures now read undefined contents", n, r);
     return r;
@@ -6659,7 +6691,7 @@ int nvmtl_vk_image_migrate(nvk_image *i, int to_sysmem, int a8, nvk_image *old_o
             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, was,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img, rr };
         pvkCmdPipelineBarrier(cp->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &a);
-        if (cp == &c0) { if (nvmtl_vk_submit_wait(&c0)) goto fail; }
+        if (cp == &c0) { nvmtl_vk_cmd_exact_xfer(&c0); if (nvmtl_vk_submit_wait(&c0)) goto fail; }
         else t_mig_n++;
     }
     *old_out = *i;
@@ -6702,6 +6734,7 @@ int nvmtl_vk_buffer_migrate(nvk_buffer *b, int to_sysmem)
       pvkCmdCopyBuffer(c.cb, (VkBuffer)b->buf, tmp, 1, &bc);
       VkMemoryBarrier post = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
       pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post, 0, NULL, 0, NULL);
+      nvmtl_vk_cmd_exact_xfer(&c);
       if (nvmtl_vk_submit_wait(&c)) { pvkDestroyBuffer(g_dev, tmp, NULL); pvkFreeMemory(g_dev, nm, NULL); return -1; } }
     pvkDestroyBuffer(g_dev, tmp, NULL);
     if (nvmtl_vk_sparse_bind((VkBuffer)b->buf, 1, nm, mr.size)) {
@@ -6827,6 +6860,7 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
     pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
     img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    nvmtl_vk_cmd_exact_xfer(c);
     const int rc = nvmtl_vk_submit_wait_at(c, "surface upload");
     if (sl->buf.size > NVMTL_UPSTAGE_KEEP) { nvmtl_vk_buffer_destroy(&sl->buf); memset(&sl->buf, 0, sizeof sl->buf); }
     return rc;
@@ -6837,6 +6871,7 @@ int nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffe
     const uint64_t t0 = nvmtl_perf_now();
     nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
     if (nvmtl_vk_cmd_copy_buffer(&c, src, srcOff, dst, dstOff, size)) { nvmtl_vk_cmd_abandon(&c); return -1; }
+    nvmtl_vk_cmd_exact_xfer(&c);
     const int k0 = g_perf_kind; g_perf_kind |= 2;
     const int r = nvmtl_vk_submit_wait(&c);
     g_perf_kind = k0;
@@ -6866,6 +6901,7 @@ int nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byte
     img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     VkBufferImageCopy bic = { 0, 0, 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
     pvkCmdCopyImageToBuffer(c.cb, img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stage.buf, 1, &bic);
+    nvmtl_vk_cmd_exact_xfer(&c);
     if (nvmtl_vk_submit_wait(&c)) return -1;
     const uint8_t *src = (const uint8_t *)stage.map;
     for (uint32_t y = 0; y < rows; y++) memcpy((uint8_t *)dst + y * row_bytes, src + (size_t)y * cols * bpp, (size_t)cols * bpp);
@@ -7012,6 +7048,7 @@ int nvmtl_vk_image_write_region_level_layer(nvk_queue *q, nvk_image *img, const 
     pvkCmdCopyBufferToImage(c->cb, (VkBuffer)stageb->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     img_to(c, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    nvmtl_vk_cmd_exact_xfer(c);   /* barriers + vkCmdCopyBufferToImage */
     if (au) {
         // submit without waiting; queue order + the SHADER_READ barrier above order the copy before any later
         // draw that samples this image, and the handle is finished before a readback, destroy or re-upload.
@@ -7043,6 +7080,7 @@ int nvmtl_vk_image_read_region_level_layer(nvk_queue *q, nvk_image *img, void *d
            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy bic = { 0, 0, 0, { nvmtl_copy_aspect(img), level, img->mtl_type == 7 ? 0u : layer, 1 }, { (int32_t)x, (int32_t)y, img->mtl_type == 7 ? (int32_t)layer : 0 }, { w, h, 1 } };
     pvkCmdCopyImageToBuffer(c.cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkBuffer)stage.buf, 1, &bic);
+    nvmtl_vk_cmd_exact_xfer(&c);
     if (nvmtl_vk_submit_wait(&c)) return -1;
     const uint8_t *src = (const uint8_t *)stage.map;
     for (uint32_t r = 0; r < rows; r++) memcpy((uint8_t *)dst + (size_t)r * row_bytes, src + (size_t)r * cols * bpp, (size_t)cols * bpp);
@@ -7054,6 +7092,7 @@ int nvmtl_vk_copy_image(nvk_queue *q, nvk_image *src, uint32_t sx, uint32_t sy,
 {
     nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
     if (nvmtl_vk_cmd_copy_image(&c, src, sx, sy, dst, dx, dy, w, h)) { nvmtl_vk_cmd_abandon(&c); return -1; }
+    nvmtl_vk_cmd_exact_xfer(&c);
     return nvmtl_vk_submit_wait(&c);
 }
 
@@ -7067,6 +7106,7 @@ int nvmtl_vk_copy_buffer_to_image_layer(nvk_queue *q, nvk_buffer *b, size_t off,
 {
     nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
     if (nvmtl_vk_cmd_copy_buffer_to_image_layer(&c, b, off, row_bytes, img, x, y, w, h, layer)) { nvmtl_vk_cmd_abandon(&c); return -1; }
+    nvmtl_vk_cmd_exact_xfer(&c);
     return nvmtl_vk_submit_wait(&c);
 }
 
@@ -7080,6 +7120,7 @@ int nvmtl_vk_copy_image_to_buffer_layer(nvk_queue *q, nvk_image *img, uint32_t x
 {
     nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
     if (nvmtl_vk_cmd_copy_image_to_buffer_layer(&c, img, x, y, w, h, b, off, row_bytes, layer)) { nvmtl_vk_cmd_abandon(&c); return -1; }
+    nvmtl_vk_cmd_exact_xfer(&c);
     return nvmtl_vk_submit_wait(&c);
 }
 

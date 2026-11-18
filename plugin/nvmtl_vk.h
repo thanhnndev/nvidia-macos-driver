@@ -295,6 +295,7 @@ int nvmtl_vk_surface_list_mark(nvk_buffer *b);
 void nvmtl_vk_surface_list_unmark(nvk_buffer *b);
 void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b);
 void nvmtl_vk_cmd_exact(nvk_cmdbuf *c);
+void nvmtl_vk_cmd_exact_xfer(nvk_cmdbuf *c);   /* a one-shot command buffer of barriers + copies/fills only (row 13) */
 int nvmtl_vk_buffer_list_mark(nvk_buffer *b);
 int nvmtl_vk_integrated(void);
 int nvmtl_bl_audit_on(void);

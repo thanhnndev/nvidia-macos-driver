@@ -666,6 +666,7 @@ static void nvmtl_zero_flush(void) {
     } else if (todo.count && nvmtl_vk_cmd_begin(nvmtl_device_queue(), &c) == 0) {
         for (NVMTLBuffer *b in todo) { const size_t w = b->_b.size & ~(size_t)3;
             if (b->_b.buf && w && nvmtl_vk_cmd_fill_buffer(&c, &b->_b, 0, w, 0) == 0) { n++; bytes += w; gZeroTail += b->_b.size - w; } }
+        nvmtl_vk_cmd_exact_xfer(&c);   /* vkCmdFillBuffer + barriers only */
         if (nvmtl_vk_submit_wait(&c)) nvlog("zero-fill: GPU clear of %u Private buffers (%zu bytes) FAILED - they hold what VRAM held", n, bytes);
         else { const unsigned long long k = atomic_fetch_add(&gZeroGpuN, n); gZeroGpuB += bytes;
                if (!k || (k >> 12) != ((k + n) >> 12)) nvmtl_zero_census(); }
