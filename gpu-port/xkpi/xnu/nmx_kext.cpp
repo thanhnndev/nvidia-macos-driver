@@ -270,6 +270,10 @@ NMX_CNT(nmx_upin_destroy_rec, gNmxUpinDestroyRec,
         "Step142: userptr BOs destroyed still holding their pages (never populated: they leaked before Step142)");
 NMX_CNT(nmx_park_skip_busy, gNmxParkSkipBusy, "Step142: idle-park candidates skipped (locked, busy, pinned or shared)");
 NMX_CNT(nmx_park_fail, gNmxParkFail, "Step142: idle parks whose move to system memory failed");
+extern "C" volatile SInt64 gNmxParkSkipVm, gNmxParkAbort, gNmxParkPtUpdate;
+NMX_CNT(nmx_park_skip_vm, gNmxParkSkipVm, "11.9: idle-park candidates skipped (mapped in no VM or in more than one)");
+NMX_CNT(nmx_park_abort, gNmxParkAbort, "11.9: parks dropped between move and unwire (a CS took the BO back)");
+NMX_CNT(nmx_park_pt_update, gNmxParkPtUpdate, "11.9: parks that cleared the mapping's PTEs before unwiring");
 extern "C" int nmx_userptr_park_ms;
 SYSCTL_INT(_debug, OID_AUTO, nmx_userptr_park_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_userptr_park_ms, 0,
            "Step142: unwire an IOSurface userptr BO's memory after this many ms without GPU use; 0 = never");
@@ -392,6 +396,9 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_upin_destroy_rec);
     sysctl_register_oid(&sysctl__debug_nmx_park_skip_busy);
     sysctl_register_oid(&sysctl__debug_nmx_park_fail);
+    sysctl_register_oid(&sysctl__debug_nmx_park_skip_vm);
+    sysctl_register_oid(&sysctl__debug_nmx_park_abort);
+    sysctl_register_oid(&sysctl__debug_nmx_park_pt_update);
     sysctl_register_oid(&sysctl__debug_nmx_userptr_park_ms);
     sysctl_register_oid(&sysctl__debug_nmx_ft);
     {

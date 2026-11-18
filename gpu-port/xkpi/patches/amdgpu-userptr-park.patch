@@ -15,7 +15,7 @@
  int amdgpu_ttm_tt_set_userptr(struct ttm_buffer_object *bo,
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-@@ -686,9 +686,185 @@
+@@ -686,9 +686,259 @@
  	uint32_t		userflags;
  	bool			bound;
  	int32_t			pool_id;
@@ -25,6 +25,9 @@
 +	bool			nmx_parking;	/* this unpopulate parks the pin (idle sweep) */
 +	bool			nmx_norec;	/* page records dropped; populate restores them */
 +	struct list_head	nmx_link;	/* on nmx_park_list while nmx_pin is set */
++	int			nmx_pstage;	/* 11.9: 0 idle, 1 moved (fvm), 2 PTEs cleared (fpt); BO resv held */
++	struct dma_fence	*nmx_fvm;	/* stage 1: the VM's jobs in flight when the BO moved to SYSTEM */
++	struct dma_fence	*nmx_fpt;	/* stage 2: the page-table update that wrote its PTEs V = 0 */
 +#endif
  };
  
@@ -56,6 +59,7 @@
 +void nmx_upin_destroy(void *pin);
 +extern int nmx_userptr_park_ms;
 +extern volatile long long gNmxUpinDestroyRec, gNmxParkSkipBusy, gNmxParkFail;
++extern volatile long long gNmxParkSkipVm, gNmxParkAbort, gNmxParkPtUpdate;	/* 11.9, see nmx_park_one */
 +
 +static LIST_HEAD(nmx_park_list);
 +static spinlock_t nmx_park_lock;
@@ -128,38 +132,108 @@
 +		ttm_to_amdgpu_ttm_tt(ttm)->nmx_used = jiffies;
 +}
 +
++static void nmx_park_reset(struct amdgpu_ttm_tt *gtt)
++{
++	dma_fence_put(gtt->nmx_fvm);
++	dma_fence_put(gtt->nmx_fpt);
++	gtt->nmx_fvm = NULL;
++	gtt->nmx_fpt = NULL;
++	gtt->nmx_pstage = 0;
++}
++
++/*
++ * FRAME-PATH 11.9: the pages go only when no job can reach them, listed or not. Linux waits for the BO's own fences
++ * (amdgpu_hmm_invalidate_gfx), which covers every job that listed it; a job that used the BO without listing it would
++ * still write through the old PTEs into pages already unwired. The park is three sweeps, none of which waits:
++ *   0 -> 1  move: idle by its reservation and unused for park_ms: validate to SYSTEM (GART unbound, bo_va invalidated,
++ *           pages still wired) and snapshot the owning VM root's fences: every job of that VM in flight now
++ *   1 -> 2  clear: that snapshot signaled: write the mapping's PTEs V = 0 with a TLB flush (amdgpu_vm_bo_update, clear,
++ *           as handle_moved does for a BO it cannot lock), under a trylock of the root reservation
++ *   2 -> 0  unwire: that page-table update signaled: unpopulate and park, as before
++ * A CS that lists the BO meanwhile touches it (nmx_used) or validates it back out of SYSTEM: the park is dropped,
++ * nothing was unwired, nothing to restore. Only BOs mapped in exactly one VM (an import) are parked.
++ */
 +static void nmx_park_one(struct ttm_buffer_object *bo)
 +{
 +	struct ttm_operation_ctx ctx = { .interruptible = false, .no_wait_gpu = true };
 +	struct amdgpu_bo *abo = ttm_to_amdgpu_bo(bo);
++	struct amdgpu_vm_bo_base *base;
 +	struct amdgpu_ttm_tt *gtt;
-+	int ms = READ_ONCE(nmx_userptr_park_ms);
++	struct dma_resv *rresv;
++	struct amdgpu_vm *vm;
++	struct dma_fence *f;
++	int ms = READ_ONCE(nmx_userptr_park_ms), r;
 +
 +	if (!dma_resv_trylock(bo->base.resv)) {
 +		__atomic_add_fetch(&gNmxParkSkipBusy, 1, __ATOMIC_RELAXED);
 +		return;
 +	}
-+	if (ms <= 0 || !bo->ttm || !bo->resource)
++	if (!bo->ttm || !bo->resource)
 +		goto out;
 +	gtt = ttm_to_amdgpu_ttm_tt(bo->ttm);
-+	if (!gtt->nmx_pin || gtt->nmx_norec || !nmx_upin_parkable(gtt->nmx_pin) ||
++	if (ms <= 0 || !gtt->nmx_pin || gtt->nmx_norec || !nmx_upin_parkable(gtt->nmx_pin) ||
 +	    !ttm_tt_is_populated(bo->ttm) || time_before(jiffies, gtt->nmx_used + msecs_to_jiffies(ms)))
-+		goto out;
++		goto drop;
 +	if (bo->pin_count || bo->base.dma_buf || bo->base.import_attach ||
 +	    !dma_resv_test_signaled(bo->base.resv, DMA_RESV_USAGE_BOOKKEEP)) {
 +		__atomic_add_fetch(&gNmxParkSkipBusy, 1, __ATOMIC_RELAXED);
-+		goto out;
++		goto drop;
 +	}
-+	if (bo->resource->mem_type != TTM_PL_SYSTEM) {
-+		amdgpu_bo_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_CPU);
-+		if (ttm_bo_validate(bo, &abo->placement, &ctx)) {
++	base = abo->vm_bo;
++	if (!base || base->next || !base->vm || !base->vm->root.bo) {
++		__atomic_add_fetch(&gNmxParkSkipVm, 1, __ATOMIC_RELAXED);
++		goto drop;
++	}
++	vm = base->vm;
++	rresv = vm->root.bo->tbo.base.resv;
++	if (gtt->nmx_pstage && bo->resource->mem_type != TTM_PL_SYSTEM) {
++		__atomic_add_fetch(&gNmxParkAbort, 1, __ATOMIC_RELAXED);	/* a CS took it back */
++		goto drop;
++	}
++	switch (gtt->nmx_pstage) {
++	case 0:
++		if (bo->resource->mem_type != TTM_PL_SYSTEM) {
++			amdgpu_bo_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_CPU);
++			if (ttm_bo_validate(bo, &abo->placement, &ctx)) {
++				__atomic_add_fetch(&gNmxParkFail, 1, __ATOMIC_RELAXED);
++				goto out;
++			}
++		}
++		f = NULL;
++		if (dma_resv_get_singleton(rresv, DMA_RESV_USAGE_BOOKKEEP, &f))	/* unlocked (RCU) snapshot */
++			goto out;					/* no memory: the BO stays wired in SYSTEM, next sweep */
++		gtt->nmx_fvm = f;
++		gtt->nmx_pstage = 1;
++		goto out;
++	case 1:
++		if (gtt->nmx_fvm && !dma_fence_is_signaled(gtt->nmx_fvm))
++			goto out;
++		if (!dma_resv_trylock(rresv))			/* the CS order is root then BOs: never wait here */
++			goto out;
++		r = amdgpu_vm_bo_update(amdgpu_ttm_adev(bo->bdev), container_of(base, struct amdgpu_bo_va, base), true);
++		f = r ? NULL : dma_fence_get(vm->last_update);	/* clear = true updates go to vm->last_update */
++		dma_resv_unlock(rresv);
++		if (r) {
 +			__atomic_add_fetch(&gNmxParkFail, 1, __ATOMIC_RELAXED);
 +			goto out;
 +		}
++		__atomic_add_fetch(&gNmxParkPtUpdate, 1, __ATOMIC_RELAXED);
++		gtt->nmx_fpt = f;
++		gtt->nmx_pstage = 2;
++		goto out;
++	default:
++		if (gtt->nmx_fpt && !dma_fence_is_signaled(gtt->nmx_fpt))
++			goto out;
++		break;
 +	}
++	nmx_park_reset(gtt);
 +	gtt->nmx_parking = true;
 +	ttm_tt_unpopulate(bo->bdev, bo->ttm);
 +	gtt->nmx_parking = false;
++	goto out;
++drop:
++	if (gtt->nmx_pstage)
++		nmx_park_reset(gtt);
 +out:
 +	dma_resv_unlock(bo->base.resv);
 +}
@@ -201,7 +275,7 @@
  
  #ifdef CONFIG_DRM_AMDGPU_USERPTR
  /*
-@@ -1087,7 +1263,21 @@
+@@ -1087,7 +1337,24 @@
  				       struct ttm_tt *ttm)
  {
  	struct amdgpu_ttm_tt *gtt = ttm_to_amdgpu_ttm_tt(ttm);
@@ -219,11 +293,14 @@
 +			}
 +		amdgpu_ttm_tt_nmx_unpin(ttm);
 +	}
++	dma_fence_put(gtt->nmx_fvm);	/* 11.9: a park in progress when the BO went away */
++	dma_fence_put(gtt->nmx_fpt);
++	gtt->nmx_fvm = gtt->nmx_fpt = NULL;
 +#endif
  	if (gtt->usertask)
  		put_task_struct(gtt->usertask);
  
-@@ -1163,6 +1353,18 @@
+@@ -1163,6 +1430,18 @@
  
  	/* user pages are bound by amdgpu_ttm_tt_pin_userptr() */
  	if (gtt->userptr) {
@@ -242,7 +319,7 @@
  		ttm->sg = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
  		if (!ttm->sg)
  			return -ENOMEM;
-@@ -1209,7 +1411,13 @@
+@@ -1209,7 +1488,13 @@
  	if (gtt->userptr) {
  #ifdef NMXKPI
  		/* ga403wm Step92: the pages were pinned when the BO was made; put them */
@@ -257,7 +334,7 @@
  			pgoff_t k;
  
  			for (k = 0; k < ttm->num_pages; k++)
-@@ -2077,6 +2285,10 @@
+@@ -2077,6 +2362,10 @@
  	if (!adev->mman.initialized)
  		return;
  
