@@ -38,3 +38,4 @@ amdgpu-userptr-park.patch
 amdgpu-dm-frametrace.patch
 amdgpu-nmx-surface-fence.patch
 amdgpu-dm-nmx-flipdone.patch
+amdgpu-vm-task-tgid.patch
