@@ -441,6 +441,10 @@ _Static_assert(sizeof(struct nmx_flipreq2) == 288, "NMXFlipRequest v2 layout (nm
 /* switches (debug.nmx_flip_kfence / nmx_flip_irq / nmx_vbl_irq; boot-args nmxkfence=0 / nmxflipirq=0 / nmxvblirq=0) */
 int nmx_flip_kfence = 1, nmx_flip_irq = 1, nmx_vbl_irq = 1;
 uint64_t gNmxFlipFenced, gNmxFlipNoFence, gNmxSurfFenceSet, gNmxFlipNotified, gNmxVblDelivered;
+/* out-33 (B): CRTC vblanks handed to NMXAMDFB's sink (the IRQ is also on while DM's own flip references hold it), and
+ * whether NMXAMDFB has an enabled 'vbl ' registration; gNmxVblDelivered counts only deliveries to IOFramebuffer */
+uint64_t gNmxVblSink;
+int nmx_vbl_wanted;
 
 struct nmx_flip_import {
     struct drm_framebuffer *fb;
@@ -1555,7 +1559,7 @@ static void vbl_deliver(void)
     fn = __atomic_load_n(&vbl.fn, __ATOMIC_ACQUIRE);
     if (fn) {
         fn(vbl.arg, mach_absolute_time());
-        __atomic_add_fetch(&gNmxVblDelivered, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&gNmxVblSink, 1, __ATOMIC_RELAXED);
     }
     __atomic_sub_fetch(&vbl.busy, 1, __ATOMIC_RELEASE);
 }
@@ -1608,9 +1612,10 @@ static int out31_format(char *buf, size_t size)
     else
         O_P("psr none active_vblank_irq_count %u\n", p[4]);
     O_P("out31 kfence %d flip_irq %d vbl_irq %d fenced %llu nofence %llu surf_set %llu notified %llu vbl_delivered %llu "
-        "vbl_held %d\n", nmx_flip_kfence, nmx_flip_irq, nmx_vbl_irq, (unsigned long long)gNmxFlipFenced,
-        (unsigned long long)gNmxFlipNoFence, (unsigned long long)gNmxSurfFenceSet, (unsigned long long)gNmxFlipNotified,
-        (unsigned long long)gNmxVblDelivered, vbl.held);
+        "vbl_held %d vbl_wanted %d vbl_sink %llu\n", nmx_flip_kfence, nmx_flip_irq, nmx_vbl_irq,
+        (unsigned long long)gNmxFlipFenced, (unsigned long long)gNmxFlipNoFence, (unsigned long long)gNmxSurfFenceSet,
+        (unsigned long long)gNmxFlipNotified, (unsigned long long)gNmxVblDelivered, vbl.held,
+        __atomic_load_n(&nmx_vbl_wanted, __ATOMIC_RELAXED), (unsigned long long)gNmxVblSink);
 #undef O_P
     return (int)(o < size ? o : size);
 }

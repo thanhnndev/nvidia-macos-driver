@@ -27,6 +27,8 @@ extern "C" void nmx_ft_vbl_timer(uint64_t frame_ns);
 /* out-31 row 2 (nmx_fb_bridge.c): CRTC vblank sink and the DRM vblank reference; debug.nmx_vbl_irq / nmxvblirq=0 */
 extern "C" void nmx_fb_vbl_set_sink(void (*fn)(void *, uint64_t), void *arg);
 extern "C" int nmx_fb_vbl_ref(int on);
+extern "C" volatile SInt64 gNmxVblDelivered;     // out-33 (B): VBLs delivered to IOFramebuffer from the CRTC vblank
+extern "C" int nmx_vbl_wanted;                   // out-33 (B): an enabled 'vbl ' registration exists (trace)
 extern "C" int nmx_vbl_irq;
 #include "../../../kexts/NVRM/nvrm_vram_abi.h"
 
@@ -328,7 +330,10 @@ private:
     }
     static void vblHwFire(thread_call_param_t p0, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
-        if (!me->fStopping && vblIrqMode() && me->fRefHeld) me->vblDeliver();
+        if (!me->fStopping && vblIrqMode() && me->fRefHeld) {
+            me->vblDeliver();
+            OSAddAtomic64(1, &gNmxVblDelivered);
+        }
     }
     void vblArmTimer() {
         if (fVblTimer && OSCompareAndSwap(1, 0, &fTimerIdle)) {
@@ -346,6 +351,7 @@ private:
         bool want;
         do {                            // until the registrations did not change under us
             want = vblIrqMode() && me->vblWanted();
+            __atomic_store_n(&nmx_vbl_wanted, me->vblWanted() ? 1 : 0, __ATOMIC_RELAXED);
             const int held = nmx_fb_vbl_ref(want ? 1 : 0);
             if (held != me->fRefHeld) me->trace(held ? "vblank ref held" : "vblank ref dropped", (unsigned long long)want);
             __atomic_store_n(&me->fRefHeld, held, __ATOMIC_RELEASE);

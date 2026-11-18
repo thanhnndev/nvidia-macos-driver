@@ -290,7 +290,7 @@ NMX_CNT(nmx_flip_fenced, gNmxFlipFenced, "out-31: flips committed with a kernel 
 NMX_CNT(nmx_flip_nofence, gNmxFlipNoFence, "out-31: fence-only flips refused because no fence was known for the surface");
 NMX_CNT(nmx_surf_fence_set, gNmxSurfFenceSet, "out-31: CS jobs recorded as an IOSurface's last fence");
 NMX_CNT(nmx_flip_notified, gNmxFlipNotified, "out-31: pageflip IRQ notifications sent to NMXAccel");
-NMX_CNT(nmx_vbl_delivered, gNmxVblDelivered, "out-31: CRTC vblanks handed to the framebuffer's VBL sink");
+NMX_CNT(nmx_vbl_delivered, gNmxVblDelivered, "out-31: IOFramebuffer VBLs delivered from the CRTC vblank (only while a 'vbl ' registration is on)");
 extern "C" int nmx_gtt_format(char *buf, size_t size);
 static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
 {
