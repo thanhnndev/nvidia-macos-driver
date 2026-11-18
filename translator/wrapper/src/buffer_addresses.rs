@@ -98,11 +98,38 @@ fn keep_stated_align(scalar: u32, stated: Option<&Operand>) -> u32 {
     match stated { Some(Operand::LiteralBit32(a)) if a.is_power_of_two() && *a <= 16 => scalar.max(*a), _ => scalar }
 }
 
-pub fn lower(bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub fn lower(bytes: &[u8]) -> Result<Vec<u8>, String> { lower_opts(bytes, true) }
+/// `keep_runtime_arrays` false lowers every buffer, also the data-indexed runtime-array buffers that normally keep
+/// their bounds-checked descriptor (see kept_roots). The plugin builds that variant only for a dispatch that binds
+/// such a buffer at an offset no storage-buffer descriptor can take (Metal allows any multiple of the element size,
+/// e.g. ANGLE's index re-pack reads a ushort buffer at byte 438; Vulkan needs minStorageBufferOffsetAlignment).
+pub fn lower_opts(bytes: &[u8], keep_runtime_arrays: bool) -> Result<Vec<u8>, String> {
     match crate::linearize::apply(bytes) {
-        Ok((lin, _why)) => lower_addresses(&lin),
-        Err(_) => lower_addresses(bytes),
+        Ok((lin, _why)) => lower_addresses(&lin, keep_runtime_arrays),
+        Err(_) => lower_addresses(bytes, keep_runtime_arrays),
     }
+}
+/// Bindings (bit b = buffer argument b, set 0) that lower() leaves on their descriptors.
+pub fn kept_mask(bytes: &[u8]) -> Result<u32, String> {
+    let lin = match crate::linearize::apply(bytes) { Ok((lin, _)) => lin, Err(_) => bytes.to_vec() };
+    let m = rspirv::dr::load_bytes(&lin).map_err(|e| e.to_string())?;
+    let defs: HashMap<_,_> = m.types_global_values.iter().filter_map(|i| i.result_id.map(|n|(n,i.clone()))).collect();
+    let sb_types: HashMap<u32,u32> = defs.iter().filter_map(|(&n,i)| {
+        (i.class.opcode == Op::TypePointer && i.operands.first() == Some(&Operand::StorageClass(StorageClass::StorageBuffer)))
+            .then(|| (n, id(&i.operands[1]).unwrap()))
+    }).collect();
+    let mut bindings = HashMap::new();
+    for a in &m.annotations {
+        if let [Operand::IdRef(n), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(v)] = a.operands.as_slice() { bindings.insert(*n, *v); }
+    }
+    let roots: Vec<(u32,u32,u32)> = m.types_global_values.iter().filter_map(|i| {
+        (i.class.opcode == Op::Variable && i.operands.first() == Some(&Operand::StorageClass(StorageClass::StorageBuffer)))
+            .then(|| (i.result_id.unwrap(),i.result_type.unwrap(),*bindings.get(&i.result_id.unwrap()).unwrap_or(&u32::MAX)))
+    }).filter(|r| r.2 != TABLE_BINDING).collect();
+    let mut value_types = HashMap::new();
+    for i in m.all_inst_iter() { if let (Some(n),Some(t)) = (i.result_id,i.result_type) { value_types.insert(n,t); } }
+    let (kept, _) = kept_roots(&m, &defs, &sb_types, &roots, &value_types);
+    Ok(roots.iter().filter(|r| kept.contains(&r.0) && r.2 < 32).fold(0u32, |a, r| a | (1u32 << r.2)))
 }
 /// A table the translator declared at TABLE_BINDING that buffer addresses can be read from: a StorageBuffer variable
 /// in set 0 whose block holds one array of 8-byte entries, ulong or uvec2. Returns (block, entry type, entry is uvec2).
@@ -132,7 +159,7 @@ fn existing_table(defs: &HashMap<u32, Instruction>, m: &rspirv::dr::Module, tv: 
     }
 }
 
-fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn lower_addresses(bytes: &[u8], keep_runtime_arrays: bool) -> Result<Vec<u8>, String> {
     let mut m = rspirv::dr::load_bytes(bytes).map_err(|e| e.to_string())?;
     let defs: HashMap<_,_> = m.types_global_values.iter().filter_map(|i| i.result_id.map(|n|(n,i.clone()))).collect();
     let sb_types: HashMap<u32,u32> = defs.iter().filter_map(|(&n,i)| {
@@ -165,7 +192,7 @@ fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
     // bounds-checks with robustBufferAccess; fixed-size blocks still move to addresses.
     let mut value_types = HashMap::new();
     for i in m.all_inst_iter() { if let (Some(n),Some(t)) = (i.result_id,i.result_type) { value_types.insert(n,t); } }
-    let (kept, kept_derived) = kept_roots(&m, &defs, &sb_types, &roots, &value_types);
+    let (kept, kept_derived) = if keep_runtime_arrays { kept_roots(&m, &defs, &sb_types, &roots, &value_types) } else { (HashSet::new(), HashSet::new()) };
     let roots: Vec<(u32,u32,u32)> = roots.into_iter().filter(|r| !kept.contains(&r.0)).collect();
     if roots.is_empty() { return Ok(bytes.to_vec()); }
     for &(n,_,b) in &roots {
@@ -432,6 +459,21 @@ OpFunctionEnd
         for (k,(n,eg)) in &broke_why { println!("    {n:5}  {k}   e.g. {eg}"); }
         assert!(lowered>100,"the corpus arm lowered only {lowered} shaders — it measured nothing");
         assert_eq!(broke,0,"{broke} shaders were valid before lowering and INVALID after");
+    }
+    /// buf[buf[0]]: the index is data, so the buffer keeps its bounds-checked descriptor, unless the plugin asks for
+    /// LOWER_ALL because Metal bound it at an offset no descriptor can take (ANGLE's fixIndexBuffer at byte 438).
+    #[test] fn a_data_indexed_runtime_array_is_kept_unless_everything_is_lowered() {
+        let input=source(&FIXTURE.replace("%p = OpAccessChain %pu %buf %zero %one",
+            "%q = OpAccessChain %pu %buf %zero %zero\n%i = OpLoad %uint %q\n%p = OpAccessChain %pu %buf %zero %i"));
+        validate(&input);
+        assert_eq!(kept_mask(&input).unwrap(), 1);
+        let kept=lower(&input).unwrap(); validate(&kept);
+        assert!(!rspirv::dr::load_bytes(&kept).unwrap().all_inst_iter().any(|i|i.class.opcode==Op::ConvertUToPtr));
+        let all=lower_opts(&input,false).unwrap(); validate(&all);
+        let m=rspirv::dr::load_bytes(&all).unwrap();
+        assert!(m.all_inst_iter().any(|i|i.class.opcode==Op::ConvertUToPtr));
+        assert!(m.annotations.iter().any(|i|i.operands.ends_with(&[Operand::Decoration(Decoration::Binding),Operand::LiteralBit32(640)])));
+        assert_eq!(kept_mask(&source(FIXTURE)).unwrap(), 0);
     }
     #[test] fn rejects_unknown_descriptor_abi() {
         assert!(lower(&source(&FIXTURE.replace("Binding 0","Binding 32"))).unwrap_err().contains("unsupported source buffer"));

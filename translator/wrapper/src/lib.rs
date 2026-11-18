@@ -703,13 +703,22 @@ pub unsafe extern "C" fn nvmtl_table_to_uniform(
         Err(e) => { if !err.is_null() && err_len>0 { let n=e.len().min(err_len-1); std::ptr::copy_nonoverlapping(e.as_ptr(),err.cast(),n); *err.add(n)=0; } -1 }
     }
 }
+/// Flag for nvmtl_lower_buffer_addresses_ex / _g2: lower every buffer, also the runtime-array buffers that otherwise
+/// keep their descriptors (buffer_addresses::lower_opts). Bits 1, 2 and 4 are the align guard, Uniform table and G2.
+pub const LOWER_ALL: u32 = 16;
+/// The bindings (bit b = buffer b) that address lowering keeps on descriptors in this module. 0 = ok, -1 = error.
+#[no_mangle]
+pub unsafe extern "C" fn nvmtl_kept_descriptor_mask(data: *const u8, len: usize, mask: *mut u32) -> i32 {
+    if data.is_null() || mask.is_null() { return -1; }
+    match buffer_addresses::kept_mask(std::slice::from_raw_parts(data, len)) { Ok(m) => { *mask = m; 0 }, Err(_) => -1 }
+}
 #[no_mangle]
 pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_ex(
     data: *const u8, len: usize, flags: u32, out: *mut *mut u8, out_len: *mut usize, info: *mut u32,
     err: *mut c_char, err_len: usize,
 ) -> i32 {
     if data.is_null() || out.is_null() || out_len.is_null() { return -1; }
-    let r = buffer_addresses::lower(std::slice::from_raw_parts(data,len))
+    let r = buffer_addresses::lower_opts(std::slice::from_raw_parts(data,len), flags & LOWER_ALL == 0)
         .and_then(|v| if flags & 2 != 0 { table_ubo::convert(&v) } else { Ok(v) })
         .and_then(|v| align_guard::guard(&v, flags & 1 != 0));
     match r {
@@ -727,7 +736,7 @@ pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_g2(
 ) -> i32 {
     if data.is_null() || out.is_null() || out_len.is_null() { return -1; }
     let mut eligible = 0u32;
-    let r = buffer_addresses::lower(std::slice::from_raw_parts(data,len))
+    let r = buffer_addresses::lower_opts(std::slice::from_raw_parts(data,len), flags & LOWER_ALL == 0)
         .and_then(|v| if flags & 2 != 0 { table_ubo::convert(&v) } else { Ok(v) })
         .and_then(|v| g2_inline::apply(&v, if flags & 4 != 0 { mask } else { 0 }).map(|(v, e)| { eligible = e; v }))
         .and_then(|v| align_guard::guard(&v, flags & 1 != 0));
