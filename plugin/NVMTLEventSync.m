@@ -120,13 +120,15 @@ static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
         if (!t->_surf || [seen containsObject:(__bridge id)t->_surf]) continue;
         [seen addObject:(__bridge id)t->_surf];
         const unsigned long long n = atomic_fetch_add(&gNmxFenceSeq, 1) + 1;
-        IOSurfaceSetValue(t->_surf, CFSTR("NMXFencePending"), (__bridge CFTypeRef)@(n));
+        // frame-path trace (FRAME-PATH.md section 7): the commit time rides in the same IOSurface call (one IPC)
+        IOSurfaceSetValues(t->_surf, (__bridge CFDictionaryRef)@{ @"NMXFencePending": @(n),
+                                                                  @"NMXFencePendingT": @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) });
         if (!cb->_nmxFence) cb->_nmxFence = [NSMutableArray new];
         [cb->_nmxFence addObject:@[(__bridge id)t->_surf, @(n)]];
     }
     cb->_nmxFenced = cb->_nmxFence.count != 0;
 }
-static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb) {
+static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb, double gpuEndSeconds) {
     NSArray *marks = cb->_nmxFence; cb->_nmxFence = nil;
     if (!marks.count) return;
     @synchronized ([NVMTLCommandBuffer class]) {
@@ -136,7 +138,10 @@ static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb) {
             NSNumber *was = [nvmtl_nmx_fence_done objectForKey:surf];
             if (was && was.unsignedLongLongValue >= n.unsignedLongLongValue) continue;
             [nvmtl_nmx_fence_done setObject:n forKey:surf];
-            IOSurfaceSetValue((__bridge IOSurfaceRef)surf, CFSTR("NMXFenceDone"), (__bridge CFTypeRef)n);
+            // frame-path trace: when this thread saw the fence, and the GPU's own end time (CLOCK_UPTIME_RAW ns, 0 = none)
+            IOSurfaceSetValues((__bridge IOSurfaceRef)surf, (__bridge CFDictionaryRef)@{ @"NMXFenceDone": n,
+                @"NMXFenceDoneT": @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)),
+                @"NMXFenceGpuEndT": @(gpuEndSeconds > 0 ? (unsigned long long)(gpuEndSeconds * 1e9) : 0ull) });
         }
     }
 }
@@ -311,7 +316,7 @@ static int nvmtl_skip_empty_on(void) {
     if (!error && _gpuTimingSeen && !_gpuTimingInvalid)
         (void)nvmtl_vk_interval_seconds(&_gpuTiming, &deviceStart, &deviceEnd);
     nvmtl_surface_finish_writes(self);
-    nvmtl_nmx_fence_done_all(self);   // after the surfaces hold the pixels (host import, or nvmtlSurfaceOut above)
+    nvmtl_nmx_fence_done_all(self, deviceEnd);   // after the surfaces hold the pixels (host import, or nvmtlSurfaceOut above)
     [_completionCondition lock];
     _gpuStart = deviceStart; _gpuEnd = deviceEnd;
     _legacyKernelEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
@@ -618,7 +623,17 @@ static int nvmtl_commit_ahead_on(void) {
 static void nvmtl_pump_buffers(void) {
     static dispatch_once_t once; static dispatch_queue_t worker;
     const BOOL async = nvmtl_async_commit_on();
-    if (async) dispatch_once(&once, ^{ worker = dispatch_queue_create("nvmtl.execution", DISPATCH_QUEUE_SERIAL); });
+    // FRAME-PATH.md row 1: in WindowServer this queue carries "the frame's GPU work is done" to the display pipe, but a queue
+    // made without a QoS runs at the default priority, behind the owner's apps. The file below (A/B only, default off)
+    // makes it USER_INTERACTIVE; the real fix moves the fence wait into the kernel.
+    if (async) dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = DISPATCH_QUEUE_SERIAL;
+        if (access("/Library/GPUBundles/nvmtl-exec-qos-ui", F_OK) == 0) {
+            attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+            nvlog("commit: nvmtl.execution at USER_INTERACTIVE (/Library/GPUBundles/nvmtl-exec-qos-ui)");
+        }
+        worker = dispatch_queue_create("nvmtl.execution", attr);
+    });
     if (!async) { nvmtl_vk_clock_refresh(); nvmtl_pump_buffers_sync(); return; }
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_pending_buffers.count) return;
