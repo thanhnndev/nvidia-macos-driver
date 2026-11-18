@@ -13,11 +13,11 @@
 + */
 +void nmx_cs_report_name(const char *what, int r, bool always)
 +{
-+	static atomic_t eperm, other;
++	static atomic_t eperm, other, info, enomem;	/* cs-enomem: info lines and -ENOMEM have budgets of their own */
 +
 +	if (!always && (r == 0 || r == -EAGAIN || r == -ERESTARTSYS || r == -EINTR || r == -EDEADLK))
 +		return;
-+	if (atomic_inc_return(r == -EPERM ? &eperm : &other) > (r == -EPERM ? 96 : 48))
++	if (atomic_inc_return(r == 0 ? &info : r == -ENOMEM ? &enomem : r == -EPERM ? &eperm : &other) > (r == 0 ? 16 : r == -EPERM ? 96 : 48))
 +		return;
 +	printf("NMX cs-trace: %s -> %d\n", what, r);
 +}

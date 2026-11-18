@@ -124,6 +124,15 @@ static int sweep_busy;                    /* sweeps/fills running + arms in flig
 static thread_call_t fill_call;
 static int fill_armed;                    /* fill_call is scheduled or running (pg_lock) */
 uint64_t gNmxPageChunksFilled, gNmxPageChunksInline; /* debug.nmx_page_chunks_filled / _inline */
+/*
+ * ga403wm cs-enomem: a failed 2 MB chunk used to return NULL at once, so one transient shortage under memory pressure
+ * became -ENOMEM from TTM populate -> amdgpu_cs_ioctl -> "Vulkan backend is down" -> WindowServer exit (2026-11-18
+ * 10:35:15). Linux's order-0 GFP_KERNEL/GFP_USER allocation reclaims and retries instead of failing, and FreeBSD's
+ * linux_alloc_pages loops on vm_wait. Now: a one-page run first, then, for callers that may sleep (VM_ALLOC_WAITOK, set
+ * by linux_alloc_pages for M_WAITOK without __GFP_NORETRY), back off and retry (pool, chunk, page) for up to 2 s.
+ */
+uint64_t gNmxPageSingleRuns, gNmxPageAllocWaits, gNmxPageAllocFails;   /* debug.nmx_page_single_runs / _alloc_waits / _alloc_fails */
+extern void IOSleep(unsigned int milliseconds);
 static u_int free_count;
 /*
  * ga403wm Step141d: the aged release gave back 194 chunks in a short pause between two videos; the next video start then
@@ -463,8 +472,23 @@ static void fill_worker(void *a, void *b)
     lck_spin_unlock(pg_lock);
 }
 
-static struct vm_page *single_alloc(void)
+/* one page in a run of its own (no chunk could be made): freed with its backing when the page comes back */
+static struct vm_page *single_run(void)
 {
+    struct backing *bk = backing_alloc(BK_RUN, 1, 0, 0, PAGE_SIZE);
+    if (bk == NULL)
+        return NULL;
+    lck_spin_lock(pg_lock);
+    bk->live = 1;
+    pages_live++;
+    lck_spin_unlock(pg_lock);
+    __atomic_add_fetch(&gNmxPageSingleRuns, 1, __ATOMIC_RELAXED);
+    return &bk->pages[0];
+}
+
+static struct vm_page *single_alloc(int req)
+{
+    unsigned waited_ms = 0, step_ms = 1;
     for (;;) {
         lck_spin_lock(pg_lock);
         struct backing *c = avail;
@@ -501,8 +525,22 @@ static struct vm_page *single_alloc(void)
         uint64_t t0 = mach_absolute_time();
         int r = chunk_new(&gNmxPageChunksInline);
         nmx_ft_stall(1, t0, CHUNK_PAGES);
-        if (r != 0)
+        if (r == 0)
+            continue;
+        struct vm_page *m = single_run();
+        if (m != NULL)
+            return m;
+        if (!(req & VM_ALLOC_WAITOK) || waited_ms >= 2000) {
+            __atomic_add_fetch(&gNmxPageAllocFails, 1, __ATOMIC_RELAXED);
             return NULL;
+        }
+        /* the system is short of free pages: let the pageout daemon and compressor work, then look again (another
+         * thread or the fill call may have refilled the pool meanwhile) */
+        __atomic_add_fetch(&gNmxPageAllocWaits, 1, __ATOMIC_RELAXED);
+        IOSleep(step_ms);
+        waited_ms += step_ms;
+        if (step_ms < 64)
+            step_ms *= 2;
     }
 }
 
@@ -517,7 +555,7 @@ static void page_prepare(struct vm_page *m, int req)
 
 vm_page_t vm_page_alloc_noobj(int req)
 {
-    struct vm_page *m = single_alloc();
+    struct vm_page *m = single_alloc(req);
     if (m)
         page_prepare(m, req);
     return m;
