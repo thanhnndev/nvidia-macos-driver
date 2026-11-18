@@ -15,7 +15,7 @@
  int amdgpu_ttm_tt_set_userptr(struct ttm_buffer_object *bo,
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-@@ -686,9 +686,259 @@
+@@ -686,9 +686,276 @@
  	uint32_t		userflags;
  	bool			bound;
  	int32_t			pool_id;
@@ -125,13 +125,6 @@
 +	gtt->nmx_norec = false;
 +}
 +
-+/* a CS lists the BO (its reservation is held) */
-+void amdgpu_ttm_tt_nmx_touch(struct ttm_tt *ttm)
-+{
-+	if (ttm)
-+		ttm_to_amdgpu_ttm_tt(ttm)->nmx_used = jiffies;
-+}
-+
 +static void nmx_park_reset(struct amdgpu_ttm_tt *gtt)
 +{
 +	dma_fence_put(gtt->nmx_fvm);
@@ -139,6 +132,20 @@
 +	gtt->nmx_fvm = NULL;
 +	gtt->nmx_fpt = NULL;
 +	gtt->nmx_pstage = 0;
++}
++
++/* a CS lists the BO (its reservation is held): in use, and a park in progress starts over (review of 30cecaa,
++ * item 2: a stale stage could otherwise unwire later after an eviction put the BO back in SYSTEM, PTEs valid) */
++void amdgpu_ttm_tt_nmx_touch(struct ttm_tt *ttm)
++{
++	struct amdgpu_ttm_tt *gtt;
++
++	if (!ttm)
++		return;
++	gtt = ttm_to_amdgpu_ttm_tt(ttm);
++	gtt->nmx_used = jiffies;
++	if (gtt->nmx_pstage)
++		nmx_park_reset(gtt);
 +}
 +
 +/*
@@ -210,6 +217,11 @@
 +			goto out;
 +		if (!dma_resv_trylock(rresv))			/* the CS order is root then BOs: never wait here */
 +			goto out;
++		/* the update ends in amdgpu_vm_sdma_commit -> dma_resv_add_fence(root): slots first, as amdgpu_vm_lock_pd */
++		if (dma_resv_reserve_fences(rresv, 2)) {
++			dma_resv_unlock(rresv);
++			goto out;
++		}
 +		r = amdgpu_vm_bo_update(amdgpu_ttm_adev(bo->bdev), container_of(base, struct amdgpu_bo_va, base), true);
 +		f = r ? NULL : dma_fence_get(vm->last_update);	/* clear = true updates go to vm->last_update */
 +		dma_resv_unlock(rresv);
@@ -224,6 +236,11 @@
 +	default:
 +		if (gtt->nmx_fpt && !dma_fence_is_signaled(gtt->nmx_fpt))
 +			goto out;
++		if (gtt->nmx_fpt && dma_fence_get_status(gtt->nmx_fpt) < 0) {
++			/* a GPU reset force-signalled the clear job: the PTEs may still be valid; start the park over */
++			__atomic_add_fetch(&gNmxParkAbort, 1, __ATOMIC_RELAXED);
++			goto drop;
++		}
 +		break;
 +	}
 +	nmx_park_reset(gtt);
@@ -275,7 +292,7 @@
  
  #ifdef CONFIG_DRM_AMDGPU_USERPTR
  /*
-@@ -1087,7 +1337,24 @@
+@@ -1087,7 +1354,24 @@
  				       struct ttm_tt *ttm)
  {
  	struct amdgpu_ttm_tt *gtt = ttm_to_amdgpu_ttm_tt(ttm);
@@ -300,11 +317,13 @@
  	if (gtt->usertask)
  		put_task_struct(gtt->usertask);
  
-@@ -1163,6 +1430,18 @@
+@@ -1163,6 +1447,20 @@
  
  	/* user pages are bound by amdgpu_ttm_tt_pin_userptr() */
  	if (gtt->userptr) {
 +#ifdef NMXKPI
++		if (gtt->nmx_pstage)
++			nmx_park_reset(gtt);	/* 11.9: populated again, a park in progress starts over (BO resv held) */
 +		/* Step142: a parked (or otherwise unpopulated) owned pin gets its wiring and page records back */
 +		if (gtt->nmx_pin && gtt->nmx_norec) {
 +			ret = nmx_upin_restore(gtt->nmx_pin, ttm->pages, (int)ttm->num_pages);
@@ -319,7 +338,7 @@
  		ttm->sg = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
  		if (!ttm->sg)
  			return -ENOMEM;
-@@ -1209,7 +1488,13 @@
+@@ -1209,7 +1507,13 @@
  	if (gtt->userptr) {
  #ifdef NMXKPI
  		/* ga403wm Step92: the pages were pinned when the BO was made; put them */
@@ -334,7 +353,7 @@
  			pgoff_t k;
  
  			for (k = 0; k < ttm->num_pages; k++)
-@@ -2077,6 +2362,10 @@
+@@ -2077,6 +2381,10 @@
  	if (!adev->mman.initialized)
  		return;
  

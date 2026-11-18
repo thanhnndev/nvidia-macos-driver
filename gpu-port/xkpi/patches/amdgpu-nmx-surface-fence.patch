@@ -10,10 +10,10 @@
  			      uint64_t *user_addr);
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-@@ -793,6 +793,18 @@
- {
- 	if (ttm)
- 		ttm_to_amdgpu_ttm_tt(ttm)->nmx_used = jiffies;
+@@ -813,6 +813,18 @@
+ 	gtt->nmx_used = jiffies;
+ 	if (gtt->nmx_pstage)
+ 		nmx_park_reset(gtt);
 +}
 +
 +/* ga403wm out-31 (FRAME-PATH row 1): the IOSurface ID whose own memory this userptr BO pins, 0 if none */
@@ -28,7 +28,7 @@
 +	return gtt->nmx_pin ? nmx_upin_sid(gtt->nmx_pin) : 0;
  }
  
- static void nmx_park_one(struct ttm_buffer_object *bo)
+ /*
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
 @@ -1425,6 +1425,9 @@
