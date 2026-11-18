@@ -1088,6 +1088,68 @@ void nmx_ft_vbl_timer(uint64_t frame_ns)
     __atomic_fetch_add(&ft.timer_bins[((now - last) % frame_ns) * 16 / frame_ns], 1, __ATOMIC_RELAXED);
 }
 
+/*
+ * Frame-path stalls under memory pressure (FRAME-PATH.md row 10): the memory work that can run synchronously on a
+ * submitting thread (WindowServer / Chrome GPU process in the CS ioctl) or on the pool's fill thread. Per kind: count,
+ * total and max time, a log2-ms histogram (<0.1, <1, <10, <100, <1000, >=1000 ms), and the last 128 events >= 1 ms with
+ * their start time (same clock as the flip records), duration, pages and pid, so the report can put them next to late
+ * frames. Kinds: 0 restore = Step142 re-wire of a parked userptr BO (TTM populate in CS), 1 inline = 2 MB chunk made on
+ * the allocating thread (pool empty), 2 fill = chunk made by the fill thread call, 3 wire = new userptr wire (import).
+ */
+struct proc;
+extern struct proc *current_proc(void);    /* already imported (no new undefined symbol) */
+extern int proc_pid(struct proc *);
+#define ST_KINDS 4
+#define ST_N 128u
+static const char *const st_name[ST_KINDS] = { "restore", "inline", "fill", "wire" };
+static struct {
+    uint64_t n[ST_KINDS], sum_ns[ST_KINDS], max_ns[ST_KINDS], hist[ST_KINDS][6];
+    uint64_t head;
+    struct { uint64_t t0, dur_ns; uint32_t kind, pages; int32_t pid; } ev[ST_N];
+} st;
+
+void nmx_ft_stall(int kind, uint64_t t0, uint64_t pages)
+{
+    uint64_t t1 = mach_absolute_time(), d = t1 > t0 ? t1 - t0 : 0, m;
+    int b = d < 100000ULL ? 0 : d < 1000000ULL ? 1 : d < 10000000ULL ? 2 : d < 100000000ULL ? 3 : d < 1000000000ULL ? 4 : 5;
+    if (kind < 0 || kind >= ST_KINDS)
+        return;
+    __atomic_fetch_add(&st.n[kind], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st.sum_ns[kind], d, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&st.hist[kind][b], 1, __ATOMIC_RELAXED);
+    m = __atomic_load_n(&st.max_ns[kind], __ATOMIC_RELAXED);
+    while (d > m && !__atomic_compare_exchange_n(&st.max_ns[kind], &m, d, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
+    if (d >= 1000000ULL) {
+        uint64_t i = __atomic_fetch_add(&st.head, 1, __ATOMIC_ACQ_REL) % ST_N;
+        st.ev[i].t0 = t0;
+        st.ev[i].dur_ns = d;
+        st.ev[i].kind = (uint32_t)kind;
+        st.ev[i].pages = (uint32_t)pages;
+        st.ev[i].pid = proc_pid(current_proc());
+    }
+}
+
+static size_t st_format(char *buf, size_t size)
+{
+    size_t o = 0;
+    uint64_t head = __atomic_load_n(&st.head, __ATOMIC_ACQUIRE), n = head < ST_N ? head : ST_N;
+#define ST_P(...) do { if (o < size) o += (size_t)snprintf(buf + o, size - o, __VA_ARGS__); } while (0)
+    for (int k = 0; k < ST_KINDS; k++)
+        ST_P("stall %s n %llu sum_us %llu max_us %llu hist_ms_0.1_1_10_100_1000_inf %llu %llu %llu %llu %llu %llu\n",
+             st_name[k], (unsigned long long)st.n[k], (unsigned long long)(st.sum_ns[k] / 1000),
+             (unsigned long long)(st.max_ns[k] / 1000), (unsigned long long)st.hist[k][0],
+             (unsigned long long)st.hist[k][1], (unsigned long long)st.hist[k][2], (unsigned long long)st.hist[k][3],
+             (unsigned long long)st.hist[k][4], (unsigned long long)st.hist[k][5]);
+    for (uint64_t k = head - n; k < head; k++) {
+        const typeof(st.ev[0]) *e = &st.ev[k % ST_N];
+        ST_P("stallev %s %llu %llu %u %d\n", e->kind < ST_KINDS ? st_name[e->kind] : "?", (unsigned long long)e->t0,
+             (unsigned long long)(e->dur_ns / 1000), e->pages, e->pid);
+    }
+#undef ST_P
+    return o < size ? o : size;
+}
+
 /* debug.nmx_frametrace: a text dump, newest record last; times relative to sub0 in microseconds */
 int nmx_ft_format(char *buf, size_t size)
 {
@@ -1110,6 +1172,8 @@ int nmx_ft_format(char *buf, size_t size)
              ips[6]);
     else
         FT_P("ips none\n");
+    if (o < size)
+        o += st_format(buf + o, size - o);
     FT_P("seq handle sub0_ns sub1_us armed_us pflip_us seen_us vbl_armed vbl_pflip idle\n");
     for (uint64_t k = head - n; k < head; k++) {
         const struct nmx_ft_rec *r = &ft.r[k % FT_N];

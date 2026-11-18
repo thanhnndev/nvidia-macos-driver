@@ -221,6 +221,7 @@ static struct vm_page *reg_find_locked(vm_paddr_t pfn)
 }
 
 static void backing_release(struct backing *bk);
+void nmx_ft_stall(int kind, uint64_t t0, uint64_t pages);    /* nmx_fb_bridge.c, FRAME-PATH row 10 */
 static void release_worker(void *a, void *b);
 static void fill_worker(void *a, void *b);
 
@@ -448,7 +449,12 @@ static void fill_worker(void *a, void *b)
         lck_spin_lock(pg_lock);
         int need = free_count < CHUNK_RESERVE && !sweep_stopping;
         lck_spin_unlock(pg_lock);
-        if (!need || chunk_new(&gNmxPageChunksFilled) != 0)
+        if (!need)
+            break;
+        uint64_t t0 = mach_absolute_time();
+        int r = chunk_new(&gNmxPageChunksFilled);
+        nmx_ft_stall(2, t0, CHUNK_PAGES);
+        if (r != 0)
             break;
     }
     lck_spin_lock(pg_lock);
@@ -492,7 +498,10 @@ static struct vm_page *single_alloc(void)
             return m;
         }
         lck_spin_unlock(pg_lock);
-        if (chunk_new(&gNmxPageChunksInline) != 0)
+        uint64_t t0 = mach_absolute_time();
+        int r = chunk_new(&gNmxPageChunksInline);
+        nmx_ft_stall(1, t0, CHUNK_PAGES);
+        if (r != 0)
             return NULL;
     }
 }
@@ -928,7 +937,9 @@ int nmx_upin_restore(void *p, vm_page_t *pages, int npages)
     err = ENOMEM;
     if (phys == NULL)
         goto fail;
+    uint64_t t0 = mach_absolute_time();
     err = nmx_xnu_user_rewire(pin->handle, (size_t)npages, phys);
+    nmx_ft_stall(0, t0, (uint64_t)npages);
     if (err == 0)
         err = pin_attach(pin, phys, npages, pages);
     free(phys, M_NMXPAGE);
