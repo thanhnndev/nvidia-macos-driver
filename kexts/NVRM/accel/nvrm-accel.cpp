@@ -1381,8 +1381,20 @@ static int gNmxFlipCaps = -1;
 SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip_api, CTLFLAG_RD | CTLFLAG_LOCKED, &gNmxFlipCaps, 0,
            "NMXGPU flip caps (nmx_flip_abi.h); -1 = not asked yet, 0 = no flip API in NMXGPU");
 static int gNmxFlipTripped = 0;
-SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip_tripped, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFlipTripped, 0,
-           "1 = flips turned themselves off after errors (see the iop: flip log); write 0 to try again");
+static bool gFlipTripTransient;     // the current trip re-arms by itself (nmxFlipMaybeRearm)
+// a manual write (0 or 1) is the owner's call: it never auto re-arms afterwards (review C2)
+static int nmxflip_tripped_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = gNmxFlipTripped;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || req->newptr == 0) return err;
+    gFlipTripTransient = false;
+    gNmxFlipTripped = v ? 1 : 0;
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmxaccel_flip_tripped, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            NULL, 0, nmxflip_tripped_sysctl, "I",
+            "1 = flips turned themselves off after errors (see the iop: flip log); write 0 to try again");
 static SInt64 gCntFlipSubmit, gCntFlipLatched, gCntFlipFallback, gCntFlipRefused, gCntFlipTimeouts, gCntFlipHome,
               gCntFlipImports, gCntFlipImportFail, gCntFlipFrontWritten, gCntFlipWaitUs, gCntFlipSame, gCntFlipDrop,
               gCntFlipGen, gCntFlipHwMismatch;
@@ -1531,7 +1543,6 @@ static IOReturn nmxFlipCall2(unsigned fn, struct NMXFlipRequest2 *r)
 // failing) stay off for the boot as before.
 enum : unsigned { kFlipAutoRearmMax = 16 };
 static const uint64_t kFlipAutoRearmNs = 10000000000ull;
-static bool gFlipTripTransient;
 static uint64_t gFlipTripT;
 static SInt64 gCntFlipAutoRearm;
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_auto_rearm, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipAutoRearm,
@@ -1546,6 +1557,10 @@ static void nmxFlipTripEx(const char *why, bool transient)
                  why, (long long)gCntFlipAutoRearm + 1, (unsigned)kFlipAutoRearmMax);
         else
             ALOG("iop: flip: OFF for this boot (%s) -- frames take the K6 copy; sysctl debug.nmxaccel_flip_tripped=0 re-arms", why);
+    }
+    else if (!transient && gFlipTripTransient) {   // a structural trip during a transient one: no auto re-arm (review C1)
+        gFlipTripTransient = false;
+        ALOG("iop: flip: OFF for this boot (%s) -- frames take the K6 copy; sysctl debug.nmxaccel_flip_tripped=0 re-arms", why);
     }
     gNmxFlipTripped = 1;
 }

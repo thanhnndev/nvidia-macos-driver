@@ -15,7 +15,7 @@
  int amdgpu_ttm_tt_set_userptr(struct ttm_buffer_object *bo,
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-@@ -686,9 +686,276 @@
+@@ -686,9 +686,285 @@
  	uint32_t		userflags;
  	bool			bound;
  	int32_t			pool_id;
@@ -237,9 +237,18 @@
 +		if (gtt->nmx_fpt && !dma_fence_is_signaled(gtt->nmx_fpt))
 +			goto out;
 +		if (gtt->nmx_fpt && dma_fence_get_status(gtt->nmx_fpt) < 0) {
-+			/* a GPU reset force-signalled the clear job: the PTEs may still be valid; start the park over */
++			/* a GPU reset force-signalled the clear job: the PTEs may still be valid. amdgpu_vm_bo_update set
++			 * bo_va->cleared, so a plain restart would issue no update and wait on this (or a later, unrelated)
++			 * fence: mark the mapping not cleared under the root reservation and redo stage 1 -> 2 now */
++			if (!dma_resv_trylock(rresv))
++				goto out;
++			container_of(base, struct amdgpu_bo_va, base)->cleared = false;
++			dma_resv_unlock(rresv);
 +			__atomic_add_fetch(&gNmxParkAbort, 1, __ATOMIC_RELAXED);
-+			goto drop;
++			dma_fence_put(gtt->nmx_fpt);
++			gtt->nmx_fpt = NULL;
++			gtt->nmx_pstage = 1;		/* nmx_fvm signalled already: the next sweep updates again */
++			goto out;
 +		}
 +		break;
 +	}
@@ -292,7 +301,7 @@
  
  #ifdef CONFIG_DRM_AMDGPU_USERPTR
  /*
-@@ -1087,7 +1354,24 @@
+@@ -1087,7 +1363,24 @@
  				       struct ttm_tt *ttm)
  {
  	struct amdgpu_ttm_tt *gtt = ttm_to_amdgpu_ttm_tt(ttm);
@@ -317,7 +326,7 @@
  	if (gtt->usertask)
  		put_task_struct(gtt->usertask);
  
-@@ -1163,6 +1447,20 @@
+@@ -1163,6 +1456,20 @@
  
  	/* user pages are bound by amdgpu_ttm_tt_pin_userptr() */
  	if (gtt->userptr) {
@@ -338,7 +347,7 @@
  		ttm->sg = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
  		if (!ttm->sg)
  			return -ENOMEM;
-@@ -1209,7 +1507,13 @@
+@@ -1209,7 +1516,13 @@
  	if (gtt->userptr) {
  #ifdef NMXKPI
  		/* ga403wm Step92: the pages were pinned when the BO was made; put them */
@@ -353,7 +362,7 @@
  			pgoff_t k;
  
  			for (k = 0; k < ttm->num_pages; k++)
-@@ -2077,6 +2381,10 @@
+@@ -2077,6 +2390,10 @@
  	if (!adev->mman.initialized)
  		return;
  
