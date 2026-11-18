@@ -276,6 +276,18 @@ SYSCTL_INT(_debug, OID_AUTO, nmx_userptr_park_ms, CTLFLAG_RW | CTLFLAG_LOCKED | 
 extern "C" int nmx_ft_on;
 SYSCTL_INT(_debug, OID_AUTO, nmx_ft, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_ft_on, 0,
            "frame-path trace (FRAME-PATH.md section 7): 0 stops the NMXGPU-side hooks (flip records, VBL timer phase, memory stalls)");
+/* out-31 (FRAME-PATH rows 1-3): new behaviour by default, each one back to the old path at runtime here or from boot
+ * with nmxkfence=0 / nmxflipirq=0 / nmxvblirq=0 (names audited against every kext on disk, 2026-11-18) */
+extern "C" int nmx_flip_kfence, nmx_flip_irq, nmx_vbl_irq;
+SYSCTL_INT(_debug, OID_AUTO, nmx_flip_kfence, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_flip_kfence, 0,
+           "out-31 row 1: flips wait for the IOSurface's last CS job fence in the atomic commit; 0 = NMXAccel polls NMXFenceDone");
+SYSCTL_INT(_debug, OID_AUTO, nmx_flip_irq, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_flip_irq, 0,
+           "out-31 row 3: the pageflip IRQ notifies NMXAccel; 0 = NMXAccel polls flip status");
+extern "C" volatile SInt64 gNmxFlipFenced, gNmxFlipNoFence, gNmxSurfFenceSet, gNmxFlipNotified, gNmxVblDelivered;
+NMX_CNT(nmx_flip_fenced, gNmxFlipFenced, "out-31: flips committed with a kernel render fence on the plane");
+NMX_CNT(nmx_flip_nofence, gNmxFlipNoFence, "out-31: fence-only flips refused because no fence was known for the surface");
+NMX_CNT(nmx_surf_fence_set, gNmxSurfFenceSet, "out-31: CS jobs recorded as an IOSurface's last fence");
+NMX_CNT(nmx_flip_notified, gNmxFlipNotified, "out-31: pageflip IRQ notifications sent to NMXAccel");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -365,6 +377,17 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_park_fail);
     sysctl_register_oid(&sysctl__debug_nmx_userptr_park_ms);
     sysctl_register_oid(&sysctl__debug_nmx_ft);
+    {
+        int v;
+        if (PE_parse_boot_argn("nmxkfence", &v, sizeof v)) nmx_flip_kfence = v != 0;
+        if (PE_parse_boot_argn("nmxflipirq", &v, sizeof v)) nmx_flip_irq = v != 0;
+    }
+    sysctl_register_oid(&sysctl__debug_nmx_flip_kfence);
+    sysctl_register_oid(&sysctl__debug_nmx_flip_irq);
+    sysctl_register_oid(&sysctl__debug_nmx_flip_fenced);
+    sysctl_register_oid(&sysctl__debug_nmx_flip_nofence);
+    sysctl_register_oid(&sysctl__debug_nmx_surf_fence_set);
+    sysctl_register_oid(&sysctl__debug_nmx_flip_notified);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);

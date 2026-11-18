@@ -1,0 +1,68 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -217,6 +217,7 @@
+ int amdgpu_ttm_tt_nmx_pin(struct ttm_tt *ttm, uint64_t addr, bool write);
+ void amdgpu_ttm_tt_nmx_unpin(struct ttm_tt *ttm);
+ void amdgpu_ttm_tt_nmx_touch(struct ttm_tt *ttm);
++uint32_t amdgpu_ttm_tt_nmx_sid(struct ttm_tt *ttm);
+ #endif
+ int amdgpu_ttm_tt_get_userptr(const struct ttm_buffer_object *tbo,
+ 			      uint64_t *user_addr);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -793,6 +793,18 @@
+ {
+ 	if (ttm)
+ 		ttm_to_amdgpu_ttm_tt(ttm)->nmx_used = jiffies;
++}
++
++/* ga403wm out-31 (FRAME-PATH row 1): the IOSurface ID whose own memory this userptr BO pins, 0 if none */
++uint32_t nmx_upin_sid(void *pin);
++uint32_t amdgpu_ttm_tt_nmx_sid(struct ttm_tt *ttm)
++{
++	struct amdgpu_ttm_tt *gtt;
++
++	if (!ttm)
++		return 0;
++	gtt = ttm_to_amdgpu_ttm_tt(ttm);
++	return gtt->nmx_pin ? nmx_upin_sid(gtt->nmx_pin) : 0;
+ }
+ 
+ static void nmx_park_one(struct ttm_buffer_object *bo)
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1425,6 +1425,9 @@
+ 	}
+ }
+ 
++#ifdef NMXKPI
++void nmx_surf_fence_set(uint32_t sid, struct dma_fence *fence);	/* nmx_fb_bridge.c */
++#endif
+ static int amdgpu_cs_submit(struct amdgpu_cs_parser *p,
+ 			    union drm_amdgpu_cs *cs)
+ {
+@@ -1484,6 +1487,24 @@
+ 	}
+ 
+ 	p->fence = dma_fence_get(&leader->base.s_fence->finished);
++#ifdef NMXKPI
++	{
++		/*
++		 * ga403wm out-31 (FRAME-PATH row 1): remember this job as the last GPU work on every IOSurface it touches,
++		 * so a page flip of that surface waits for it in the kernel commit (drm_atomic_set_fence_for_plane ->
++		 * drm_atomic_helper_wait_for_fences), as Linux does with the BO's dma_resv. One BO per process per surface
++		 * (FRAME-PATH row 5), so the surface ID is the shared key.
++		 */
++		struct amdgpu_bo_list_entry *ne;
++
++		amdgpu_bo_list_for_each_userptr_entry(ne, p->bo_list) {
++			uint32_t sid = amdgpu_ttm_tt_nmx_sid(ne->bo->tbo.ttm);
++
++			if (sid)
++				nmx_surf_fence_set(sid, p->fence);
++		}
++	}
++#endif
+ 	drm_exec_for_each_locked_object(&p->exec, index, gobj) {
+ 
+ 		ttm_bo_move_to_lru_tail_unlocked(&gem_to_amdgpu_bo(gobj)->tbo);

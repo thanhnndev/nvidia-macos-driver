@@ -1,0 +1,72 @@
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -443,6 +443,9 @@
+ void nmx_ft_pflip(struct drm_crtc *crtc);
+ void nmx_ft_vblank(struct drm_crtc *crtc);
+ void nmx_ft_armed(struct drm_crtc *crtc, int idle_allowed);
++/* ga403wm out-31 (FRAME-PATH row 3): tell the display bridge a flip latched, after the event went out (Linux sends
++ * the DRM pageflip event from this same IRQ; NMXAccel completes the IOAccel transaction from it instead of polling). */
++void nmx_fb_flip_done(struct drm_crtc *crtc);
+ 
+ static void dm_pflip_high_irq(void *interrupt_params)
+ {
+@@ -453,7 +456,7 @@
+ 	unsigned long flags;
+ 	struct drm_pending_vblank_event *e;
+ 	u32 vpos, hpos, v_blank_start, v_blank_end;
+-	bool vrr_active;
++	bool vrr_active, nmx_sent = false;
+ 
+ 	amdgpu_crtc = get_crtc_by_otg_inst(adev, irq_params->irq_src - IRQ_TYPE_PFLIP);
+ 
+@@ -503,6 +506,7 @@
+ 
+ 			/* Event sent, so done with vblank for this flip */
+ 			drm_crtc_vblank_put(&amdgpu_crtc->base);
++			nmx_sent = true;
+ 		}
+ 	} else if (e) {
+ 		/* VRR active and inside front-porch: vblank count and
+@@ -536,6 +540,8 @@
+ 
+ 	amdgpu_crtc->pflip_status = AMDGPU_FLIP_NONE;
+ 	spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
++	if (nmx_sent)	/* event sent now (VRR front porch: sent later by the vblank handler, the bridge's fallback catches it) */
++		nmx_fb_flip_done(&amdgpu_crtc->base);
+ 
+ 	drm_dbg_state(dev,
+ 		      "crtc:%d[%p], pflip_stat:AMDGPU_FLIP_NONE, vrr[%d]-fp %d\n",
+@@ -3175,6 +3181,33 @@
+ 	return 0;
+ }
+ 
++/* ga403wm out-31 trace: the eDP panel link's self-refresh state and the vblank IRQ users, the inputs of
++ * amdgpu_dm_crtc_vblank_control_worker / dcn35_apply_idle_power_optimizations. out[] = psr_feature_enabled,
++ * psr_allow_active, psr_version, replay_feature_enabled, active_vblank_irq_count. -1 without an eDP link. */
++int nmx_dm_psr_flags(struct drm_device *ddev, u32 out[5]);
++int nmx_dm_psr_flags(struct drm_device *ddev, u32 out[5])
++{
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++	struct dc *dc = adev->dm.dc;
++	unsigned int i;
++
++	out[4] = adev->dm.active_vblank_irq_count;
++	if (dc == NULL)
++		return -1;
++	for (i = 0; i < dc->link_count; i++) {
++		struct dc_link *l = dc->links[i];
++
++		if (l == NULL || l->connector_signal != SIGNAL_TYPE_EDP)
++			continue;
++		out[0] = l->psr_settings.psr_feature_enabled;
++		out[1] = l->psr_settings.psr_allow_active;
++		out[2] = (u32)l->psr_settings.psr_version;
++		out[3] = l->replay_settings.replay_feature_enabled;
++		return 0;
++	}
++	return -1;
++}
++
+ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;

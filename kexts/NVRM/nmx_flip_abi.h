@@ -22,12 +22,25 @@
  *                   immediate, never torn). Returns at once; out: seq. kIOReturnBusy while an earlier flip is pending.
  *   nmxFlipStatus   out: seqSubmitted, seqLatched, current, pending, generation, vblankCount, vblankNs. Never sleeps.
  *
+ * Version 2 (out-31, FRAME-PATH rows 1 and 3) appends struct NMXFlipRequest2's fields; an NMXGPU that only knows
+ * version 1 answers kIOReturnBadArgument to a version 2 call, and the caller drops back to version 1.
+ *   nmxFlipCaps     v2 adds NMX_FLIP_CAP_FENCE / NMX_FLIP_CAP_NOTIFY when those paths are on in NMXGPU.
+ *   nmxFlipSubmit   v2 in: surfaceId and flags NMX_FLIP_SUBMIT_FENCE(_ONLY). The commit then waits for that IOSurface's
+ *                   last GPU job in the kernel (drm_atomic_helper_wait_for_fences), out: fenced = 1. With FENCE_ONLY and
+ *                   no job known for the surface, or the last one recorded before fenceAfterNs (an older frame's):
+ *                   kIOReturnNotFound, nothing queued (the caller waits its own way).
+ *   nmxFlipStatus   v2 out: latchNs, mach_absolute_time of the pageflip interrupt that latched seqLatched.
+ *   nmxFlipNotify   v2 in: notify, refcon (notify NULL = off). notify(refcon, seq, pflipNs) runs on NMXGPU's interrupt
+ *                   thread right after each flip latched: it must only wake something (no locks, never sleep).
+ *
  * generation changes whenever the bridge itself puts its home buffer back on the outputs (restore, hotplug, display
  * power): the caller's idea of what is on screen is then wrong, and it must start over from home.
  */
 #pragma once
 
 #define NMX_FLIP_ABI_VERSION 1u
+#define NMX_FLIP_ABI_VERSION2 2u
+#define NMX_FLIP_FN_NOTIFY   "nmxFlipNotify"
 
 #define NMX_FLIP_FN_CAPS     "nmxFlipCaps"
 #define NMX_FLIP_FN_IMPORT   "nmxFlipImport"
@@ -43,12 +56,18 @@ enum {
     NMX_FLIP_CAP_SUBMIT       = 1u << 0,   // nmxFlipSubmit / nmxFlipStatus work (required for anything else)
     NMX_FLIP_CAP_IMPORT       = 1u << 1,   // nmxFlipImport: scan out caller memory (zero copy)
     NMX_FLIP_CAP_VRAM_CHAIN   = 1u << 2,   // nmxFlipBuffers: extra VRAM scan-out buffers
+    NMX_FLIP_CAP_FENCE        = 1u << 3,   // v2: nmxFlipSubmit waits for the surface's render fence in the kernel
+    NMX_FLIP_CAP_NOTIFY       = 1u << 4,   // v2: nmxFlipNotify, flip completion from the pageflip interrupt
     NMX_FLIP_CAP_XRGB8888     = 1u << 8,   // formats the display accepts for an import
     NMX_FLIP_CAP_XRGB2101010  = 1u << 9,
 };
 enum {
     NMX_FLIP_FMT_XRGB8888    = 1u,   // IOSurface 'BGRA' (0x42475241)
     NMX_FLIP_FMT_XRGB2101010 = 2u,   // IOSurface 'l10r' (0x6C313072)
+};
+enum {
+    NMX_FLIP_SUBMIT_FENCE      = 1u,   // v2 submit flags: attach the surface's last kernel GPU fence if one is known
+    NMX_FLIP_SUBMIT_FENCE_ONLY = 2u,   // ... and refuse (kIOReturnNotFound) when none is
 };
 #define NMX_FLIP_MAX_BUFFERS 3u
 
@@ -84,4 +103,15 @@ struct NMXFlipRequest {
     unsigned long long vblankCount;     // out: status
     unsigned long long vblankNs;        // out: status, uptime of the last vertical blank
     struct NMXFlipBuffer buf[NMX_FLIP_MAX_BUFFERS];   // out: buffers
+};
+/* version 2: NMXGPU's struct nmx_flipreq2 (nmx_fb_bridge.c) must match */
+struct NMXFlipRequest2 {
+    struct NMXFlipRequest v1;           // v1.version = NMX_FLIP_ABI_VERSION2
+    unsigned int       surfaceId;       // in: submit
+    unsigned int       fenced;          // out: submit
+    unsigned long long latchNs;         // out: status
+    void (*notify)(void *refcon, unsigned long long seq, unsigned long long pflipNs);   // in: notify
+    void              *refcon;          // in: notify
+    unsigned long long fenceAfterNs;    // in: submit, refuse a fence recorded before this mach time (0 = any)
+    unsigned long long fenceSetNs;      // out: submit, when the attached fence was recorded
 };

@@ -398,6 +398,7 @@ int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out)
 #define FLIP_R_BUSY        0xe00002d5u
 #define FLIP_R_NOTREADY    0xe00002d8u
 #define FLIP_R_ERROR       0xe00002bcu
+#define FLIP_R_NOFENCE     0xe00002f0u      /* kIOReturnNotFound: v2 submit with NMX_FLIP_SUBMIT_FENCE_ONLY, no fence known */
 #define FLIP_NONE          0xffffffffu
 #define FLIP_NBUF          3
 #define FLIP_IMP0          8u
@@ -415,6 +416,29 @@ struct nmx_flipreq {
 _Static_assert(__builtin_offsetof(struct nmx_flipreq, buf) == 120, "NMXFlipRequest layout");
 _Static_assert(sizeof(struct nmx_flipbuf) == 40, "NMXFlipBuffer layout");
 
+/*
+ * out-31 (FRAME-PATH rows 1 and 3): NMXFlipRequest version 2 = version 1 plus these fields at the end. A version 1
+ * caller (an older NMXAccel) never reaches them; a version 2 caller of an older NMXGPU gets FLIP_R_BADARG and falls
+ * back to version 1.
+ */
+struct nmx_flipreq2 {
+    struct nmx_flipreq v1;
+    uint32_t surfaceId;                 /* in: submit, the IOSurface being flipped (row 1 fence lookup) */
+    uint32_t fenced;                    /* out: submit, 1 = the commit waits for that surface's last GPU job */
+    uint64_t latchNs;                   /* out: status, mach_absolute_time of the pageflip IRQ of seqLatched */
+    void (*notify)(void *refcon, uint64_t seq, uint64_t pflipNs);   /* in: nmxFlipNotify (NULL = off) */
+    void *refcon;
+    uint64_t fenceAfterNs;              /* in: submit, a fence recorded before this mach time is not this frame's (0 = any) */
+    uint64_t fenceSetNs;                /* out: submit, when the attached fence was recorded */
+};
+#define FLIP_CAP_FENCE      (1u << 3)
+#define FLIP_CAP_NOTIFY     (1u << 4)
+#define FLIP_SUBMIT_FENCE       1u      /* attach the surface's last kernel GPU fence to the plane if one is known */
+#define FLIP_SUBMIT_FENCE_ONLY  2u      /* ... and refuse (FLIP_R_NOFENCE, nothing committed) when none is known */
+/* switches (debug.nmx_flip_kfence / nmx_flip_irq / nmx_vbl_irq; boot-args nmxkfence=0 / nmxflipirq=0 / nmxvblirq=0) */
+int nmx_flip_kfence = 1, nmx_flip_irq = 1, nmx_vbl_irq = 1;
+uint64_t gNmxFlipFenced, gNmxFlipNoFence, gNmxSurfFenceSet, gNmxFlipNotified, gNmxVblDelivered;
+
 struct nmx_flip_import {
     struct drm_framebuffer *fb;
     struct drm_gem_object *gem;
@@ -429,6 +453,9 @@ static struct {
     int lock_ready;
     uint32_t inited, gen, cur, pending, nbuf, logs, tried;
     uint64_t seq_sub, seq_lat;
+    uint64_t pflip_t, latch_t;          /* out-31: last pageflip IRQ time; the one of the flip that latched (seq_lat) */
+    void (*notify)(void *, uint64_t, uint64_t);
+    void *notify_ref;
     struct drm_crtc_commit *commit;     /* the pending flip's commit (one reference held) */
     struct nmx_fb *nfb;
     struct drm_crtc *crtc;
@@ -614,6 +641,7 @@ static void flip_refresh(void)
         flip.cur = flip.pending;
         flip.pending = FLIP_NONE;
         flip.seq_lat = flip.seq_sub;
+        flip.latch_t = __atomic_load_n(&flip.pflip_t, __ATOMIC_ACQUIRE);
     }
     if (flip.pending == FLIP_NONE) {
         struct drm_plane_state *ps = flip.plane->state;
@@ -633,6 +661,8 @@ static void flip_refresh(void)
     }
 }
 
+static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *set_ns);
+
 static uint32_t flip_submit(struct nmx_flipreq *r)
 {
     uint32_t h = r->handle;
@@ -640,14 +670,30 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
     struct drm_modeset_acquire_ctx ctx;
     struct drm_atomic_state *state;
     struct drm_crtc_commit *commit = NULL;
+    struct dma_fence *kf = NULL;        /* out-31 row 1: the surface's last GPU job, waited in the commit */
     int e = -ENOMEM;
 
     if (!nfbp)
         return FLIP_R_BADARG;
+    if (r->version >= 2) {
+        struct nmx_flipreq2 *r2 = (struct nmx_flipreq2 *)r;
+
+        r2->fenced = 0;
+        if ((r->flags & (FLIP_SUBMIT_FENCE | FLIP_SUBMIT_FENCE_ONLY)) && __atomic_load_n(&nmx_flip_kfence, __ATOMIC_RELAXED)) {
+            r2->fenceSetNs = 0;
+            kf = surf_fence_get(r2->surfaceId, r2->fenceAfterNs, &r2->fenceSetNs);
+            if (kf == NULL && (r->flags & FLIP_SUBMIT_FENCE_ONLY)) {
+                __atomic_add_fetch(&gNmxFlipNoFence, 1, __ATOMIC_RELAXED);
+                return FLIP_R_NOFENCE;
+            }
+        }
+    }
     spin_lock(&flip.lock);
     flip_refresh();
     if (flip.pending != FLIP_NONE) {
         spin_unlock(&flip.lock);
+        if (kf)
+            dma_fence_put(kf);
         return FLIP_R_BUSY;
     }
     flip.pending = h;           /* reserved; status reports it pending from here */
@@ -667,6 +713,11 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
                 goto deadlk;
             }
             drm_atomic_set_fb_for_plane(ps, nfbp);
+            /* = drm_atomic_set_fence_for_plane (not in this drm-kmod): an existing fence wins. The plane state owns
+             * the reference (drm_atomic_helper_wait_for_fences puts it; state_clear on -EDEADLK too). This tree's
+             * drm_gem_plane_helper_prepare_fb keeps a fence already set, so the commit waits for this one. */
+            if (kf && ps->fence == NULL)
+                ps->fence = dma_fence_get(kf);
             cs = drm_atomic_get_crtc_state(state, flip.crtc);
             if (IS_ERR(cs)) {
                 e = PTR_ERR(cs);
@@ -689,6 +740,13 @@ deadlk:
     }
     drm_modeset_drop_locks(&ctx);
     drm_modeset_acquire_fini(&ctx);
+    if (kf) {
+        if (!e && commit) {
+            ((struct nmx_flipreq2 *)r)->fenced = 1;
+            __atomic_add_fetch(&gNmxFlipFenced, 1, __ATOMIC_RELAXED);
+        }
+        dma_fence_put(kf);
+    }
 
     spin_lock(&flip.lock);
     if (e || !commit) {
@@ -720,6 +778,8 @@ static uint32_t flip_status(struct nmx_flipreq *r)
     r->pending = flip.pending;
     r->generation = flip.gen;
     spin_unlock(&flip.lock);
+    if (r->version >= 2)
+        ((struct nmx_flipreq2 *)r)->latchNs = flip.latch_t;
     r->vblankCount = drm_crtc_vblank_count_and_time(flip.crtc, &t);
     r->vblankNs = (uint64_t)ktime_to_ns(t);
     return FLIP_R_OK;
@@ -916,7 +976,7 @@ long long nmx_fb_flip_call(const char *name, void *req)
         return -1;
     fn = !strcmp(name, "nmxFlipStatus") ? 5 : !strcmp(name, "nmxFlipSubmit") ? 4 : !strcmp(name, "nmxFlipCaps") ? 0 :
          !strcmp(name, "nmxFlipBuffers") ? 2 : !strcmp(name, "nmxFlipRelease") ? 3 :
-         !strcmp(name, "nmxFlipImport") ? 1 : -1;
+         !strcmp(name, "nmxFlipImport") ? 1 : !strcmp(name, "nmxFlipNotify") ? 6 : -1;
     if (fn < 0)
         return -1;
     {
@@ -926,7 +986,7 @@ long long nmx_fb_flip_call(const char *name, void *req)
             nmx_xnu_stage(name);
         }
     }
-    if (!r || r->version != 1)
+    if (!r || (r->version != 1 && r->version != 2) || (fn == 6 && r->version < 2))
         return FLIP_R_BADARG;
     if (!flip_init())
         return FLIP_R_NOTREADY;
@@ -938,6 +998,12 @@ long long nmx_fb_flip_call(const char *name, void *req)
         if (flip_gpu_vm(flip.nfb)) {
             r->caps |= 2u | 0x200u;
             r->maxImports = FLIP_NIMP;
+        }
+        if (r->version >= 2) {
+            if (__atomic_load_n(&nmx_flip_kfence, __ATOMIC_RELAXED))
+                r->caps |= FLIP_CAP_FENCE;
+            if (__atomic_load_n(&nmx_flip_irq, __ATOMIC_RELAXED))
+                r->caps |= FLIP_CAP_NOTIFY;
         }
         r->width = flip.nfb->info.width;
         r->height = flip.nfb->info.height;
@@ -961,6 +1027,16 @@ long long nmx_fb_flip_call(const char *name, void *req)
     }
     case 4:
         return flip_submit(r);
+    case 6: {
+        struct nmx_flipreq2 *r2 = (struct nmx_flipreq2 *)r;
+
+        spin_lock(&flip.lock);
+        __atomic_store_n(&flip.notify, NULL, __ATOMIC_RELEASE);
+        flip.notify_ref = r2->refcon;
+        __atomic_store_n(&flip.notify, r2->notify, __ATOMIC_RELEASE);
+        spin_unlock(&flip.lock);
+        return FLIP_R_OK;
+    }
     default:
         return flip_status(r);
     }
@@ -1067,6 +1143,8 @@ void nmx_ft_armed(struct drm_crtc *crtc, int idle_allowed)
 void nmx_ft_pflip(struct drm_crtc *crtc)
 {
     struct nmx_ft_rec *r;
+    if (__atomic_load_n(&flip.inited, __ATOMIC_ACQUIRE) && crtc == flip.crtc)
+        __atomic_store_n(&flip.pflip_t, mach_absolute_time(), __ATOMIC_RELEASE);   /* out-31 row 3: latch time */
     if (!ft_is_panel(crtc))
         return;
     __atomic_fetch_add(&ft.pflip_irqs, 1, __ATOMIC_RELAXED);
@@ -1076,6 +1154,7 @@ void nmx_ft_pflip(struct drm_crtc *crtc)
         r->vbl_pflip = (uint32_t)drm_crtc_vblank_count(crtc);
     }
 }
+
 
 void nmx_ft_vblank(struct drm_crtc *crtc)
 {
@@ -1201,4 +1280,108 @@ int nmx_ft_format(char *buf, size_t size)
     }
 #undef FT_P
     return (int)(o < size ? o : size);
+}
+
+/* ---- out-31 row 1: the render fence travels in the kernel ----------------------------------------------------------
+ *
+ * Linux: amdgpu_cs_submit() adds the job fence to every BO's dma_resv; a KMS client's atomic commit takes the fb's
+ * implicit fence (drm_gem_plane_helper_prepare_fb -> drm_atomic_set_fence_for_plane) and commit_tail waits for it
+ * (drm_atomic_helper_wait_for_fences) before programming the flip. Here the scan-out buffer is an IOSurface imported
+ * by handle, not a GEM object with a shared dma_resv, so the CS ioctl records, per IOSurface ID, the last job that used
+ * a userptr BO wired from that surface (amdgpu-nmx-surface-fence.patch -> nmx_surf_fence_set) and flip_submit attaches
+ * that fence to the plane state: the same wait, in the same place, as Linux. NMXAccel no longer polls the IOSurface's
+ * NMXFenceDone property and the plugin no longer has to publish it before the flip.
+ *
+ * Conservative: the recorded fence is the LAST job that referenced the surface, read or write. Waiting for a read job
+ * as well delays the flip by at most that job; it never shows an unfinished frame. 64 surfaces, least recently set out.
+ */
+#define SF_N 64
+static struct {
+    volatile int lock;
+    uint64_t tick;
+    struct { uint32_t sid; uint64_t use, set_ns; struct dma_fence *f; } e[SF_N];
+} sf;
+
+static void sf_lock(void)
+{
+    while (__atomic_exchange_n(&sf.lock, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&sf.lock, __ATOMIC_RELAXED))
+            cpu_relax();
+}
+
+static void sf_unlock(void)
+{
+    __atomic_store_n(&sf.lock, 0, __ATOMIC_RELEASE);
+}
+
+/* amdgpu_cs_submit, after the job fence exists: called once per userptr BO of the job that came from an IOSurface */
+void nmx_surf_fence_set(uint32_t sid, struct dma_fence *fence)
+{
+    struct dma_fence *old = NULL;
+    int i, slot = 0;
+
+    if (sid == 0 || fence == NULL || !__atomic_load_n(&nmx_flip_kfence, __ATOMIC_RELAXED))
+        return;
+    fence = dma_fence_get(fence);
+    sf_lock();
+    for (i = 0; i < SF_N; i++) {
+        if (sf.e[i].sid == sid) { slot = i; break; }
+        if (sf.e[i].use < sf.e[slot].use)
+            slot = i;
+    }
+    old = sf.e[slot].f;
+    sf.e[slot].sid = sid;
+    sf.e[slot].f = fence;
+    sf.e[slot].use = ++sf.tick;
+    sf.e[slot].set_ns = mach_absolute_time();
+    sf_unlock();
+    if (old)
+        dma_fence_put(old);
+    __atomic_add_fetch(&gNmxSurfFenceSet, 1, __ATOMIC_RELAXED);
+}
+
+/*
+ * A reference to the surface's last job fence, or NULL when none is known (never submitted through CS, aged out) or
+ * the last one was recorded before `after` (the caller's frame was committed later, so that job is an older frame's:
+ * its own CS has not reached the kernel yet and waiting for the older one would flip an unfinished frame).
+ */
+static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *set_ns)
+{
+    struct dma_fence *f = NULL;
+    int i;
+
+    if (sid == 0)
+        return NULL;
+    sf_lock();
+    for (i = 0; i < SF_N; i++)
+        if (sf.e[i].sid == sid) {
+            if (sf.e[i].set_ns >= after) {
+                f = dma_fence_get(sf.e[i].f);
+                *set_ns = sf.e[i].set_ns;
+            }
+            break;
+        }
+    sf_unlock();
+    return f;
+}
+
+/* ---- out-31 row 3: flip completion from the pageflip IRQ -----------------------------------------------------------
+ *
+ * Linux: dm_pflip_high_irq sends the DRM event (drm_crtc_send_vblank_event) and completes the commit's flip_done; a
+ * compositor wakes on that event. amdgpu-dm-nmx-flipdone.patch calls this right after, on the IH thread, and NMXAccel's
+ * callback only kicks its thread call (no locks, no sleeping here). The time handed over is the pageflip IRQ's
+ * mach_absolute_time, which NMXAccel writes into the IOAccel transaction where the family leaves it 0.
+ */
+void nmx_fb_flip_done(struct drm_crtc *crtc)
+{
+    void (*fn)(void *, uint64_t, uint64_t);
+
+    if (!__atomic_load_n(&flip.inited, __ATOMIC_ACQUIRE) || crtc != flip.crtc ||
+        !__atomic_load_n(&nmx_flip_irq, __ATOMIC_RELAXED))
+        return;
+    fn = __atomic_load_n(&flip.notify, __ATOMIC_ACQUIRE);
+    if (fn == NULL)
+        return;
+    __atomic_add_fetch(&gNmxFlipNotified, 1, __ATOMIC_RELAXED);
+    fn(flip.notify_ref, __atomic_load_n(&flip.seq_sub, __ATOMIC_RELAXED), __atomic_load_n(&flip.pflip_t, __ATOMIC_ACQUIRE));
 }

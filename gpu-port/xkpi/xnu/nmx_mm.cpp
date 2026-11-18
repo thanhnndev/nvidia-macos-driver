@@ -245,6 +245,7 @@ struct UserWire {
     uint8_t surface;        /* the IOSurface's own descriptor */
     uint8_t parked;         /* complete()d while the descriptor is still held */
     char who[22];           /* process that made the wiring */
+    uint32_t sid;           /* out-31 row 1: the IOSurface ID of a surface wiring (0 = plain range) */
 };
 static UserWire *gWires;
 static IOLock *gWireLock;
@@ -449,6 +450,8 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
             int sr = surf_wire(task, sid, uaddr, npages, write, phys, handle);
             nmx_ft_stall(4, surf_t0, npages);
             if (sr == 0) {
+                if (*handle != nullptr)
+                    ((UserWire *)*handle)->sid = sid;
                 (void)hint_find(task, uaddr, (uint64_t)npages * PAGE_SIZE, true);
                 __atomic_add_fetch(&gNmxSurfWire, 1, __ATOMIC_RELAXED);
                 if (mm != nullptr)
@@ -591,6 +594,13 @@ extern "C" int nmx_xnu_user_park(void *handle)
     IOLockUnlock(gWireLock);
     w->md->complete();
     return 0;
+}
+
+/* out-31 row 1: the IOSurface a wiring belongs to (nmx_upin_sid -> amdgpu_ttm_tt_nmx_sid -> CS fence record) */
+extern "C" uint32_t nmx_xnu_user_sid(void *handle)
+{
+    UserWire *w = (UserWire *)handle;
+    return w != nullptr ? w->sid : 0;
 }
 
 /*

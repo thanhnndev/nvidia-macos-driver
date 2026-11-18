@@ -953,6 +953,13 @@ void nmx_upin_put_pages(void *p, vm_page_t *pages, int npages)
     }
 }
 
+uint32_t nmx_xnu_user_sid(void *handle);    /* xnu/nmx_mm.cpp */
+uint32_t nmx_upin_sid(void *p)
+{
+    struct user_pin *pin = p;
+    return pin != NULL ? nmx_xnu_user_sid(pin->handle) : 0;
+}
+
 int nmx_upin_parkable(void *p)
 {
     struct user_pin *pin = p;
