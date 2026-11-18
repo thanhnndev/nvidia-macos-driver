@@ -32,6 +32,7 @@ typedef struct { void *rp; void *pipe; void *layout; int has_depth; uint32_t dfm
     uint64_t bmask[4]; uint32_t bmask_ok;
     uint64_t gmask[2][4]; uint32_t gmask_ok;
     uint32_t ag_mask, ag_req; void *ag_src; size_t ag_srcn; void *ag_safe;
+    uint32_t kd_mask; void *kd_safe;   /* buffers the module keeps on descriptors; its all-lowered variant (see nvmtl_kept_pick) */
     uint64_t shape_identity;
     uint32_t lin;
     uint64_t tbm[2][4]; uint32_t tbany;

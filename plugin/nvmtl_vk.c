@@ -2345,7 +2345,26 @@ int nvmtl_vk_image_create(uint32_t w, uint32_t h, nvk_image *out) { return nvmtl
 #define NVMTL_ADDRESS_BINDING_NUMBER 640
 #define NVMTL_BINDING_NUMBER(i) ((i) == NVMTL_ADDRESS_BINDING ? NVMTL_ADDRESS_BINDING_NUMBER : \
                                  (i) >= NVMTL_STEX_BASE ? NVMTL_STEX_BINDING_NUMBER + ((i) - NVMTL_STEX_BASE) : (i))
-#define NVMTL_SSBO_ALIGN 16
+/* A storage-buffer descriptor's offset must be a multiple of minStorageBufferOffsetAlignment: 16 on NVIDIA, where this
+ * plugin began, 4 on RADV. Metal binds a buffer at any multiple of its element size, so a slot off this grid gets the
+ * dummy descriptor. Its data is still reachable through the address table, but only from a module that address lowering
+ * moved to that table; a buffer the translator keeps on its descriptor (data-indexed runtime array) then reads zeros,
+ * and a compute dispatch switches to the module's all-lowered variant instead (nvmtl_kept_pick). */
+static uint32_t nvmtl_ssbo_align(void)
+{
+    static uint32_t a;
+    if (!a) {
+        const VkDeviceSize d = g_lim.minStorageBufferOffsetAlignment;
+        const char *e = getenv("NVMTL_SSBO_ALIGN");
+        uint32_t v = e ? (uint32_t)strtoul(e, NULL, 0) : (uint32_t)d;
+        if (!v || (v & (v - 1)) || v > 256 || v < d) v = d && !(d & (d - 1)) && d <= 256 ? (uint32_t)d : 16;
+        a = v;
+        nvlog("vk: storage-buffer descriptors take offsets that are multiples of %u (device minStorageBufferOffsetAlignment %llu, NVMTL_SSBO_ALIGN=%s; was a fixed 16)",
+              a, (unsigned long long)d, e ? e : "unset");
+    }
+    return a;
+}
+#define NVMTL_SSBO_ALIGN nvmtl_ssbo_align()
 #define NVMTL_NSTEX 128
 #define NVMTL_STEX_BASE (NVMTL_ADDRESS_BINDING + 1)
 #define NVMTL_STEX_BINDING_NUMBER 480
@@ -3381,7 +3400,8 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
                 bi[i] = (VkDescriptorBufferInfo){ (VkBuffer)sl->h, sl->off, VK_WHOLE_SIZE }; pb = &bi[i];
                 if (c->audit || nvmtl_bl_audit_on()) nvmtl_audit_used(c, sl->h, sl->who, which * 1000 + i);
             } else {
-                if (sl && sl->kind == NVMTL_SLOT_BUF) { static int said; if (!said++) nvlog("vk: buffer slot %u is bound at offset %zu, not a multiple of %d — reachable only through the address table", i, sl->off, NVMTL_SSBO_ALIGN); }
+                if (sl && sl->kind == NVMTL_SLOT_BUF) { static _Atomic unsigned said; const unsigned k = atomic_fetch_add(&said, 1) + 1;
+                    if (k <= 4 || !(k & (k - 1))) nvlog("vk: buffer slot %u is bound at offset %zu, not a multiple of %u - its descriptor is the dummy, the address table carries it (%u so far; a module that keeps this buffer on its descriptor reads zeros unless nvmtl_kept_pick switched it)", i, sl->off, NVMTL_SSBO_ALIGN, k); }
                 pb = &dummyB;
             }
         } else if (ty == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
@@ -3826,6 +3846,7 @@ static int nvmtl_spirv_ssbo_table(const void *spv, size_t n)
         i += len; }
     return 0;
 }
+#define NVMTL_LOWER_ALL 16u   /* translator flag: lower every buffer, also the ones kept on descriptors */
 static _Atomic unsigned long long g_g1_refused;
 static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info);
 static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info);
@@ -3869,7 +3890,7 @@ static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t fl
     }
     uint8_t *out = NULL; size_t n = 0; char err[512] = {0};
     const int ubo = nvmtl_table_ubo();
-    const int ex = xlate_lower_ex && (nvmtl_align_guard_on() || ubo);
+    const int ex = xlate_lower_ex && (nvmtl_align_guard_on() || ubo || (flags & NVMTL_LOWER_ALL));
     if (ex ? xlate_lower_ex(data, len, flags | (ubo ? 2u : 0u), &out, &n, info, err, sizeof err) : xlate_lower(data, len, &out, &n, err, sizeof err)) {
         if (info) memset(info, 0, 4 * sizeof *info);
         if (said++ < 40) nvlog("address lowering REFUSED, shader kept as-is: %s", err);
@@ -4734,11 +4755,17 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     if (!g_heapSet && nvmtl_spirv_uses_set(cs, n / 4, 2)) {
         nvlog("vk: compute pipeline REFUSED - the kernel indexes the bindless heap (set 2) and this device has none"); return -1; }
     memset(out, 0, sizeof *out);
-    if (!(flags & 1) && ag[0]) {
+    uint32_t kd = 0;   /* buffers this module keeps on descriptors (data-indexed runtime arrays, translator kept_roots) */
+    if (!(flags & NVMTL_LOWER_ALL) && xlate_kept_mask && xlate_kept_mask(ag_src, ag_srcn, &kd)) kd = 0;
+    if ((!(flags & 1) && ag[0]) || kd) {
         if (!(out->ag_src = malloc(ag_srcn))) { nvlog("align guard: out of memory keeping a module's source - pipeline REFUSED"); return -1; }
-        memcpy(out->ag_src, ag_src, ag_srcn); out->ag_srcn = ag_srcn; out->ag_mask = ag[0]; out->ag_req = ag[1] >= 8 ? ag[1] : 8;
+        memcpy(out->ag_src, ag_src, ag_srcn); out->ag_srcn = ag_srcn;
+    }
+    if (!(flags & 1) && ag[0]) {
+        out->ag_mask = ag[0]; out->ag_req = ag[1] >= 8 ? ag[1] : 8;
         atomic_fetch_add(&g_ag_guarded, 1);
     }
+    out->kd_mask = kd;
     if (!nvmtl_spirv_ok(cs, n, "compute module")) return -1;
     out->stex_hi[0] = nvmtl_spirv_stex_hi(cs, n);
     nvmtl_spirv_texel_mask(cs, n, out->tbm[0]); memset(out->tbm[1], 0, sizeof out->tbm[1]);
@@ -4787,8 +4814,45 @@ int nvmtl_vk_tg_reject(const uint32_t l[3], const uint32_t *t, const char *kerne
 }
 static pthread_mutex_t g_var_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_ag_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned long long g_kd_switched, g_kd_built;
+/* A kernel that keeps buffer b on its descriptor reads zeros when b is bound off the descriptor offset grid (the dummy
+ * descriptor, see nvmtl_ssbo_align): ANGLE's index re-pack kernel reads a ushort index buffer at byte 438 for Google
+ * Maps' line draws. Such a dispatch runs the module built with every buffer lowered to the address table (translator
+ * LOWER_ALL), which reads the binding exactly, as Metal does. That variant loses the descriptor's bounds check for this
+ * dispatch only; without it the kernel read nothing at all. */
+static nvk_pipeline *nvmtl_kept_pick(nvk_cmdbuf *c, nvk_pipeline *p)
+{
+    if (!p->kd_mask) return p;
+    const nvmtl_bindtable *t = (const nvmtl_bindtable *)c->table;
+    const uint32_t a = NVMTL_SSBO_ALIGN;
+    int bad = -1; size_t off = 0;
+    for (uint32_t b = 0; b < 32 && b < NVMTL_NBUF; b++) {
+        if (!(p->kd_mask & (1u << b))) continue;
+        const nvmtl_slot *s = t ? &t->s[0][b] : NULL;
+        if (s && s->kind == NVMTL_SLOT_BUF && (s->off % a)) { bad = (int)b; off = s->off; break; }
+    }
+    if (bad < 0) return p;
+    pthread_mutex_lock(&g_ag_lock);
+    nvk_pipeline *kp = (nvk_pipeline *)p->kd_safe;
+    if (!kp && p->ag_src) {
+        kp = calloc(1, sizeof *kp);
+        if (kp && nvmtl_vk_compute_pipeline_create_g(p->ag_src, p->ag_srcn, 1 | NVMTL_LOWER_ALL, kp)) { free(kp); kp = NULL; }
+        p->kd_safe = kp;
+        const unsigned long long k = atomic_fetch_add(&g_kd_built, 1) + 1;
+        if (k <= 16 || !(k & (k - 1)))
+            nvlog("kept descriptors: buffer %d (kept on its descriptor, mask %#x) is bound at offset %zu, not a multiple of %u - %s (%llu kernels so far)", bad, p->kd_mask, off, a,
+                  kp ? "this kernel now runs its all-lowered module on such bindings" : "all-lowered module FAILED - the dispatch keeps the dummy descriptor and reads zeros", k);
+    }
+    pthread_mutex_unlock(&g_ag_lock);
+    if (!kp) return p;
+    const unsigned long long k = atomic_fetch_add(&g_kd_switched, 1) + 1;
+    if (!(k & (k - 1))) nvlog("kept descriptors: %llu dispatch(es) ran an all-lowered module (%llu kernels)", k, (unsigned long long)atomic_load(&g_kd_built));
+    return kp;
+}
 static nvk_pipeline *nvmtl_align_guard_pick(nvk_cmdbuf *c, nvk_pipeline *p)
 {
+    nvk_pipeline *kp = nvmtl_kept_pick(c, p);
+    if (kp != p) return kp;   /* built SAFE (flag 1) as well, so it carries no promise to guard */
     if (!p->ag_mask) return p;
     const nvmtl_bindtable *t = (const nvmtl_bindtable *)c->table;
     const uint64_t m = (uint64_t)p->ag_req - 1;
@@ -8499,8 +8563,10 @@ void nvmtl_vk_pipeline_destroy(nvk_pipeline *p)
     nvmtl_destroy_pipe_once(seen, &nseen, 64, (VkPipeline)p->pipe);
     pthread_mutex_lock(&g_ag_lock);
     nvk_pipeline *safe = (nvk_pipeline *)p->ag_safe; p->ag_safe = NULL;
+    nvk_pipeline *kept = (nvk_pipeline *)p->kd_safe; p->kd_safe = NULL;
     pthread_mutex_unlock(&g_ag_lock);
     if (safe) { nvmtl_vk_pipeline_destroy(safe); free(safe); }
+    if (kept) { nvmtl_vk_pipeline_destroy(kept); free(kept); }
     pthread_mutex_lock(&g_rpv_lock);
     for (uint32_t i = 1; i < 4; i++) if (p->rpv[i] && p->rpv[i] != p->rp) pvkDestroyRenderPass(g_dev, (VkRenderPass)p->rpv[i], NULL);
     for (uint32_t i = 0; i < p->nrpx; i++) if (p->rpx[i] && p->rpx[i] != p->rp) pvkDestroyRenderPass(g_dev, (VkRenderPass)p->rpx[i], NULL);

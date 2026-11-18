@@ -45,6 +45,8 @@ typedef int (*nvmtl_lower_fn)(const uint8_t *, size_t, uint8_t **, size_t *, cha
 static nvmtl_lower_fn xlate_lower;
 typedef int (*nvmtl_lower_ex_fn)(const uint8_t *, size_t, uint32_t, uint8_t **, size_t *, uint32_t *, char *, size_t);
 static nvmtl_lower_ex_fn xlate_lower_ex;
+typedef int (*nvmtl_kept_mask_fn)(const uint8_t *, size_t, uint32_t *);
+static nvmtl_kept_mask_fn xlate_kept_mask;   /* bindings address lowering keeps on descriptors (translator LOWER_ALL = 16 lowers them too) */
 static nvmtl_translate_fn xlate;
 static char gXlateTag[80] = "untagged";
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
@@ -114,6 +116,7 @@ static int nvmtl_xlate_ready(void) {
                 xlate ? "" : " - it has NO nvmtl_translate"); }
         xlate_lower = (nvmtl_lower_fn)dlsym(h, "nvmtl_lower_buffer_addresses");
         xlate_lower_ex = (nvmtl_lower_ex_fn)dlsym(h, "nvmtl_lower_buffer_addresses_ex");
+        xlate_kept_mask = (nvmtl_kept_mask_fn)dlsym(h, "nvmtl_kept_descriptor_mask");
         xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
         xlate_sampler = (nvmtl_sampler_fn)dlsym(h, "nvmtl_translate_samplers");
         xlate_tglen = (nvmtl_tglen_fn)dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
