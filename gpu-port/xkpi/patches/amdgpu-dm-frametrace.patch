@@ -1,0 +1,76 @@
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -436,6 +436,14 @@
+  * Handles the pageflip interrupt by notifying all interested parties
+  * that the pageflip has been completed.
+  */
++/*
++ * ga403wm frame-path trace (FRAME-PATH.md section 7): per-frame stage stamps. The hooks live in the display bridge
++ * (override/src/nmx_fb_bridge.c, nmx_ft_*) and only take a timestamp and the vblank count; they never sleep.
++ */
++void nmx_ft_pflip(struct drm_crtc *crtc);
++void nmx_ft_vblank(struct drm_crtc *crtc);
++void nmx_ft_armed(struct drm_crtc *crtc, int idle_allowed);
++
+ static void dm_pflip_high_irq(void *interrupt_params)
+ {
+ 	struct amdgpu_crtc *amdgpu_crtc;
+@@ -455,6 +463,7 @@
+ 		drm_dbg_state(dev, "CRTC is null, returning.\n");
+ 		return;
+ 	}
++	nmx_ft_pflip(&amdgpu_crtc->base);
+ 
+ 	spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
+ 
+@@ -611,6 +620,7 @@
+ 	acrtc = get_crtc_by_otg_inst(adev, irq_params->irq_src - IRQ_TYPE_VBLANK);
+ 	if (!acrtc)
+ 		return;
++	nmx_ft_vblank(&acrtc->base);
+ 
+ 	if (acrtc->wb_conn) {
+ 		spin_lock_irqsave(&acrtc->wb_conn->job_lock, flags);
+@@ -3140,6 +3150,29 @@
+ 		    fw->ips1_exit_count, fw->ips2_entry_count, fw->ips2_exit_count);
+ 	else
+ 		printf("NullMoth ips: %s: no DMUB shared state (firmware without IPS signals)\n", where);
++}
++
++/* ga403wm frame-path trace: the DMUB IPS counters (rcg, ips1, ips2 entry/exit) and idle_optimizations_allowed, read
++ * from the shared state without waking the DMCUB. Returns -1 without DMUB IPS state. */
++int nmx_dm_ips_counts(struct drm_device *ddev, u32 out[7]);
++int nmx_dm_ips_counts(struct drm_device *ddev, u32 out[7])
++{
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++	struct dc *dc = adev->dm.dc;
++	struct dc_dmub_srv *ds = (dc && dc->ctx) ? dc->ctx->dmub_srv : NULL;
++	volatile struct dmub_shared_state_ips_fw *fw;
++
++	if (ds == NULL || ds->dmub == NULL || ds->dmub->shared_state == NULL)
++		return -1;
++	fw = &ds->dmub->shared_state[DMUB_SHARED_SHARE_FEATURE__IPS_FW].data.ips_fw;
++	out[0] = fw->rcg_entry_count;
++	out[1] = fw->rcg_exit_count;
++	out[2] = fw->ips1_entry_count;
++	out[3] = fw->ips1_exit_count;
++	out[4] = fw->ips2_entry_count;
++	out[5] = fw->ips2_exit_count;
++	out[6] = dc->idle_optimizations_allowed ? 1 : 0;
++	return 0;
+ }
+ 
+ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+@@ -8837,7 +8870,12 @@
+ 
+ 	/* Set the flip status */
+ 	acrtc->pflip_status = AMDGPU_FLIP_SUBMITTED;
++	{
++		struct amdgpu_device *ft_adev = drm_to_adev(acrtc->base.dev);
+ 
++		nmx_ft_armed(&acrtc->base, ft_adev->dm.dc ? (int)ft_adev->dm.dc->idle_optimizations_allowed : -1);
++	}
++
+ 	/* Mark this event as consumed */
+ 	acrtc->base.state->event = NULL;
+ 

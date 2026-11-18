@@ -182,6 +182,22 @@ static int nmx_pin_by_proc_sysctl SYSCTL_HANDLER_ARGS
     return sysctl_handle_string(oidp, buf, sizeof buf, req);
 }
 extern "C" int nmx_userwire_format(char *buf, size_t size);
+/* frame-path trace (FRAME-PATH.md section 7): per-flip stage stamps, vblank/VBL-timer phase, DMUB IPS counters */
+extern "C" int nmx_ft_format(char *buf, size_t size);
+static int nmx_frametrace_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 96 * 1024;
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = nmx_ft_format(buf, size);
+    if (n < 0) n = 0;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_frametrace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_frametrace_sysctl, "A",
+            "frame-path trace: last 512 flips (submit, commit return, armed, pageflip IRQ, status seen), vblank, VBL timer phase, IPS");
 static int nmx_userwire_by_kind_sysctl SYSCTL_HANDLER_ARGS
 {
     char buf[1024];
@@ -325,6 +341,7 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_userwire_count);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_pages);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_by_kind);
+    sysctl_register_oid(&sysctl__debug_nmx_frametrace);
     sysctl_register_oid(&sysctl__debug_nmx_surfwire_count);
     sysctl_register_oid(&sysctl__debug_nmx_surfwire_pages);
     sysctl_register_oid(&sysctl__debug_nmx_userwire_parked);

@@ -600,12 +600,17 @@ static uint32_t flip_buffers(struct nmx_flipreq *r)
     return flip.nbuf > 1 ? FLIP_R_OK : FLIP_R_ERROR;
 }
 
+static void ft_submit_begin(uint32_t handle);
+static void ft_submit_end(uint64_t seq, int ok);
+static void ft_seen(void);
+
 /* lock held. Retire a pending flip whose commit has signalled flip_done; notice a bridge commit. */
 static void flip_refresh(void)
 {
     if (flip.commit && __atomic_load_n(&flip.commit->flip_done.done, __ATOMIC_ACQUIRE)) {
         drm_crtc_commit_put(flip.commit);
         flip.commit = NULL;
+        ft_seen();
         flip.cur = flip.pending;
         flip.pending = FLIP_NONE;
         flip.seq_lat = flip.seq_sub;
@@ -647,6 +652,7 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
     }
     flip.pending = h;           /* reserved; status reports it pending from here */
     spin_unlock(&flip.lock);
+    ft_submit_begin(h);
 
     drm_modeset_acquire_init(&ctx, 0);
     state = drm_atomic_state_alloc(flip.nfb->client.dev);
@@ -690,6 +696,7 @@ deadlk:
         if (commit)
             drm_crtc_commit_put(commit);
         spin_unlock(&flip.lock);
+        ft_submit_end(0, 0);
         FLIP_LOG("NMX flip: submit of handle %u failed (%d%s)\n", h, e, e ? "" : ", no commit");
         r->err = e ? e : -EINVAL;
         return e == -EBUSY ? FLIP_R_BUSY : FLIP_R_ERROR;
@@ -697,6 +704,7 @@ deadlk:
     flip.commit = commit;
     r->seq = ++flip.seq_sub;
     spin_unlock(&flip.lock);
+    ft_submit_end(r->seq, 1);
     return FLIP_R_OK;
 }
 
@@ -956,4 +964,161 @@ long long nmx_fb_flip_call(const char *name, void *req)
     default:
         return flip_status(r);
     }
+}
+
+/* ---- frame-path trace (ga403wm, docs/FRAME-PATH.md section 7) ------------------------------------------------------
+ *
+ * One record per flip of the panel CRTC, stamped with mach_absolute_time (ns on x86) at each stage:
+ *   sub0   flip_submit entered (NMXAccel's performTransaction thread)      sub1  drm_atomic_nonblocking_commit returned
+ *   armed  prepare_flip_isr in amdgpu_dm_commit_planes (commit worker)     pflip dm_pflip_high_irq (IH work-loop thread)
+ *   seen   the first nmxFlipStatus that saw flip_done (NMXAccel's poll)
+ * plus the vblank counts at armed and pflip (pflip - armed > 1 = the flip missed its first vblank) and whether DC idle
+ * optimisations (IPS) were allowed when the flip was armed. Hardware vblanks are counted and the last one is kept, so the
+ * IOFramebuffer VBL timer (nmx_fb.cpp vblFire) can record its phase against the real vblank (16-bin histogram over the
+ * frame period; "stale" = the vblank IRQ was off when the timer fired). Read with: sysctl -n debug.nmx_frametrace
+ * Writes are lock-free and racy by design (trace only); nothing here sleeps or takes a lock.
+ */
+extern uint64_t mach_absolute_time(void);
+int nmx_dm_ips_counts(struct drm_device *ddev, u32 out[7]);
+
+#define FT_N 512u
+struct nmx_ft_rec {
+    uint64_t seq, sub0, sub1, armed, pflip, seen;
+    uint32_t handle, vbl_armed, vbl_pflip;
+    int32_t idle;
+};
+static struct {
+    struct nmx_ft_rec r[FT_N];
+    uint64_t head;                  /* records written */
+    uint64_t cur;                   /* index + 1 of the flip in flight, 0 = none */
+    uint64_t vbl_irqs, pflip_irqs, armed_n, last_vbl_ns, last_vbl_cnt;
+    uint64_t timer_fires, timer_stale, timer_bins[16];
+    uint64_t frame_ns;
+} ft;
+
+static int ft_is_panel(struct drm_crtc *crtc)
+{
+    return __atomic_load_n(&flip.inited, __ATOMIC_ACQUIRE) && crtc == flip.crtc;
+}
+
+static struct nmx_ft_rec *ft_cur(void)
+{
+    uint64_t c = __atomic_load_n(&ft.cur, __ATOMIC_ACQUIRE);
+    return c ? &ft.r[(c - 1) % FT_N] : NULL;
+}
+
+/* flip_submit entry: a new record */
+static void ft_submit_begin(uint32_t handle)
+{
+    uint64_t i = __atomic_fetch_add(&ft.head, 1, __ATOMIC_ACQ_REL);
+    struct nmx_ft_rec *r = &ft.r[i % FT_N];
+    memset(r, 0, sizeof(*r));
+    r->handle = handle;
+    r->idle = -2;
+    r->sub0 = mach_absolute_time();
+    __atomic_store_n(&ft.cur, i + 1, __ATOMIC_RELEASE);
+}
+
+static void ft_submit_end(uint64_t seq, int ok)
+{
+    struct nmx_ft_rec *r = ft_cur();
+    if (!r)
+        return;
+    r->sub1 = mach_absolute_time();
+    r->seq = ok ? seq : 0;
+    if (!ok)
+        __atomic_store_n(&ft.cur, 0, __ATOMIC_RELEASE);
+}
+
+/* flip_refresh retired the flip */
+static void ft_seen(void)
+{
+    struct nmx_ft_rec *r = ft_cur();
+    if (r && !r->seen)
+        r->seen = mach_absolute_time();
+    __atomic_store_n(&ft.cur, 0, __ATOMIC_RELEASE);
+}
+
+void nmx_ft_armed(struct drm_crtc *crtc, int idle_allowed)
+{
+    struct nmx_ft_rec *r;
+    if (!ft_is_panel(crtc))
+        return;
+    __atomic_fetch_add(&ft.armed_n, 1, __ATOMIC_RELAXED);
+    r = ft_cur();
+    if (r && !r->armed) {
+        r->armed = mach_absolute_time();
+        r->vbl_armed = (uint32_t)drm_crtc_vblank_count(crtc);
+        r->idle = idle_allowed;
+    }
+}
+
+void nmx_ft_pflip(struct drm_crtc *crtc)
+{
+    struct nmx_ft_rec *r;
+    if (!ft_is_panel(crtc))
+        return;
+    __atomic_fetch_add(&ft.pflip_irqs, 1, __ATOMIC_RELAXED);
+    r = ft_cur();
+    if (r && r->armed && !r->pflip) {
+        r->pflip = mach_absolute_time();
+        r->vbl_pflip = (uint32_t)drm_crtc_vblank_count(crtc);
+    }
+}
+
+void nmx_ft_vblank(struct drm_crtc *crtc)
+{
+    if (!ft_is_panel(crtc))
+        return;
+    __atomic_store_n(&ft.last_vbl_ns, mach_absolute_time(), __ATOMIC_RELEASE);
+    __atomic_store_n(&ft.last_vbl_cnt, drm_crtc_vblank_count(crtc), __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ft.vbl_irqs, 1, __ATOMIC_RELAXED);
+}
+
+/* nmx_fb.cpp vblFire: where in the real frame the IOFramebuffer VBL timer fired */
+void nmx_ft_vbl_timer(uint64_t frame_ns)
+{
+    uint64_t now = mach_absolute_time(), last = __atomic_load_n(&ft.last_vbl_ns, __ATOMIC_ACQUIRE);
+    __atomic_fetch_add(&ft.timer_fires, 1, __ATOMIC_RELAXED);
+    ft.frame_ns = frame_ns;
+    if (!frame_ns || !last || now < last || now - last > 2 * frame_ns) {
+        __atomic_fetch_add(&ft.timer_stale, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    __atomic_fetch_add(&ft.timer_bins[((now - last) % frame_ns) * 16 / frame_ns], 1, __ATOMIC_RELAXED);
+}
+
+/* debug.nmx_frametrace: a text dump, newest record last; times relative to sub0 in microseconds */
+int nmx_ft_format(char *buf, size_t size)
+{
+    size_t o = 0;
+    u32 ips[7] = {0};
+    int have_ips = (flip.nfb != NULL) ? nmx_dm_ips_counts(flip.nfb->client.dev, ips) : -1;
+    uint64_t head = __atomic_load_n(&ft.head, __ATOMIC_ACQUIRE), n = head < FT_N ? head : FT_N;
+
+#define FT_P(...) do { if (o < size) o += (size_t)snprintf(buf + o, size - o, __VA_ARGS__); } while (0)
+    FT_P("flips %llu vblank_irqs %llu pflip_irqs %llu armed %llu last_vblank_ns %llu count %llu\n",
+         (unsigned long long)head, (unsigned long long)ft.vbl_irqs, (unsigned long long)ft.pflip_irqs,
+         (unsigned long long)ft.armed_n, (unsigned long long)ft.last_vbl_ns, (unsigned long long)ft.last_vbl_cnt);
+    FT_P("vbl_timer fires %llu stale %llu frame_ns %llu phase16", (unsigned long long)ft.timer_fires,
+         (unsigned long long)ft.timer_stale, (unsigned long long)ft.frame_ns);
+    for (int i = 0; i < 16; i++)
+        FT_P(" %llu", (unsigned long long)ft.timer_bins[i]);
+    FT_P("\n");
+    if (have_ips == 0)
+        FT_P("ips rcg %u/%u ips1 %u/%u ips2 %u/%u idle_allowed %u\n", ips[0], ips[1], ips[2], ips[3], ips[4], ips[5],
+             ips[6]);
+    else
+        FT_P("ips none\n");
+    FT_P("seq handle sub0_ns sub1_us armed_us pflip_us seen_us vbl_armed vbl_pflip idle\n");
+    for (uint64_t k = head - n; k < head; k++) {
+        const struct nmx_ft_rec *r = &ft.r[k % FT_N];
+#define FT_D(t) ((t) && (t) >= r->sub0 ? (long long)(((t) - r->sub0) / 1000) : -1LL)
+        FT_P("%llu %u %llu %lld %lld %lld %lld %u %u %d\n", (unsigned long long)r->seq, r->handle,
+             (unsigned long long)r->sub0, FT_D(r->sub1), FT_D(r->armed), FT_D(r->pflip), FT_D(r->seen), r->vbl_armed,
+             r->vbl_pflip, r->idle);
+#undef FT_D
+    }
+#undef FT_P
+    return (int)(o < size ? o : size);
 }

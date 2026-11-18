@@ -22,6 +22,8 @@
 #include "nmx_port.h"
 
 extern "C" long long nmx_fb_flip_call(const char *name, void *req);
+/* frame-path trace (nmx_fb_bridge.c): the timer's phase against the real vblank */
+extern "C" void nmx_ft_vbl_timer(uint64_t frame_ns);
 #include "../../../kexts/NVRM/nvrm_vram_abi.h"
 
 #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
@@ -278,6 +280,7 @@ private:
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
         if (me->fStopping) return;
+        nmx_ft_vbl_timer(me->fFrameNs);
         if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
         uint64_t period;
         nanoseconds_to_absolutetime(me->fFrameNs, &period);

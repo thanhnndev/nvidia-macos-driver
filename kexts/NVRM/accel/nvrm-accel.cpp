@@ -1245,6 +1245,69 @@ static inline UInt32 nmxScanLine(const NmxScan &sc) { return nmxReg(kDcn35Seg2 +
 // at commit, ("NMXFenceDone", n) once the work completed and its pixels are in the surface. The transaction waits here,
 // sleeping, until done >= pending; WindowServer returns as soon as its work is submitted. A surface with no
 // NMXFencePending (another client, an older plugin) is copied at once, as before. 0 = no wait (NVMTL then waits itself).
+#ifdef NMX_ACCEL
+// ---- frame-path trace (ga403wm docs/FRAME-PATH.md section 7) ---------------------------------------------------------
+// One record per display-pipe transaction that carried a surface, mach_absolute_time (ns on x86) at each stage:
+//   cpend  plugin: WindowServer committed the GPU work (NMXFencePendingT)   gend  plugin: GPU end timestamp (NMXFenceGpuEndT)
+//   pdone  plugin: its completion thread saw the fence (NMXFenceDoneT)      entry performTransaction entered
+//   fence  nmxFenceWait returned (pipe thread saw NMXFenceDone)             sub   nmxFlipSubmit called NMXGPU
+//   latch  the poll saw the latch (nmxFlipPoll)                               sig   signalTransactionInterrupt called
+// seq = NMXGPU's flip seq (join with debug.nmx_frametrace). Read: sysctl -n debug.nmxaccel_frametrace
+// debug.nmxaccel_ft (default 1) turns the extra IOSurface reads off. Racy by design (trace only).
+extern "C" { int snprintf(char *, size_t, const char *, ...); }
+static int gNmxFt = 1;
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_ft, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFt, 0, "frame-path trace on (1) or off (0)");
+enum : unsigned { kFtN = 512 };
+struct NmxFtRec { unsigned long long seq, cpend, gend, pdone, entry, fence, sub, latch, sig; unsigned sid, waited; };
+static NmxFtRec gFt[kFtN];
+static volatile UInt64 gFtHead;
+static NmxFtRec *gFtCur;            // the transaction the pipe thread is in (serial)
+static NmxFtRec *nmxFtBegin(IOSurface *s)
+{
+    if (!gNmxFt) { gFtCur = nullptr; return nullptr; }
+    const UInt64 i = (UInt64)OSIncrementAtomic64((volatile SInt64 *)&gFtHead);
+    NmxFtRec *r = &gFt[i % kFtN];
+    memset(r, 0, sizeof *r);
+    r->entry = mach_absolute_time();
+    r->sid = s ? s->getSurfaceID() : 0;
+    gFtCur = r;
+    return r;
+}
+static unsigned long long nmxSurfValue(IOSurface *s, const char *key);
+static void nmxFtFence(IOSurface *s, bool waited)
+{
+    NmxFtRec *r = gFtCur;
+    if (!r || !s) return;
+    r->fence = mach_absolute_time();
+    r->waited = waited ? 1 : 0;
+    r->cpend = nmxSurfValue(s, "NMXFencePendingT");
+    r->pdone = nmxSurfValue(s, "NMXFenceDoneT");
+    r->gend = nmxSurfValue(s, "NMXFenceGpuEndT");
+}
+static int nmxaccel_frametrace_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 96 * 1024;
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    size_t o = 0;
+    const UInt64 head = gFtHead, n = head < kFtN ? head : kFtN;
+    o += (size_t)snprintf(buf + o, size - o, "transactions %llu\nseq sid entry_ns cpend_us gend_us pdone_us fence_us sub_us latch_us sig_us waited\n",
+                          (unsigned long long)head);
+    for (UInt64 k = head - n; k < head && o < size; k++) {
+        const NmxFtRec &r = gFt[k % kFtN];
+        // relative to entry; negative = before the pipe got the transaction (plugin stages); -999999 = missing
+        auto d = [&](unsigned long long t) -> long long { return t ? ((long long)t - (long long)r.entry) / 1000 : -999999LL; };
+        o += (size_t)snprintf(buf + o, size - o, "%llu 0x%x %llu %lld %lld %lld %lld %lld %lld %lld %u\n", r.seq, r.sid, r.entry,
+                              d(r.cpend), d(r.gend), d(r.pdone), d(r.fence), d(r.sub), d(r.latch), d(r.sig), r.waited);
+    }
+    if (o > size) o = size;
+    const int err = SYSCTL_OUT(req, buf, o);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmxaccel_frametrace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmxaccel_frametrace_sysctl, "A", "frame-path trace: last 512 transactions, stage times");
+#endif
 static int gNmxFenceWait = 1;
 SYSCTL_INT(_debug, OID_AUTO, nmxaccel_fence_wait, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFenceWait, 0,
            "1 = the K6 copy waits for the surface's NMXFenceDone (NVMTL then returns from commitAndWaitUntilSubmitted early)");
@@ -1269,7 +1332,7 @@ static bool nmxFenceWait(IOSurface *s)
     const unsigned long long want = nmxSurfValue(s, "NMXFencePending");
     if (!want) return true;
     OSAddAtomic64(1, &gCntFenceFrames);
-    if (nmxSurfValue(s, "NMXFenceDone") >= want) return true;
+    if (nmxSurfValue(s, "NMXFenceDone") >= want) { nmxFtFence(s, false); return true; }
     const uint64_t t0 = mach_absolute_time();
     uint64_t ns = 0;
     bool done = false;
@@ -1279,6 +1342,7 @@ static bool nmxFenceWait(IOSurface *s)
         absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
         if (!done && ns > 100000000ull) break;
     }
+    nmxFtFence(s, true);
     OSAddAtomic64(1, &gCntFenceWaited);
     OSAddAtomic64((SInt64)(ns / 1000), &gCntFenceWaitUs);
     if (!done) {
@@ -1359,6 +1423,7 @@ struct NmxFlip {
     volatile SInt32 busy;                  // 1 while the poll thread waits for pendSeq to latch
     volatile SInt32 result;                // kLatch*
     struct thread_call *call;
+    NmxFtRec *pendFt;                      // frame-path trace record of the pending flip
     NmxImport imp[kNmxFlipImports];
     unsigned long long tick;
     unsigned errRun, frontWrites, logs;
@@ -1438,9 +1503,12 @@ static void nmxFlipPoll(void *, void *)
     void *pipe = gFl.pipe;
     uint64_t ns = 0;
     const int res = nmxFlipWaitLatch(gFl.pendSeq, gFl.gen, kNmxFlipLatchCapNs, &ns);
+    NmxFtRec *ft = gFl.pendFt;
+    if (ft) ft->latch = mach_absolute_time();
     OSAddAtomic64((SInt64)(ns / 1000), &gCntFlipWaitUs);
     __atomic_store_n(&gFl.result, res, __ATOMIC_RELEASE);
     __atomic_store_n(&gFl.busy, 0, __ATOMIC_RELEASE);
+    if (ft) ft->sig = mach_absolute_time();
     if (pipe) {
         _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
         ((OSObject *)pipe)->release();
@@ -1599,6 +1667,9 @@ static bool nmxFlipSubmit(void *pipe, unsigned handle, IOSurface *s, unsigned lo
 {
     struct NMXFlipRequest r; memset(&r, 0, sizeof r);
     r.handle = handle;
+    NmxFtRec *ft = gFtCur;
+    if (ft) ft->sub = mach_absolute_time();
+    gFl.pendFt = nullptr;
     const IOReturn rr = nmxFlipCall(kFnSubmit, &r);
     if (rr != kIOReturnSuccess) {
         OSAddAtomic64(1, &gCntFlipRefused);
@@ -1609,6 +1680,7 @@ static bool nmxFlipSubmit(void *pipe, unsigned handle, IOSurface *s, unsigned lo
     const SInt64 n = OSAddAtomic64(1, &gCntFlipSubmit);
     if (n < 3) FLIPLOG("submitted handle %u seq %llu (surface 0x%x)%s", handle, r.seq, s ? s->getSurfaceID() : 0u, wait ? ", waiting for the latch" : "");
     gFl.pend = handle; gFl.pendS = s; gFl.pendSeq = r.seq; gFl.pendGpu = gpu;
+    if (ft) { ft->seq = r.seq; gFl.pendFt = ft; }
     gFl.pendFence = s ? nmxSurfValue(s, "NMXFencePending") : 0;
     __atomic_store_n(&gFl.result, kLatchNone, __ATOMIC_RELEASE);
     if (!wait && pipe && !gFl.call) gFl.call = thread_call_allocate(nmxFlipPoll, nullptr);
@@ -1772,6 +1844,9 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
+#ifdef NMX_ACCEL
+    (void)nmxFtBegin(s);
+#endif
 
     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false, l10r = false;
     bool fenceOk = true;
@@ -2110,6 +2185,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_beam_copy_us);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_wait);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_frames);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_ft);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_frametrace);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_waited);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_wait_us);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_timeouts);
