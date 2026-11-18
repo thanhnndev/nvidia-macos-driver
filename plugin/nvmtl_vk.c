@@ -1513,6 +1513,7 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
    every import on the global list. */
 static VkResult (*g_sl_set)(VkDevice, VkDeviceMemory, VkBool32);
 static void (*g_sl_use)(VkCommandBuffer, VkDeviceMemory);
+static void nvmtl_nocopy_unregister(const void *buf);
 static void (*g_sl_exact)(VkCommandBuffer);
 static void (*g_sl_stats)(VkDevice, uint64_t *, uint32_t);
 static int (*g_sl_breakdown)(VkDevice, char *, size_t);
@@ -1532,9 +1533,19 @@ static int nvmtl_sl_on(void)
             g_sl_stats = (void (*)(VkDevice, uint64_t *, uint32_t))dlsym(g_lib, "radv_nvmtl_stats");
             g_sl_breakdown = (int (*)(VkDevice, char *, size_t))dlsym(g_lib, "radv_nvmtl_global_breakdown");
         }
-        on = !(e && e[0] == '0') && g_sl_set && g_sl_use && g_sl_exact;
-        nvlog("vk: surface list %s (NVMTL_SURFACE_LIST=%s, driver %s)", on ? "ON - an IOSurface import goes only to the submits that use it"
-              : "OFF - every IOSurface import rides every submit", e ? e : "unset", abi ? "has radv_nvmtl" : "has no radv_nvmtl entry points");
+        /* row 12 (2026-11-18 20:34): mediaanalysisd's Espresso work wrote through a parked import that its exact
+           submit did not list. Until every way a surface reaches a shader is listed (audit below), the owner can keep
+           the list to WindowServer (/Library/NullMoth/nvmtl-sl-ws-only, root): elsewhere every import then rides every
+           submit, the kernel sees each one used whenever the process submits, and it can only park while the process
+           has no GPU work at all - so no job can reach a parked page. Costs ~1.4 us of CS ioctl per import per submit
+           in those processes. NVMTL_SURFACE_LIST=0/1 still decides for one process. */
+        struct stat st;
+        const char *me = getprogname();
+        const int wsOnly = !e && stat("/Library/NullMoth/nvmtl-sl-ws-only", &st) == 0 && !(me && !strcmp(me, "WindowServer"));
+        on = !(e && e[0] == '0') && !wsOnly && g_sl_set && g_sl_use && g_sl_exact;
+        nvlog("vk: surface list %s (NVMTL_SURFACE_LIST=%s%s, driver %s)", on ? "ON - an IOSurface import goes only to the submits that use it"
+              : "OFF - every IOSurface import rides every submit", e ? e : "unset", wsOnly ? ", nvmtl-sl-ws-only" : "",
+              abi ? "has radv_nvmtl" : "has no radv_nvmtl entry points");
     }
     return on;
 }
@@ -1552,12 +1563,13 @@ int nvmtl_vk_surface_list_mark(nvk_buffer *b)
     VkResult r = g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_TRUE);
     if (r != VK_SUCCESS) { if (atomic_fetch_add(&g_sl_refused, 1) < 4) nvlog("vk: surface list refused an import (%d) - it stays on the global list", (int)r); return 0; }
     atomic_fetch_add(&g_sl_marked, 1); nvmtl_sl_census();
+    nvmtl_vk_nocopy_register(b);    /* audit only: a surface-list import is checked like a no-copy one */
     return 1;
 }
 void nvmtl_vk_surface_list_unmark(nvk_buffer *b)
 {
     if (!b || !b->mem || !nvmtl_sl_on()) return;
-    if (g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_FALSE) == VK_SUCCESS) atomic_fetch_add(&g_sl_unmarked, 1);
+    if (g_sl_set(g_dev, (VkDeviceMemory)b->mem, VK_FALSE) == VK_SUCCESS) { atomic_fetch_add(&g_sl_unmarked, 1); nvmtl_nocopy_unregister(b->buf); }
 }
 /* Buffer list: newBufferWithBytesNoCopy imports are host-pointer BOs too, and after the surface list they were the whole
    global list (WindowServer: ~500 of them, 45 MB, ~120 handles on every submit; docs/890M-TRACE.md part 8). They go
@@ -1730,7 +1742,7 @@ void nvmtl_vk_audit_check(nvk_cmdbuf *c, const char *where)
             const void *who = NULL; unsigned slot = 0xffff;
             for (unsigned j = 0; j < a->nwho; j++) if (a->whoBuf[j] == buf) { who = a->who[j]; slot = a->whoSlot[j]; break; }
             Dl_info di; const char *sym = (who && dladdr(who, &di) && di.dli_sname) ? di.dli_sname : "?";
-            nvlog("vk: buffer-list AUDIT MISS (%s): no-copy import %p is named by a descriptor/address table/texture of this part (slot %u, bound by %s +%ld) "
+            nvlog("vk: buffer-list AUDIT MISS (%s): import %p (no-copy buffer or surface-list IOSurface) is named by a descriptor/address table/texture of this part (slot %u, bound by %s +%ld) "
                   "but not by its resources", where ? where : "?", buf, slot, sym,
                   (long)(who && dladdr(who, &di) && di.dli_saddr ? (const char *)who - (const char *)di.dli_saddr : 0));
         }

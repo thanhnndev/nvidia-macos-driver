@@ -220,7 +220,7 @@ static void nvmtl_part_list_surfaces(nvk_cmdbuf *c, NVMTLResSet *res, NSSet *sur
         NVMTLTexture *r = (NVMTLTexture *)o;
         for (NVMTLTexture *v = r; v; v = v->_parent) if (v->_backBuf) buf(v->_backBuf);   // a texture on a buffer's pages
         while (r->_parent) r = r->_parent;
-        if (r->_hostOn && r->_hostSL) nvmtl_vk_cmd_use_surface(c, &r->_hostBuf);
+        if (r->_hostOn && r->_hostSL) { if (aud) nvmtl_vk_audit_listed(c, &r->_hostBuf); nvmtl_vk_cmd_use_surface(c, &r->_hostBuf); }
     };
     for (id o in res) use(o);
     for (id o in surfaces) use(o);
