@@ -1,0 +1,133 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1512,7 +1512,106 @@
+  * Returns:
+  * 0 for success.
+  *
++ */
++#ifdef NMXKPI
++/*
++ * ga403wm FRAME-PATH row 12 (10.4): name what a faulting GPU address was. The VideoToolbox and mediaanalysisd faults
++ * are PERMISSION_FAULTS 0x5 (a write through a V = 0 PTE) with MAPPING_ERROR 0: the page tables exist and say "not
++ * valid". Linux writes V = 0 for a mapping that was freed (amdgpu_vm_clear_freed) or for a BO placed in SYSTEM (an
++ * evicted or parked BO). The fault print says neither which, nor which BO. Two read-only aids, printed under the fault:
++ * - a ring of the last NMX_VAFREE_N ranges whose PTEs clear_freed invalidated (pasid, range, when): a hit = the GPU
++ *   used an address after its process unmapped it (a use-after-free in the client or its driver);
++ * - the live mapping at the address, looked up under a trylock of the VM's root reservation: the BO, its placement
++ *   (SYSTEM = evicted/parked: its PTEs are V = 0 until a CS validates it), userptr or not, size and pin count.
+  */
++#define NMX_VAFREE_N 4096	/* 32 B each; a power of two (the u32 sequence wraps onto the same slots) */
++struct nmx_vafree {
++	u64 start, end;		/* bytes, end exclusive */
++	u64 ns;
++	u32 pasid;
++	u32 seq;
++};
++static struct nmx_vafree nmx_vafrees[NMX_VAFREE_N];
++static u32 nmx_vafree_seq;
++static DEFINE_SPINLOCK(nmx_vafree_lock);
++
++static void nmx_vafree_note(u32 pasid, u64 start_pfn, u64 last_pfn)
++{
++	struct nmx_vafree *e;
++	unsigned long fl;
++
++	spin_lock_irqsave(&nmx_vafree_lock, fl);
++	e = &nmx_vafrees[nmx_vafree_seq % NMX_VAFREE_N];
++	e->seq = ++nmx_vafree_seq;
++	e->start = start_pfn << AMDGPU_GPU_PAGE_SHIFT;
++	e->end = (last_pfn + 1) << AMDGPU_GPU_PAGE_SHIFT;
++	e->ns = ktime_get_ns();
++	e->pasid = pasid;
++	spin_unlock_irqrestore(&nmx_vafree_lock, fl);
++}
++
++/* the fault print's NMX lines (gmc_v11_0_process_interrupt; IH thread context, nothing here sleeps) */
++void nmx_vm_fault_name(struct amdgpu_device *adev, u32 pasid, u64 addr)
++{
++	struct amdgpu_bo *root = NULL;
++	struct amdgpu_vm *vm;
++	unsigned long fl;
++	u64 now = ktime_get_ns();
++	int i, hits = 0;
++
++	xa_lock_irqsave(&adev->vm_manager.pasids, fl);
++	vm = xa_load(&adev->vm_manager.pasids, pasid);
++	if (vm && vm->root.bo)
++		root = amdgpu_bo_ref(vm->root.bo);
++	xa_unlock_irqrestore(&adev->vm_manager.pasids, fl);
++
++	if (root == NULL) {
++		dev_err(adev->dev, "  NMX: pasid %u has no VM any more\n", pasid);
++	} else if (!dma_resv_trylock(root->tbo.base.resv)) {
++		dev_err(adev->dev, "  NMX: VM of pasid %u busy, live mapping not looked up\n", pasid);
++	} else {
++		struct amdgpu_bo_va_mapping *m = NULL;
++
++		xa_lock_irqsave(&adev->vm_manager.pasids, fl);
++		vm = xa_load(&adev->vm_manager.pasids, pasid);
++		xa_unlock_irqrestore(&adev->vm_manager.pasids, fl);
++		if (vm && vm->root.bo == root)
++			m = amdgpu_vm_bo_lookup_mapping(vm, addr >> AMDGPU_GPU_PAGE_SHIFT);
++		if (m == NULL) {
++			dev_err(adev->dev, "  NMX: no live mapping at 0x%llx\n", addr);
++		} else {
++			struct amdgpu_bo *bo = m->bo_va ? m->bo_va->base.bo : NULL;
++
++			dev_err(adev->dev, "  NMX: live mapping 0x%llx-0x%llx flags 0x%llx bo %p size %lu placement %d "
++				"(0 SYSTEM = evicted/parked, 1 GTT, 2 VRAM) userptr %d pin %u prefer 0x%x\n",
++				m->start << AMDGPU_GPU_PAGE_SHIFT, (m->last + 1) << AMDGPU_GPU_PAGE_SHIFT,
++				(unsigned long long)m->flags, bo, bo ? (unsigned long)amdgpu_bo_size(bo) : 0UL,
++				bo && bo->tbo.resource ? (int)bo->tbo.resource->mem_type : -1,
++				bo && bo->tbo.ttm ? (int)amdgpu_ttm_tt_is_userptr(bo->tbo.ttm) : -1,
++				bo ? bo->tbo.pin_count : 0, bo ? bo->preferred_domains : 0);
++		}
++		dma_resv_unlock(root->tbo.base.resv);
++	}
++	if (root)
++		amdgpu_bo_unref(&root);
++
++	spin_lock_irqsave(&nmx_vafree_lock, fl);
++	for (i = 0; i < NMX_VAFREE_N && hits < 4; i++) {
++		struct nmx_vafree *e = &nmx_vafrees[(nmx_vafree_seq - 1 - i) % NMX_VAFREE_N];
++
++		if (e->seq == 0 || e->pasid != pasid || addr < e->start || addr >= e->end)
++			continue;
++		hits++;
++		dev_err(adev->dev, "  NMX: 0x%llx was FREED: range 0x%llx-0x%llx invalidated %llu ms ago (free #%u of %u)\n",
++			addr, e->start, e->end, (now - e->ns) / 1000000ULL, e->seq, nmx_vafree_seq);
++	}
++	spin_unlock_irqrestore(&nmx_vafree_lock, fl);
++	if (hits == 0)
++		dev_err(adev->dev, "  NMX: 0x%llx is in none of the last %u freed ranges\n", addr,
++			nmx_vafree_seq < NMX_VAFREE_N ? nmx_vafree_seq : NMX_VAFREE_N);
++}
++#endif
++
+ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
+ 			  struct amdgpu_vm *vm,
+ 			  struct dma_fence **fence)
+@@ -1537,6 +1636,9 @@
+ 		mapping = list_first_entry(&vm->freed,
+ 			struct amdgpu_bo_va_mapping, list);
+ 		list_del(&mapping->list);
++#ifdef NMXKPI
++		nmx_vafree_note(vm->pasid, mapping->start, mapping->last);
++#endif
+ 
+ 		r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
+ 					   &sync, mapping->start, mapping->last,
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+@@ -154,6 +154,11 @@
+ 				dev_err(adev->dev, "  NMX: address is in no recorded read-only mapping of pasid %u\n",
+ 					entry->pasid);
+ 		}
++		{
++			void nmx_vm_fault_name(struct amdgpu_device *adev, u32 pasid, u64 addr);	/* amdgpu_vm.c, row 12 */
++
++			nmx_vm_fault_name(adev, entry->pasid, addr);
++		}
+ #endif
+ 
+ 		/* Only print L2 fault status if the status register could be read and
