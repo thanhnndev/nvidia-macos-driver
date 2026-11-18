@@ -274,6 +274,9 @@ extern "C" volatile SInt64 gNmxParkSkipVm, gNmxParkAbort, gNmxParkPtUpdate;
 NMX_CNT(nmx_park_skip_vm, gNmxParkSkipVm, "11.9: idle-park candidates skipped (mapped in no VM or in more than one)");
 NMX_CNT(nmx_park_abort, gNmxParkAbort, "11.9: parks dropped between move and unwire (a CS took the BO back)");
 NMX_CNT(nmx_park_pt_update, gNmxParkPtUpdate, "11.9: parks that cleared the mapping's PTEs before unwiring");
+extern "C" volatile SInt64 gNmxFaultKick, gNmxFaultKickIgnored;
+NMX_CNT(nmx_fault_kick, gNmxFaultKick, "row 12: GPU page faults whose job was recovered at once (not at the 3 s timeout)");
+NMX_CNT(nmx_fault_kick_ignored, gNmxFaultKickIgnored, "row 12: fault kicks that found another process's job at the ring head (left running)");
 extern "C" int nmx_userptr_park_ms;
 SYSCTL_INT(_debug, OID_AUTO, nmx_userptr_park_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_userptr_park_ms, 0,
            "Step142: unwire an IOSurface userptr BO's memory after this many ms without GPU use; 0 = never");
@@ -399,6 +402,8 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_park_skip_vm);
     sysctl_register_oid(&sysctl__debug_nmx_park_abort);
     sysctl_register_oid(&sysctl__debug_nmx_park_pt_update);
+    sysctl_register_oid(&sysctl__debug_nmx_fault_kick);
+    sysctl_register_oid(&sysctl__debug_nmx_fault_kick_ignored);
     sysctl_register_oid(&sysctl__debug_nmx_userptr_park_ms);
     sysctl_register_oid(&sysctl__debug_nmx_ft);
     {

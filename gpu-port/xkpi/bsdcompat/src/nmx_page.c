@@ -59,6 +59,7 @@ volatile long long gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserR
  * counters. nmx_userptr_park_ms: idle time after which an IOSurface userptr BO is parked; 0 = never (debug.*). */
 volatile long long gNmxUpinRestoreFail, gNmxUpinDestroyRec, gNmxParkSkipBusy, gNmxParkFail;
 volatile long long gNmxParkSkipVm, gNmxParkAbort, gNmxParkPtUpdate;	/* 11.9, amdgpu-userptr-park.patch */
+volatile long long gNmxFaultKick, gNmxFaultKickIgnored;	/* row 12, amdgpu-vm-fault-name.patch */
 int nmx_userptr_park_ms = 60000;      /* Step142b: 10 s re-wired whole swap chains at once mid-video (part 39) */
 
 struct backing {
