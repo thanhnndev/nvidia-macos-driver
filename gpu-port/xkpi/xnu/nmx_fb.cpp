@@ -662,11 +662,14 @@ public:
     IOReturn unregisterInterrupt(void *iref) override {
         if (Irq *q = vblSlotOf(iref)) {
             q->on = false;
-            __atomic_store_n(&q->proc, (IOFBInterruptProc)nullptr, __ATOMIC_RELEASE);
-            if (fVblLast == q) fVblLast = nullptr;
+            // out-31 N6: SEQ_CST (xchg on x86) so the store is visible before fDelivering is read below; with RELEASE
+            // the store could sit in the store buffer while a delivery (OSIncrementAtomic: locked, full barrier) reads
+            // the old proc and this side still reads fDelivering 0 (store->load reordering)
+            __atomic_store_n(&q->proc, (IOFBInterruptProc)nullptr, __ATOMIC_SEQ_CST);
+            if (fVblLast == q) __atomic_store_n(&fVblLast, (Irq *)nullptr, __ATOMIC_SEQ_CST);
             // the caller may free target/refcon on return: wait out a delivery that read the old proc (IOFramebuffer's
             // VBL handler is interrupt-safe and takes no gate, so this cannot wait on the caller)
-            for (int n = 0; __atomic_load_n(&fDelivering, __ATOMIC_ACQUIRE) && n < 1000; n++) IODelay(10);
+            for (int n = 0; __atomic_load_n(&fDelivering, __ATOMIC_SEQ_CST) && n < 1000; n++) IODelay(10);
             if (fVblRef) thread_call_enter(fVblRef);
         } else if (iref == &fConnect) {
             fConnect.proc = nullptr;

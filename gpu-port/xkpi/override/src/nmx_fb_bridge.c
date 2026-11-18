@@ -450,6 +450,7 @@ struct nmx_flip_import {
     uint64_t gpu;
     uint32_t fbid, gemh, fmt, used;     /* used: 0 free, 1 live, 2 being built or torn down */
     uint32_t sid;                       /* out-31: the IOSurface ID (v2 import), 0 = unknown; nmx_surf_fence_set filter */
+    uint64_t import_ns;                 /* out-31 N3: when it became a candidate; jobs before that were never recorded */
 };
 
 static struct {
@@ -954,6 +955,7 @@ static uint32_t flip_import(struct nmx_flipreq *r)
     m->fbid = c.fb_id;
     m->gemh = h;
     m->fmt = fmt;
+    m->import_ns = mach_absolute_time();
     __atomic_store_n(&m->sid, r->version >= 2 ? ((struct nmx_flipreq2 *)r)->surfaceId : 0, __ATOMIC_RELEASE);
     __atomic_store_n(&m->used, 1, __ATOMIC_RELEASE);
     flip.nimports++;
@@ -1333,9 +1335,11 @@ static struct {
     volatile int lock;
     uint64_t tick;
     struct {
-        uint32_t sid, overflow;         /* overflow: a 5th unsignaled context came; lookups refuse until the slot resets */
+        uint32_t sid, overflow;         /* overflow: a 9th unsignaled context came and its fence was dropped; nothing can
+                                         * tell when that job ends, so lookups refuse (old wait) until the slot is reused */
         uint64_t use, set_ns;
         struct { uint64_t ctx; struct dma_fence *f; } c[SF_CTX];
+        struct dma_fence *ov[SF_CTX];   /* out-31 N4: a 5th..8th unsignaled context; waited for like c[] */
     } e[SF_N];
 } sf;
 
@@ -1379,7 +1383,7 @@ static int sf_signaled(struct dma_fence *f)
  */
 void nmx_surf_fence_set(uint32_t sid, struct dma_fence *fence)
 {
-    struct dma_fence *drop[SF_CTX + 1];
+    struct dma_fence *drop[2 * SF_CTX + 1];
     int i, k, nd = 0, slot = 0;
 
     if (sid == 0 || fence == NULL || !__atomic_load_n(&nmx_flip_kfence, __ATOMIC_RELAXED) || !sf_candidate(sid))
@@ -1395,6 +1399,9 @@ void nmx_surf_fence_set(uint32_t sid, struct dma_fence *fence)
         if (sf.e[slot].c[k].f)
             drop[nd++] = sf.e[slot].c[k].f;
         sf.e[slot].c[k].f = NULL;
+        if (sf.e[slot].ov[k])
+            drop[nd++] = sf.e[slot].ov[k];
+        sf.e[slot].ov[k] = NULL;
     }
     sf.e[slot].sid = sid;
     sf.e[slot].overflow = 0;
@@ -1407,8 +1414,23 @@ found:
             if (sf_signaled(sf.e[slot].c[k].f))
                 break;
     if (k == SF_CTX) {
-        sf.e[slot].overflow = 1;                /* never drop an unsignaled fence: refuse instead (old wait) */
-        drop[nd++] = fence;
+        /* out-31 N4: a 5th unsignaled context goes to the overflow list, waited for like the others; an older overflow
+         * fence of the same context is covered by it, a signaled one is replaced */
+        for (k = 0; k < SF_CTX; k++)
+            if (sf.e[slot].ov[k] && sf.e[slot].ov[k]->context == fence->context)
+                break;
+        if (k == SF_CTX)
+            for (k = 0; k < SF_CTX; k++)
+                if (sf_signaled(sf.e[slot].ov[k]))
+                    break;
+        if (k == SF_CTX) {
+            sf.e[slot].overflow = 1;            /* never drop an unsignaled fence silently: refuse instead (old wait) */
+            drop[nd++] = fence;
+        } else {
+            if (sf.e[slot].ov[k])
+                drop[nd++] = sf.e[slot].ov[k];
+            sf.e[slot].ov[k] = fence;
+        }
     } else {
         if (sf.e[slot].c[k].f)
             drop[nd++] = sf.e[slot].c[k].f;
@@ -1430,19 +1452,31 @@ found:
  */
 static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *set_ns)
 {
-    struct dma_fence *got[SF_CTX], *any = NULL, **arr;
+    struct dma_fence *got[2 * SF_CTX], *any = NULL, **arr;
     struct dma_fence_array *fa;
     int i, k, n = 0;
 
     if (sid == 0)
         return NULL;
+    /* out-31 N3: jobs are recorded only while the surface is imported; a frame committed before its (latest) import
+     * may have its writer CS unrecorded, and a later job's fence would not cover it */
+    {
+        uint64_t imp_ns = 0;
+
+        for (i = 0; i < FLIP_NIMP; i++)
+            if (__atomic_load_n(&flip.imp[i].sid, __ATOMIC_ACQUIRE) == sid &&
+                __atomic_load_n(&flip.imp[i].used, __ATOMIC_ACQUIRE) == 1)
+                imp_ns = flip.imp[i].import_ns;
+        if (imp_ns == 0 || after < imp_ns)
+            return NULL;
+    }
     sf_lock();
     for (i = 0; i < SF_N; i++)
         if (sf.e[i].sid == sid) {
             if (sf.e[i].set_ns < after || sf.e[i].overflow)
                 break;
-            for (k = 0; k < SF_CTX; k++) {
-                struct dma_fence *f = sf.e[i].c[k].f;
+            for (k = 0; k < 2 * SF_CTX; k++) {
+                struct dma_fence *f = k < SF_CTX ? sf.e[i].c[k].f : sf.e[i].ov[k - SF_CTX];
 
                 if (f == NULL)
                     continue;

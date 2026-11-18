@@ -1418,6 +1418,9 @@ SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip_notify, CTLFLAG_RW | CTLFLAG_LOCKED, 
            "out-31 row 3: 1 = flip completion from NMXGPU's pageflip IRQ; 0 = 200 us status poll");
 SYSCTL_INT(_debug, OID_AUTO, nmxaccel_flip_ts, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxFlipTs, 0,
            "out-31 row 3: 1 = write the pageflip IRQ time as the transaction's presentation time where the family left 0");
+static SInt64 gCntFlipRedo, gCntFlipStuckLanded;
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_redo, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipRedo, "out-31: frames dropped behind a stuck fenced flip and shown once it landed");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_flip_stuck_landed, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipStuckLanded, "out-31: fenced flips that landed after their 150 ms cap");
 static SInt64 gCntKfence, gCntKfenceNoSub, gCntKfenceRefused, gCntFlipNotified, gCntFlipTsSet, gCntFlipRearm, gCntKfenceSlow,
               gCntFlipBusyDrop;
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_kfence_slow, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntKfenceSlow, "out-31: fenced flips not latched within 150 ms (GPU job slow; resynced, flips stay on)");
@@ -1456,6 +1459,18 @@ struct NmxFlip {
     volatile unsigned long long claimedSeq; // notify mode: the last flip seq whose completion ran (one per flip)
     volatile unsigned long long notifySeq; // the seq NMXGPU's last pageflip notification named
     bool pendFenced;                       // the pending flip waits for its render job in NMXGPU's commit
+    // out-31 N1/N2/N5: a fenced flip that missed its 150 ms cap is still committing in NMXGPU ("stuck"). It is not
+    // assumed on screen; its import and the last frame dropped behind it (redo) are kept from eviction; nmxFlipWatch
+    // learns when it lands (bridge status: nothing pending), sets front from the bridge and resubmits the redo frame,
+    // so a static screen does not keep the old image; after 2 s it trips flips off.
+    unsigned stuckHandle;                  // NMX_FLIP_NONE = nothing stuck
+    uint64_t stuckT0;
+    bool stuckTripped;
+    unsigned redoHandle;                   // NMX_FLIP_NONE = no dropped frame to show
+    IOSurface *redoS;
+    unsigned long long redoGpu, redoAfterNs;
+    bool redoKf;
+    struct thread_call *watch;
     struct thread_call *call;
     NmxFtRec *pendFt;                      // frame-path trace record of the pending flip
     bool v2;                               // NMXGPU took a version 2 caps call
@@ -1482,6 +1497,7 @@ static bool nmxFlipInit()
     if (!l) return false;
     if (!OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gFl.lock)) IOLockFree(l);
     gFl.front = NMX_FLIP_HOME; gFl.pend = NMX_FLIP_NONE;
+    gFl.stuckHandle = NMX_FLIP_NONE; gFl.redoHandle = NMX_FLIP_NONE;
     gFl.inited = true;
     return true;
 }
@@ -1623,6 +1639,75 @@ static void nmxFlipResync(const char *why)
     gFl.frontFence = gFl.frontS ? nmxSurfValue(gFl.frontS, "NMXFencePending") : 0;
 }
 // The pending flip has finished (poll thread done, or a synchronous wait): it becomes what is on screen. Lock held.
+static void nmxFlipWatch(void *, void *);
+static bool nmxFlipSubmit(void *pipe, unsigned handle, IOSurface *s, unsigned long long gpu, bool wait,
+                          IOSurface *kfS, unsigned long long kfAfterNs, bool *refusedNoFence, IOReturn *rrOut);
+// a frame dropped because the bridge still commits a stuck fenced flip: nmxFlipWatch shows it once that flip lands
+static void nmxFlipRedo(unsigned handle, IOSurface *s, unsigned long long gpu, bool kf, unsigned long long afterNs)
+{
+    if (gFl.stuckHandle == NMX_FLIP_NONE) return;   // within the 150 ms cap: the next frame (or the poll) follows anyway
+    gFl.redoHandle = handle; gFl.redoS = s; gFl.redoGpu = gpu; gFl.redoKf = kf; gFl.redoAfterNs = afterNs;
+}
+static void nmxFlipWatchArm(unsigned ms)
+{
+    if (!gFl.watch) gFl.watch = thread_call_allocate(nmxFlipWatch, nullptr);
+    if (!gFl.watch) return;
+    uint64_t d;
+    nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &d);
+    thread_call_enter_delayed(gFl.watch, mach_absolute_time() + d);
+}
+// the bridge's own view of the screen once nothing is pending there (the late flip landed, or the bridge went home)
+static void nmxFlipStuckDone(const struct NMXFlipRequest &st)
+{
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time() - gFl.stuckT0, &ns);
+    OSAddAtomic64(1, &gCntFlipStuckLanded);
+    FLIPLOG("stuck fenced flip handle %u done after %llu ms; on screen handle %u", gFl.stuckHandle,
+            (unsigned long long)(ns / 1000000), st.current);
+    gFl.gen = st.generation;
+    gFl.front = st.current;
+    gFl.frontS = nmxFlipSurfaceOf(st.current, &gFl.frontGpu);
+    gFl.frontFence = gFl.frontS ? nmxSurfValue(gFl.frontS, "NMXFencePending") : 0;
+    gFl.stuckHandle = NMX_FLIP_NONE;
+}
+static void nmxFlipWatch(void *, void *)
+{
+    if (!gFl.lock) return;
+    IOLockLock(gFl.lock);
+    if (gFl.stuckHandle == NMX_FLIP_NONE) { IOLockUnlock(gFl.lock); return; }
+    struct NMXFlipRequest st; memset(&st, 0, sizeof st);
+    const bool ok = nmxFlipCall(kFnStatus, &st) == kIOReturnSuccess;
+    if (ok && (st.pending == NMX_FLIP_NONE || st.generation != gFl.gen)) {
+        nmxFlipStuckDone(st);
+        // a frame dropped behind it is newer than what landed: show it now (static screen: nothing else would)
+        const unsigned h = gFl.redoHandle;
+        IOSurface *const rs = gFl.redoS;
+        const unsigned long long rg = gFl.redoGpu, ra = gFl.redoAfterNs;
+        const bool rk = gFl.redoKf;
+        gFl.redoHandle = NMX_FLIP_NONE; gFl.redoS = nullptr;
+        if (h != NMX_FLIP_NONE && h != gFl.front && !gNmxFlipTripped && gFl.pend == NMX_FLIP_NONE &&
+            nmxFlipSurfaceOf(h, nullptr) == rs) {
+            bool noFence = false;
+            IOReturn rr = kIOReturnSuccess;
+            // the surface may have taken GPU work since it was dropped: the flip waits for it (fence-only or here)
+            bool done = rk ? nmxFlipSubmit(nullptr, h, rs, rg, true, rs, ra, &noFence, &rr)
+                           : ((!rs || nmxFenceWait(rs)) && nmxFlipSubmit(nullptr, h, rs, rg, true, nullptr, 0, nullptr, &rr));
+            if (!done && noFence && nmxFenceWait(rs))
+                done = nmxFlipSubmit(nullptr, h, rs, rg, true, nullptr, 0, nullptr, &rr);
+            if (done) OSAddAtomic64(1, &gCntFlipRedo);
+        }
+        IOLockUnlock(gFl.lock);
+        return;
+    }
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time() - gFl.stuckT0, &ns);
+    if (ns > 2000000000ull && !gFl.stuckTripped) {
+        gFl.stuckTripped = true;        // N2: escalate; keep watching so front is right when it finally lands
+        nmxFlipTrip("a fenced flip has waited 2 s for its GPU job");
+    }
+    IOLockUnlock(gFl.lock);
+    nmxFlipWatchArm(ns > 2000000000ull ? 100 : 4);
+}
 static void nmxFlipRetire()
 {
     if (gFl.pend == NMX_FLIP_NONE || __atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) return;
@@ -1639,6 +1724,15 @@ static void nmxFlipRetire()
                 if (++gFl.frontWrites >= 16) nmxFlipTrip("CoreDisplay draws into the surface on screen; zero copy is not safe");
             }
         }
+        if (res == kLatchTimeout && gFl.pendFenced) {
+            // still committing in NMXGPU (render job slow): not on screen yet; nmxFlipWatch follows it
+            OSAddAtomic64(1, &gCntKfenceSlow);
+            FLIPLOG("fenced flip handle %u not latched within 150 ms (GPU job slow) -- watching it, flips stay on", gFl.pend);
+            gFl.stuckHandle = gFl.pend; gFl.stuckT0 = gFl.pendT0; gFl.stuckTripped = false;
+            nmxFlipWatchArm(4);
+            gFl.pend = NMX_FLIP_NONE; gFl.pendS = nullptr; gFl.pendGpu = 0;
+            return;
+        }
         // a flip that missed 50 ms is assumed to land late; flips go off either way
         gFl.front = gFl.pend; gFl.frontS = gFl.pendS; gFl.frontFence = gFl.pendFence; gFl.frontGpu = gFl.pendGpu;
         if (res == kLatchOk) {
@@ -1654,11 +1748,6 @@ static void nmxFlipRetire()
             if (n < 3 || n == 600 || n == 60000)
                 FLIPLOG("#%lld latched: handle %u -> %u (surface 0x%x), HUBP0 addr 0x%llx in use 0x%llx%s", (long long)n, was, gFl.front,
                         gFl.frontS ? gFl.frontS->getSurfaceID() : 0u, addr, inuse, pending ? " pending" : "");
-        } else if (gFl.pendFenced) {
-            // the render job is slow (NMXGPU's commit is still waiting for it): flips stay on, the bridge stays busy until
-            // it lands (later frames are dropped as BUSY), and the generation check resyncs what is on screen
-            OSAddAtomic64(1, &gCntKfenceSlow);
-            FLIPLOG("fenced flip handle %u not latched within 150 ms (GPU job slow) -- resync, flips stay on", gFl.pend);
         } else {
             OSAddAtomic64(1, &gCntFlipTimeouts);
             nmxFlipTrip("a flip did not latch within 50 ms");
@@ -1704,7 +1793,9 @@ static void nmxFlipDrop(NmxImport *e)
 static void nmxFlipDropIdle()
 {
     for (unsigned i = 0; i < kNmxFlipImports; i++)
-        if (gFl.imp[i].s && gFl.imp[i].handle != gFl.front && gFl.imp[i].handle != gFl.pend) nmxFlipDrop(&gFl.imp[i]);
+        if (gFl.imp[i].s && gFl.imp[i].handle != gFl.front && gFl.imp[i].handle != gFl.pend &&
+            gFl.imp[i].handle != gFl.stuckHandle && gFl.imp[i].handle != gFl.redoHandle)
+            nmxFlipDrop(&gFl.imp[i]);
 }
 static NmxImport *nmxFlipImportSurface(IOSurface *s, unsigned fmt, unsigned w, unsigned h, unsigned pitch)
 {
@@ -1721,6 +1812,8 @@ static NmxImport *nmxFlipImportSurface(IOSurface *s, unsigned fmt, unsigned w, u
     for (unsigned i = 0; i < slots; i++) {
         if (!gFl.imp[i].s) { k = (int)i; break; }
         if (gFl.imp[i].handle == gFl.front || gFl.imp[i].handle == gFl.pend) continue;
+        // out-31 N5: a stuck fenced flip may be on screen any moment, and the redo frame is shown after it
+        if (gFl.imp[i].handle == gFl.stuckHandle || gFl.imp[i].handle == gFl.redoHandle) continue;
         if (k < 0 || gFl.imp[i].use < gFl.imp[k].use) k = (int)i;
     }
     if (k < 0) return nullptr;
@@ -1776,10 +1869,10 @@ static bool nmxFlipSubmit(void *pipe, unsigned handle, IOSurface *s, unsigned lo
     struct NMXFlipRequest2 r2; memset(&r2, 0, sizeof r2);
     struct NMXFlipRequest &r = r2.v1;
     r.handle = handle;
-    NmxFtRec *ft = gFtCur;
+    NmxFtRec *ft = pipe ? gFtCur : nullptr;   // a redo from nmxFlipWatch belongs to no transaction
     if (ft) ft->sub = mach_absolute_time();
     gFl.pendFt = nullptr;
-    gFl.pendTx = gCurTx;
+    gFl.pendTx = pipe ? gCurTx : nullptr;
     IOReturn rr;
     if (kfS && gFl.v2) {
         r.flags = NMX_FLIP_SUBMIT_FENCE_ONLY;
@@ -1808,6 +1901,12 @@ static bool nmxFlipSubmit(void *pipe, unsigned handle, IOSurface *s, unsigned lo
         FLIPLOG("submit of handle %u refused (0x%x, err %d)", handle, rr, r.err);
         return false;
     }
+    // accepted: the bridge had nothing pending, so a stuck flip has landed; this frame is newer than any redo frame
+    if (gFl.stuckHandle != NMX_FLIP_NONE) {
+        OSAddAtomic64(1, &gCntFlipStuckLanded);
+        gFl.stuckHandle = NMX_FLIP_NONE;
+    }
+    gFl.redoHandle = NMX_FLIP_NONE; gFl.redoS = nullptr;
     const SInt64 n = OSAddAtomic64(1, &gCntFlipSubmit);
     if (n < 3) FLIPLOG("submitted handle %u seq %llu (surface 0x%x)%s", handle, r.seq, s ? s->getSurfaceID() : 0u, wait ? ", waiting for the latch" : "");
     gFl.pend = handle; gFl.pendS = s; gFl.pendSeq = r.seq; gFl.pendGpu = gpu;
@@ -1882,6 +1981,14 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
             memset(&r2, 0, sizeof r2);
             rr = nmxFlipCall(kFnCaps, &r);
         }
+        if (rr == kIOReturnNotReady) {
+            // out-31 N7: NMXGPU's flip state is being set up by another caller (vblank reference, GTT sysctl): not an
+            // answer; caps stay unknown (-1) and the next frame asks again instead of keeping "missing" for the boot
+            gFl.v2 = false;
+            gFl.caps = 0;
+            want = false;
+            goto capsDone;
+        }
         gNmxFlipCaps = (rr == kIOReturnSuccess) ? (int)(r.caps & 0x7fffffff) : 0;
         gFl.notifyOn = false;
         if (gFl.v2 && (r.caps & NMX_FLIP_CAP_NOTIFY) && gNmxFlipNotify) {
@@ -1899,6 +2006,7 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
              gNmxFlipCaps ? "present" : "MISSING -- flips stay off, K6 copy", (unsigned)rr, gFl.caps, r.width, r.height, r.pitch,
              r.maxImports, r.generation, addr, inuse, pending ? " pending" : "", gFl.v2 ? 2u : 1u, gFl.notifyOn ? 1 : 0);
     }
+capsDone:
     const unsigned caps = gFl.caps;
     if (!(caps & NMX_FLIP_CAP_SUBMIT) || (mode == 1 && !(caps & NMX_FLIP_CAP_IMPORT)) || (mode == 2 && !(caps & NMX_FLIP_CAP_VRAM_CHAIN)))
         want = false;
@@ -1949,7 +2057,7 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
         if (mode == 1) {
             const unsigned fmt = l10r ? NMX_FLIP_FMT_XRGB2101010 : NMX_FLIP_FMT_XRGB8888;
             const unsigned need = l10r ? NMX_FLIP_CAP_XRGB2101010 : NMX_FLIP_CAP_XRGB8888;
-            if (s == gFl.frontS) {
+            if (s == gFl.frontS && gFl.stuckHandle == NMX_FLIP_NONE) {   // stuck: front is not what will be on screen
                 OSAddAtomic64(1, &gCntFlipSame);
                 gFl.frontFence = nmxSurfValue(s, "NMXFencePending");
                 IOLockUnlock(gFl.lock);
@@ -1993,6 +2101,7 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
             }
             gKfS = nullptr;
             if (kfRr == kIOReturnBusy) {                                // still committing the last flip: drop this frame
+                nmxFlipRedo(handle, ns, gpu, true, gKfAfterNs);         // N1: shown once that flip lands
                 IOLockUnlock(gFl.lock);
                 return true;
             }
@@ -2006,6 +2115,7 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
         IOReturn subRr = kIOReturnSuccess;
         if (handle != NMX_FLIP_NONE && (nmxFlipSubmit(pipe, handle, ns, gpu, gNmxFlipSync != 0, nullptr, 0, nullptr, &subRr) ||
                                         subRr == kIOReturnBusy)) {
+            if (subRr == kIOReturnBusy) nmxFlipRedo(handle, ns, gpu, false, 0);
             IOLockUnlock(gFl.lock);       // flipped, or dropped because the bridge still commits the last flip
             return true;
         }
@@ -2022,7 +2132,8 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
         IOReturn homeRr = kIOReturnSuccess;
         if (!nmxFlipSubmit(pipe, NMX_FLIP_HOME, nullptr, 0, true, nullptr, 0, nullptr, &homeRr) && homeRr != kIOReturnBusy)
             nmxFlipTrip("could not flip back to the home buffer -- the panel keeps the last flipped frame");
-        // BUSY: a fenced flip is still committing; the home buffer already holds this frame, the next frame flips home
+        // BUSY: a fenced flip is still committing; the home buffer already holds this frame: flip home once it lands
+        if (homeRr == kIOReturnBusy) nmxFlipRedo(NMX_FLIP_HOME, nullptr, 0, false, 0);
         FLIPLOG("back home (on screen now handle %u) for a copied frame", gFl.front);
         IOLockUnlock(gFl.lock);
         return true;
