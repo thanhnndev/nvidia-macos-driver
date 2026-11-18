@@ -269,6 +269,9 @@ NMX_CNT(nmx_park_fail, gNmxParkFail, "Step142: idle parks whose move to system m
 extern "C" int nmx_userptr_park_ms;
 SYSCTL_INT(_debug, OID_AUTO, nmx_userptr_park_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_userptr_park_ms, 0,
            "Step142: unwire an IOSurface userptr BO's memory after this many ms without GPU use; 0 = never");
+extern "C" int nmx_ft_on;
+SYSCTL_INT(_debug, OID_AUTO, nmx_ft, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_ft_on, 0,
+           "frame-path trace (FRAME-PATH.md section 7): 0 stops the NMXGPU-side hooks (flip records, VBL timer phase, memory stalls)");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -354,6 +357,7 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_park_skip_busy);
     sysctl_register_oid(&sysctl__debug_nmx_park_fail);
     sysctl_register_oid(&sysctl__debug_nmx_userptr_park_ms);
+    sysctl_register_oid(&sysctl__debug_nmx_ft);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);

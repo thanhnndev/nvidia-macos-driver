@@ -601,7 +601,7 @@ static uint32_t flip_buffers(struct nmx_flipreq *r)
 }
 
 static void ft_submit_begin(uint32_t handle);
-static void ft_submit_end(uint64_t seq, int ok);
+static void ft_submit_end(uint64_t seq, int ok, const void *commit);
 static void ft_seen(void);
 
 /* lock held. Retire a pending flip whose commit has signalled flip_done; notice a bridge commit. */
@@ -695,16 +695,16 @@ deadlk:
         flip.pending = FLIP_NONE;
         if (commit)
             drm_crtc_commit_put(commit);
+        ft_submit_end(0, 0, NULL);      /* under the lock: a status call cannot retire the record first */
         spin_unlock(&flip.lock);
-        ft_submit_end(0, 0);
         FLIP_LOG("NMX flip: submit of handle %u failed (%d%s)\n", h, e, e ? "" : ", no commit");
         r->err = e ? e : -EINVAL;
         return e == -EBUSY ? FLIP_R_BUSY : FLIP_R_ERROR;
     }
     flip.commit = commit;
     r->seq = ++flip.seq_sub;
+    ft_submit_end(r->seq, 1, commit);
     spin_unlock(&flip.lock);
-    ft_submit_end(r->seq, 1);
     return FLIP_R_OK;
 }
 
@@ -984,6 +984,7 @@ int nmx_dm_ips_counts(struct drm_device *ddev, u32 out[7]);
 #define FT_N 512u
 struct nmx_ft_rec {
     uint64_t seq, sub0, sub1, armed, pflip, seen;
+    const void *commit;             /* compared only (never dereferenced): which commit this record is */
     uint32_t handle, vbl_armed, vbl_pflip;
     int32_t idle;
 };
@@ -996,9 +997,12 @@ static struct {
     uint64_t frame_ns;
 } ft;
 
+int nmx_ft_on = 1;                  /* debug.nmx_ft: 0 stops every frame-path hook (NMXGPU side) */
+
 static int ft_is_panel(struct drm_crtc *crtc)
 {
-    return __atomic_load_n(&flip.inited, __ATOMIC_ACQUIRE) && crtc == flip.crtc;
+    return __atomic_load_n(&nmx_ft_on, __ATOMIC_RELAXED) && __atomic_load_n(&flip.inited, __ATOMIC_ACQUIRE) &&
+           crtc == flip.crtc;
 }
 
 static struct nmx_ft_rec *ft_cur(void)
@@ -1010,6 +1014,10 @@ static struct nmx_ft_rec *ft_cur(void)
 /* flip_submit entry: a new record */
 static void ft_submit_begin(uint32_t handle)
 {
+    if (!__atomic_load_n(&nmx_ft_on, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&ft.cur, 0, __ATOMIC_RELEASE);
+        return;
+    }
     uint64_t i = __atomic_fetch_add(&ft.head, 1, __ATOMIC_ACQ_REL);
     struct nmx_ft_rec *r = &ft.r[i % FT_N];
     memset(r, 0, sizeof(*r));
@@ -1019,13 +1027,14 @@ static void ft_submit_begin(uint32_t handle)
     __atomic_store_n(&ft.cur, i + 1, __ATOMIC_RELEASE);
 }
 
-static void ft_submit_end(uint64_t seq, int ok)
+static void ft_submit_end(uint64_t seq, int ok, const void *commit)
 {
     struct nmx_ft_rec *r = ft_cur();
     if (!r)
         return;
     r->sub1 = mach_absolute_time();
     r->seq = ok ? seq : 0;
+    r->commit = commit;
     if (!ok)
         __atomic_store_n(&ft.cur, 0, __ATOMIC_RELEASE);
 }
@@ -1046,6 +1055,8 @@ void nmx_ft_armed(struct drm_crtc *crtc, int idle_allowed)
         return;
     __atomic_fetch_add(&ft.armed_n, 1, __ATOMIC_RELAXED);
     r = ft_cur();
+    if (r && r->commit && crtc->state && crtc->state->commit != r->commit)
+        r = NULL;                   /* another commit on the CRTC (cursor, modeset): not this flip */
     if (r && !r->armed) {
         r->armed = mach_absolute_time();
         r->vbl_armed = (uint32_t)drm_crtc_vblank_count(crtc);
@@ -1078,6 +1089,8 @@ void nmx_ft_vblank(struct drm_crtc *crtc)
 /* nmx_fb.cpp vblFire: where in the real frame the IOFramebuffer VBL timer fired */
 void nmx_ft_vbl_timer(uint64_t frame_ns)
 {
+    if (!__atomic_load_n(&nmx_ft_on, __ATOMIC_RELAXED))
+        return;
     uint64_t now = mach_absolute_time(), last = __atomic_load_n(&ft.last_vbl_ns, __ATOMIC_ACQUIRE);
     __atomic_fetch_add(&ft.timer_fires, 1, __ATOMIC_RELAXED);
     ft.frame_ns = frame_ns;
@@ -1094,14 +1107,17 @@ void nmx_ft_vbl_timer(uint64_t frame_ns)
  * total and max time, a log2-ms histogram (<0.1, <1, <10, <100, <1000, >=1000 ms), and the last 128 events >= 1 ms with
  * their start time (same clock as the flip records), duration, pages and pid, so the report can put them next to late
  * frames. Kinds: 0 restore = Step142 re-wire of a parked userptr BO (TTM populate in CS), 1 inline = 2 MB chunk made on
- * the allocating thread (pool empty), 2 fill = chunk made by the fill thread call, 3 wire = new userptr wire (import).
+ * the allocating thread (pool empty), 2 fill = chunk made by the fill thread call, 3 wire = new userptr wire of a plain
+ * user range (import; also the fallback after a failed surf), 4 surf = wire through the IOSurface's own descriptor. Every
+ * call is counted and histogrammed (most are fast); only those >= 1 ms enter the event list. Do not read across a GPU
+ * reset or sleep (the flip records restart; mixed snapshots do not join).
  */
 struct proc;
 extern struct proc *current_proc(void);    /* already imported (no new undefined symbol) */
 extern int proc_pid(struct proc *);
-#define ST_KINDS 4
+#define ST_KINDS 5
 #define ST_N 128u
-static const char *const st_name[ST_KINDS] = { "restore", "inline", "fill", "wire" };
+static const char *const st_name[ST_KINDS] = { "restore", "inline", "fill", "wire", "surf" };
 static struct {
     uint64_t n[ST_KINDS], sum_ns[ST_KINDS], max_ns[ST_KINDS], hist[ST_KINDS][6];
     uint64_t head;
@@ -1112,7 +1128,7 @@ void nmx_ft_stall(int kind, uint64_t t0, uint64_t pages)
 {
     uint64_t t1 = mach_absolute_time(), d = t1 > t0 ? t1 - t0 : 0, m;
     int b = d < 100000ULL ? 0 : d < 1000000ULL ? 1 : d < 10000000ULL ? 2 : d < 100000000ULL ? 3 : d < 1000000000ULL ? 4 : 5;
-    if (kind < 0 || kind >= ST_KINDS)
+    if (kind < 0 || kind >= ST_KINDS || !__atomic_load_n(&nmx_ft_on, __ATOMIC_RELAXED))
         return;
     __atomic_fetch_add(&st.n[kind], 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&st.sum_ns[kind], d, __ATOMIC_RELAXED);

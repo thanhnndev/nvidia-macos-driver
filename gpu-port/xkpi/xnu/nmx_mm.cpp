@@ -447,7 +447,7 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         if (sid != 0) {
             uint64_t surf_t0 = mach_absolute_time();
             int sr = surf_wire(task, sid, uaddr, npages, write, phys, handle);
-            nmx_ft_stall(3, surf_t0, npages);
+            nmx_ft_stall(4, surf_t0, npages);
             if (sr == 0) {
                 (void)hint_find(task, uaddr, (uint64_t)npages * PAGE_SIZE, true);
                 __atomic_add_fetch(&gNmxSurfWire, 1, __ATOMIC_RELAXED);
