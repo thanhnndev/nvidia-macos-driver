@@ -1458,6 +1458,7 @@ struct NmxFlip {
     volatile SInt32 result;                // kLatch*
     volatile unsigned long long claimedSeq; // notify mode: the last flip seq whose completion ran (one per flip)
     volatile unsigned long long notifySeq; // the seq NMXGPU's last pageflip notification named
+    uint64_t netNs;                        // notify mode: when the safety-net look runs after a submit (0 = 4 ms)
     bool pendFenced;                       // the pending flip waits for its render job in NMXGPU's commit
     // out-31 N1/N2/N5: a fenced flip that missed its 150 ms cap is still committing in NMXGPU ("stuck"). It is not
     // assumed on screen; its import and the last frame dropped behind it (redo) are kept from eviction; nmxFlipWatch
@@ -1616,6 +1617,18 @@ static void nmxFlipPoll(void *, void *)
     if (seq != __atomic_load_n(&gFl.pendSeq, __ATOMIC_ACQUIRE) || !__atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) return;
     void *pipe = gFl.pipe;
     NmxFtRec *ft = gFl.pendFt;
+    if (res == kLatchOk && gFl.notifyOn && gNmxFlipNotify) {
+        // flip_rearm 1.21 of latched on out-34 (2026-11-18 20:18): a commit latches at the next vblank, 5.9 ms after
+        // the submit on average and > 4 ms on 99 % of flips, so a fixed 4 ms net looked before the IRQ on nearly every
+        // flip and re-armed 2 ms steps until the IRQ came. The net follows the latch delay instead: the largest recent
+        // one + 2 ms (slow decay), 4..20 ms; a missed IRQ still completes within one net + 2 ms steps.
+        uint64_t net = gFl.netNs ? gFl.netNs : 4000000ull;
+        net -= net / 16;
+        if (ns + 2000000ull > net) net = ns + 2000000ull;
+        if (net < 4000000ull) net = 4000000ull;
+        if (net > 20000000ull) net = 20000000ull;
+        gFl.netNs = net;
+    }
     if (ft) ft->latch = (res == kLatchOk && gFl.latchNs) ? gFl.latchNs : mach_absolute_time();
     OSAddAtomic64((SInt64)(ns / 1000), &gCntFlipWaitUs);
     if (res == kLatchOk) nmxFlipStampTx(pipe, gFl.pendTx, gFl.latchNs);
@@ -1723,9 +1736,12 @@ static void nmxFlipWatch(void *, void *)
     if (!rk && rs) {
         // the GPU wait happens without gFl.lock (follow-up 5: the pipe thread must not stall behind it); redoHandle
         // stays set, so the import is kept, and any accepted submit meanwhile clears it
+        // review 1: an accepted submit meanwhile clears redoS and may drop the last reference; hold our own
+        ((OSObject *)rs)->retain();
         IOLockUnlock(gFl.lock);
         const bool done = nmxFenceWait(rs);
         IOLockLock(gFl.lock);
+        ((OSObject *)rs)->release();    // gFl.redoS is only compared below, rs is not used past this point
         if (gFl.redoHandle != h || gFl.redoS != rs || !done || gFl.pend != NMX_FLIP_NONE ||
             __atomic_load_n(&gFl.busy, __ATOMIC_ACQUIRE)) {
             if (gFl.redoHandle == h && !done) { gFl.redoHandle = NMX_FLIP_NONE; gFl.redoS = nullptr; gFl.redoArmed = false; }
@@ -1977,9 +1993,10 @@ static bool nmxFlipSubmit(void *pipe, unsigned handle, IOSurface *s, unsigned lo
     if (pipe) ((OSObject *)pipe)->retain();
     __atomic_store_n(&gFl.busy, 1, __ATOMIC_RELEASE);
     if (gFl.notifyOn && gNmxFlipNotify) {
-        // the pageflip IRQ wakes the completion (thread_call_enter moves this call up); 4 ms is only the safety net
+        // the pageflip IRQ wakes the completion (thread_call_enter moves this call up); the net (4..20 ms, learned
+        // from the latch delay in nmxFlipPoll) is only the safety net
         uint64_t d;
-        nanoseconds_to_absolutetime(4000000ull, &d);
+        nanoseconds_to_absolutetime(gFl.netNs ? gFl.netNs : 4000000ull, &d);
         thread_call_enter_delayed(gFl.call, mach_absolute_time() + d);
         // the notification can only come after the commit; if it already came before busy was set, look now
         if (__atomic_load_n(&gFl.notifySeq, __ATOMIC_ACQUIRE) >= r.seq) thread_call_enter(gFl.call);
@@ -2028,9 +2045,14 @@ static bool nmxFlipPresent(void *pipe, IOService *fb, unsigned head, IOSurface *
             rr = nmxFlipCall(kFnCaps, &r);
         }
         static unsigned notReadyRun;
+        static bool notReadyLogged;
         if (rr == kIOReturnNotReady && ++notReadyRun >= 600) {
             // follow-up 4: NMXGPU answers "not ready" for good too (no framebuffer / CRTC): stop asking every frame
-            ALOG("iop: flip: NMXGPU flip API not ready after %u asks -- flips stay off, K6 copy", notReadyRun);
+            // review 5: say so once per boot; a new framebuffer asks again and may turn flips off again silently
+            if (!notReadyLogged) {
+                notReadyLogged = true;
+                ALOG("iop: flip: NMXGPU flip API not ready after %u asks -- flips stay off, K6 copy", notReadyRun);
+            }
             rr = kIOReturnNotFound;
         }
         if (rr != kIOReturnNotReady) notReadyRun = 0;
