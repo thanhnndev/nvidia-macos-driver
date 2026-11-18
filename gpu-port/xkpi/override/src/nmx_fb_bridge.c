@@ -1156,8 +1156,12 @@ void nmx_ft_pflip(struct drm_crtc *crtc)
 }
 
 
+static void vbl_deliver(void);
+
 void nmx_ft_vblank(struct drm_crtc *crtc)
 {
+    if (__atomic_load_n(&flip.inited, __ATOMIC_ACQUIRE) && crtc == flip.crtc)
+        vbl_deliver();                  /* out-31 row 2: IOFramebuffer 'vbl ' from the real CRTC vblank */
     if (!ft_is_panel(crtc))
         return;
     __atomic_store_n(&ft.last_vbl_ns, mach_absolute_time(), __ATOMIC_RELEASE);
@@ -1384,4 +1388,66 @@ void nmx_fb_flip_done(struct drm_crtc *crtc)
         return;
     __atomic_add_fetch(&gNmxFlipNotified, 1, __ATOMIC_RELAXED);
     fn(flip.notify_ref, __atomic_load_n(&flip.seq_sub, __ATOMIC_RELAXED), __atomic_load_n(&flip.pflip_t, __ATOMIC_ACQUIRE));
+}
+
+/* ---- out-31 row 2: IOFramebuffer VBL from the CRTC vblank ----------------------------------------------------------
+ *
+ * Linux: a vblank consumer holds drm_crtc_vblank_get() while it wants vblanks (the DRM vblank IRQ stays enabled and
+ * amdgpu_dm_crtc_vblank_control_worker counts it in active_vblank_irq_count), drm_crtc_handle_vblank() runs from
+ * dm_crtc_high_irq, and drm_crtc_vblank_put() lets the IRQ go (and idle optimisations come back) when nobody wants it.
+ * NMXAMDFB registers a sink and asks for the reference while IOFramebuffer has a VBL interrupt enabled
+ * (setInterruptState); nmx_ft_vblank (dm_crtc_high_irq) calls the sink. The sink only kicks a thread call.
+ */
+static struct {
+    void (*fn)(void *, uint64_t);
+    void *arg;
+    int busy, held;
+} vbl;
+
+static void vbl_deliver(void)
+{
+    void (*fn)(void *, uint64_t);
+
+    if (!__atomic_load_n(&nmx_vbl_irq, __ATOMIC_RELAXED))
+        return;
+    __atomic_add_fetch(&vbl.busy, 1, __ATOMIC_ACQUIRE);
+    fn = __atomic_load_n(&vbl.fn, __ATOMIC_ACQUIRE);
+    if (fn) {
+        fn(vbl.arg, mach_absolute_time());
+        __atomic_add_fetch(&gNmxVblDelivered, 1, __ATOMIC_RELAXED);
+    }
+    __atomic_sub_fetch(&vbl.busy, 1, __ATOMIC_RELEASE);
+}
+
+/* NULL fn unregisters and returns only when no delivery is still inside the old sink */
+void nmx_fb_vbl_set_sink(void (*fn)(void *, uint64_t), void *arg)
+{
+    __atomic_store_n(&vbl.fn, NULL, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&vbl.busy, __ATOMIC_ACQUIRE))
+        cpu_relax();
+    if (fn) {
+        vbl.arg = arg;
+        __atomic_store_n(&vbl.fn, fn, __ATOMIC_RELEASE);
+    }
+}
+
+/* thread context only (drm_crtc_vblank_get can enable the IRQ). Returns 1 while a reference is held, 0 when none is
+ * (released, or the CRTC is off: drm_crtc_vblank_get -EINVAL, the caller's timer is the fallback). Idempotent. */
+int nmx_fb_vbl_ref(int on)
+{
+    static DEFINE_MUTEX(vbl_mtx);
+    int held;
+
+    if (!flip_init())
+        return 0;
+    mutex_lock(&vbl_mtx);
+    if (on && !vbl.held && __atomic_load_n(&nmx_vbl_irq, __ATOMIC_RELAXED))
+        vbl.held = drm_crtc_vblank_get(flip.crtc) == 0;
+    else if (!on && vbl.held) {
+        drm_crtc_vblank_put(flip.crtc);
+        vbl.held = 0;
+    }
+    held = vbl.held;
+    mutex_unlock(&vbl_mtx);
+    return held;
 }

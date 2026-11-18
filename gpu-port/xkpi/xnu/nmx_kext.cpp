@@ -283,11 +283,14 @@ SYSCTL_INT(_debug, OID_AUTO, nmx_flip_kfence, CTLFLAG_RW | CTLFLAG_LOCKED | CTLF
            "out-31 row 1: flips wait for the IOSurface's last CS job fence in the atomic commit; 0 = NMXAccel polls NMXFenceDone");
 SYSCTL_INT(_debug, OID_AUTO, nmx_flip_irq, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_flip_irq, 0,
            "out-31 row 3: the pageflip IRQ notifies NMXAccel; 0 = NMXAccel polls flip status");
+SYSCTL_INT(_debug, OID_AUTO, nmx_vbl_irq, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_vbl_irq, 0,
+           "out-31 row 2: IOFramebuffer VBL from the CRTC vblank IRQ (vblank reference held while enabled); 0 = timer");
 extern "C" volatile SInt64 gNmxFlipFenced, gNmxFlipNoFence, gNmxSurfFenceSet, gNmxFlipNotified, gNmxVblDelivered;
 NMX_CNT(nmx_flip_fenced, gNmxFlipFenced, "out-31: flips committed with a kernel render fence on the plane");
 NMX_CNT(nmx_flip_nofence, gNmxFlipNoFence, "out-31: fence-only flips refused because no fence was known for the surface");
 NMX_CNT(nmx_surf_fence_set, gNmxSurfFenceSet, "out-31: CS jobs recorded as an IOSurface's last fence");
 NMX_CNT(nmx_flip_notified, gNmxFlipNotified, "out-31: pageflip IRQ notifications sent to NMXAccel");
+NMX_CNT(nmx_vbl_delivered, gNmxVblDelivered, "out-31: CRTC vblanks handed to the framebuffer's VBL sink");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -381,13 +384,16 @@ static void nmx_sysctl_install(void)
         int v;
         if (PE_parse_boot_argn("nmxkfence", &v, sizeof v)) nmx_flip_kfence = v != 0;
         if (PE_parse_boot_argn("nmxflipirq", &v, sizeof v)) nmx_flip_irq = v != 0;
+        if (PE_parse_boot_argn("nmxvblirq", &v, sizeof v)) nmx_vbl_irq = v != 0;
     }
     sysctl_register_oid(&sysctl__debug_nmx_flip_kfence);
     sysctl_register_oid(&sysctl__debug_nmx_flip_irq);
+    sysctl_register_oid(&sysctl__debug_nmx_vbl_irq);
     sysctl_register_oid(&sysctl__debug_nmx_flip_fenced);
     sysctl_register_oid(&sysctl__debug_nmx_flip_nofence);
     sysctl_register_oid(&sysctl__debug_nmx_surf_fence_set);
     sysctl_register_oid(&sysctl__debug_nmx_flip_notified);
+    sysctl_register_oid(&sysctl__debug_nmx_vbl_delivered);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);

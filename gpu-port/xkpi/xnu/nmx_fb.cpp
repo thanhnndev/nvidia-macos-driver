@@ -24,6 +24,10 @@
 extern "C" long long nmx_fb_flip_call(const char *name, void *req);
 /* frame-path trace (nmx_fb_bridge.c): the timer's phase against the real vblank */
 extern "C" void nmx_ft_vbl_timer(uint64_t frame_ns);
+/* out-31 row 2 (nmx_fb_bridge.c): CRTC vblank sink and the DRM vblank reference; debug.nmx_vbl_irq / nmxvblirq=0 */
+extern "C" void nmx_fb_vbl_set_sink(void (*fn)(void *, uint64_t), void *arg);
+extern "C" int nmx_fb_vbl_ref(int on);
+extern "C" int nmx_vbl_irq;
 #include "../../../kexts/NVRM/nvrm_vram_abi.h"
 
 #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
@@ -131,10 +135,26 @@ class NMXAMDFB : public IOFramebuffer {
     nmx_fb_display_info fDisplay = {};
     uint32_t fRefresh16 = 60 << 16;
     uint64_t fFrameNs = 16666667ull;
-    struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
-    Irq fVbl, fConnect;
-    thread_call_t fVblTimer = nullptr;
+    struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; volatile bool on = true; };
+    /*
+     * out-31 row 2. IOFramebuffer's VBL contract (FRAME-PATH.md section 4): each client (the display pipe, the cursor)
+     * registers its own 'vbl ' interrupt and turns it on and off with setInterruptState, refcounted, and IOFramebuffer
+     * turns it off itself after idle frames (deferredVBLDisable). Up to kVblSlots registrations are kept; while any is
+     * on, NMXGPU holds a DRM vblank reference (drm_crtc_vblank_get, as a Linux vblank client does) and every CRTC
+     * vblank (dm_crtc_high_irq) is delivered from fVblHw. The timer only stands in when the CRTC gives no vblank (off,
+     * reference refused, IRQ stale > 2 frames) and otherwise wakes every kVblWatchMs to check. debug.nmx_vbl_irq=0:
+     * the old path, the last registration always on, delivered by the frame timer.
+     */
+    static const int kVblSlots = 4;
+    static const uint64_t kVblWatchMs = 100;
+    Irq fVblSlot[kVblSlots], fConnect;
+    Irq *fVblLast = nullptr;
+    thread_call_t fVblTimer = nullptr, fVblHw = nullptr, fVblRef = nullptr;
     uint64_t fVblNext = 0;
+    volatile uint64_t fHwVblAt = 0;     // mach time of the last CRTC vblank handed over
+    volatile UInt32 fTimerIdle = 0;     // the timer did not re-arm itself (nothing to deliver)
+    volatile int fRefHeld = 0;          // NMXGPU holds the DRM vblank reference for us
+    unsigned fRefRetry = 0;
     volatile bool fStopping = false;
     bool fPowerRegistered = false;
     bool fForeign = false;      // head 4 of NVAccel's display machine (the NV controller group)
@@ -277,14 +297,78 @@ private:
               (unsigned long long)(fForeign ? 4 : 0), a, b);
     }
 
+    static bool vblIrqMode() { return __atomic_load_n(&nmx_vbl_irq, __ATOMIC_RELAXED) != 0; }
+    bool vblWanted() const {
+        for (int i = 0; i < kVblSlots; i++)
+            if (fVblSlot[i].proc && fVblSlot[i].on) return true;
+        return false;
+    }
+    void vblDeliver() {
+        if (!vblIrqMode()) {            // old path: the last registration, whatever its state
+            Irq *l = fVblLast;
+            if (l && l->proc) l->proc(l->target, l->ref);
+            return;
+        }
+        for (int i = 0; i < kVblSlots; i++) {
+            Irq &q = fVblSlot[i];
+            if (q.proc && q.on) q.proc(q.target, q.ref);
+        }
+    }
+    /* IH thread (dm_crtc_high_irq): no locks, no sleeping, only the hand-over */
+    static void vblSink(void *p0, uint64_t now) {
+        NMXAMDFB *me = (NMXAMDFB *)p0;
+        __atomic_store_n(&me->fHwVblAt, now, __ATOMIC_RELEASE);
+        if (!me->fStopping && me->fVblHw && vblIrqMode() && me->fRefHeld) thread_call_enter(me->fVblHw);
+    }
+    static void vblHwFire(thread_call_param_t p0, thread_call_param_t) {
+        NMXAMDFB *me = (NMXAMDFB *)p0;
+        if (!me->fStopping && vblIrqMode() && me->fRefHeld) me->vblDeliver();
+    }
+    void vblArmTimer() {
+        if (fVblTimer && OSCompareAndSwap(1, 0, &fTimerIdle)) {
+            uint64_t period;
+            nanoseconds_to_absolutetime(fFrameNs, &period);
+            fVblNext = mach_absolute_time() + period;
+            thread_call_enter_delayed(fVblTimer, fVblNext);
+        }
+    }
+    /* thread call: take or drop the DRM vblank reference to match the registrations (drm_crtc_vblank_get may sleep) */
+    static void vblRefFire(thread_call_param_t p0, thread_call_param_t) {
+        NMXAMDFB *me = (NMXAMDFB *)p0;
+        if (me->fStopping) return;
+        const bool want = vblIrqMode() && me->vblWanted();
+        const int held = nmx_fb_vbl_ref(want ? 1 : 0);
+        if (held != me->fRefHeld) me->trace(held ? "vblank ref held" : "vblank ref dropped", (unsigned long long)want);
+        me->fRefHeld = held;
+        me->vblArmTimer();
+    }
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
         if (me->fStopping) return;
-        nmx_ft_vbl_timer(me->fFrameNs);
-        if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
         uint64_t period;
         nanoseconds_to_absolutetime(me->fFrameNs, &period);
         uint64_t now = mach_absolute_time();
+        if (vblIrqMode()) {
+            if (!me->vblWanted()) {
+                if (me->fRefHeld && me->fVblRef) thread_call_enter(me->fVblRef);
+                me->fTimerIdle = 1;     // vblRefFire re-arms when a registration turns on
+                return;
+            }
+            const uint64_t hw = __atomic_load_n(&me->fHwVblAt, __ATOMIC_ACQUIRE);
+            if (me->fRefHeld && hw && now - hw <= 2 * period) {
+                uint64_t watch;
+                nanoseconds_to_absolutetime(kVblWatchMs * 1000000ull, &watch);
+                me->fVblNext = now + watch;     // the CRTC delivers: only watch
+                thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
+                return;
+            }
+            /* fallback frame: no reference (CRTC off when asked) or the IRQ went quiet; ask again about once a second */
+            if (!me->fRefHeld && me->fVblRef && (++me->fRefRetry % 64) == 0) thread_call_enter(me->fVblRef);
+        } else if (me->fRefHeld && me->fVblRef) {
+            thread_call_enter(me->fVblRef);     // switched to the old path: drop the reference
+        }
+        nmx_ft_vbl_timer(me->fFrameNs);
+        me->vblDeliver();
         me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
         thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
     }
@@ -366,6 +450,9 @@ public:
         setupWakeWork();
         setProperty("NMXEDIDBytes", (unsigned long long)fDisplay.edid_size, 32);
         if (fDisplay.edid_size) setProperty("NMXEDIDSource", "drm-connector");
+        fVblHw = thread_call_allocate(vblHwFire, this);
+        fVblRef = thread_call_allocate(vblRefFire, this);
+        if (fVblHw && fVblRef) nmx_fb_vbl_set_sink(vblSink, this);
         fVblTimer = thread_call_allocate(vblFire, this);
         if (fVblTimer) {
             uint64_t d;
@@ -389,11 +476,15 @@ public:
             OSSafeReleaseNULL(fBacklight);
         }
         /* thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out */
-        if (fVblTimer) {
-            thread_call_cancel(fVblTimer);
-            while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); }
-            fVblTimer = nullptr;
+        nmx_fb_vbl_set_sink(nullptr, nullptr);     // returns once no CRTC vblank is inside vblSink
+        thread_call_t *tcs[3] = { &fVblTimer, &fVblHw, &fVblRef };
+        for (thread_call_t *tc : tcs) {
+            if (!*tc) continue;
+            thread_call_cancel(*tc);
+            while (!thread_call_free(*tc)) { thread_call_cancel(*tc); IOSleep(5); }
+            *tc = nullptr;
         }
+        if (fRefHeld) { nmx_fb_vbl_ref(0); fRefHeld = 0; }
         IOFramebuffer::stop(provider);
     }
 
@@ -527,12 +618,50 @@ public:
     }
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
                                       void **iref) override {
-        if (type == kIOFBVBLInterruptType) { trace("register VBL", (unsigned long long)(proc != nullptr)); fVbl = { proc, target, ref }; if (iref) *iref = &fVbl; return kIOReturnSuccess; }
+        if (type == kIOFBVBLInterruptType) {
+            trace("register VBL", (unsigned long long)(proc != nullptr));
+            Irq *slot = nullptr;
+            for (int i = 0; i < kVblSlots && !slot; i++)
+                if (!fVblSlot[i].proc) slot = &fVblSlot[i];
+            if (!slot) return kIOReturnNoResources;
+            slot->target = target;
+            slot->ref = ref;
+            slot->on = true;            // registered on; the caller turns it off with setInterruptState
+            __atomic_store_n(&slot->proc, proc, __ATOMIC_RELEASE);
+            fVblLast = slot;
+            if (iref) *iref = slot;
+            if (fVblRef) thread_call_enter(fVblRef);
+            return kIOReturnSuccess;
+        }
         if (type == kIOFBConnectInterruptType) { fConnect = { proc, target, ref }; if (iref) *iref = &fConnect; return kIOReturnSuccess; }
         return kIOReturnUnsupported;
     }
-    IOReturn unregisterInterrupt(void *) override { return kIOReturnSuccess; }
-    IOReturn setInterruptState(void *, UInt32) override { return kIOReturnSuccess; }
+    Irq *vblSlotOf(void *iref) {
+        for (int i = 0; i < kVblSlots; i++)
+            if (iref == &fVblSlot[i]) return &fVblSlot[i];
+        return nullptr;
+    }
+    IOReturn unregisterInterrupt(void *iref) override {
+        if (Irq *q = vblSlotOf(iref)) {
+            q->on = false;
+            __atomic_store_n(&q->proc, (IOFBInterruptProc)nullptr, __ATOMIC_RELEASE);
+            if (fVblLast == q) fVblLast = nullptr;
+            if (fVblRef) thread_call_enter(fVblRef);
+        } else if (iref == &fConnect) {
+            fConnect.proc = nullptr;
+        }
+        return kIOReturnSuccess;
+    }
+    IOReturn setInterruptState(void *iref, UInt32 state) override {
+        Irq *q = vblSlotOf(iref);
+        if (!q) return kIOReturnSuccess;
+        const bool on = state == kEnabledInterruptState;
+        if (q->on != on) {
+            q->on = on;
+            if (fVblRef) thread_call_enter(fVblRef);
+        }
+        return kIOReturnSuccess;
+    }
     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *) override { return kIOReturnSuccess; }
     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *, bool) override { return kIOReturnSuccess; }
     IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
