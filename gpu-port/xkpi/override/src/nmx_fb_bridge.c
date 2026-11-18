@@ -1155,8 +1155,8 @@ void nmx_ft_pflip(struct drm_crtc *crtc)
     }
 }
 
-
 static void vbl_deliver(void);
+static int out31_format(char *buf, size_t size);
 
 void nmx_ft_vblank(struct drm_crtc *crtc)
 {
@@ -1271,6 +1271,8 @@ int nmx_ft_format(char *buf, size_t size)
              ips[6]);
     else
         FT_P("ips none\n");
+    if (o < size)
+        o += out31_format(buf + o, size - o);
     if (o < size)
         o += st_format(buf + o, size - o);
     FT_P("seq handle sub0_ns sub1_us armed_us pflip_us seen_us vbl_armed vbl_pflip idle\n");
@@ -1450,4 +1452,89 @@ int nmx_fb_vbl_ref(int on)
     held = vbl.held;
     mutex_unlock(&vbl_mtx);
     return held;
+}
+
+/* trace: the panel link's PSR/Replay state and the vblank IRQ users, one line in debug.nmx_frametrace */
+int nmx_dm_psr_flags(struct drm_device *ddev, u32 out[5]);
+
+static int out31_format(char *buf, size_t size)
+{
+    size_t o = 0;
+    u32 p[5] = {0};
+    int have = flip.nfb != NULL ? nmx_dm_psr_flags(flip.nfb->client.dev, p) : -1;
+
+#define O_P(...) do { if (o < size) o += (size_t)snprintf(buf + o, size - o, __VA_ARGS__); } while (0)
+    if (have == 0)
+        O_P("psr feature_enabled %u allow_active %u version %u replay %u active_vblank_irq_count %u\n", p[0], p[1], p[2],
+            p[3], p[4]);
+    else
+        O_P("psr none active_vblank_irq_count %u\n", p[4]);
+    O_P("out31 kfence %d flip_irq %d vbl_irq %d fenced %llu nofence %llu surf_set %llu notified %llu vbl_delivered %llu "
+        "vbl_held %d\n", nmx_flip_kfence, nmx_flip_irq, nmx_vbl_irq, (unsigned long long)gNmxFlipFenced,
+        (unsigned long long)gNmxFlipNoFence, (unsigned long long)gNmxSurfFenceSet, (unsigned long long)gNmxFlipNotified,
+        (unsigned long long)gNmxVblDelivered, vbl.held);
+#undef O_P
+    return (int)(o < size ? o : size);
+}
+
+/* ---- out-31 item 3: GTT accounting (debug.nmx_gtt) -----------------------------------------------------------------
+ *
+ * Linux has this as fdinfo (amdgpu_show_fdinfo -> amdgpu_vm_get_memory) plus the TTM managers' usage in debugfs
+ * (amdgpu_gtt_mm / ttm_resource_manager_debug). One read-only text: the GTT and VRAM managers' used/size, then one line
+ * per open DRM file: pid, process name, resident bytes per placement (cpu/gtt/vram), evicted, and GEM handle count. A
+ * CS -ENOMEM with GTT near its size is TTM placement (ttm_bo.c turns -ENOSPC into -ENOMEM); with GTT room left it is
+ * page allocation (debug.nmx_page_alloc_fails).
+ */
+static int gtt_count_bo(int id, void *p, void *data)
+{
+    (*(uint32_t *)data)++;
+    return 0;
+}
+
+int nmx_gtt_format(char *buf, size_t size)
+{
+    size_t o = 0;
+    struct amdgpu_device *adev;
+    struct drm_device *dev;
+    struct drm_file *file;
+    struct ttm_resource_manager *gtt, *vram;
+
+#define G_P(...) do { if (o < size) o += (size_t)snprintf(buf + o, size - o, __VA_ARGS__); } while (0)
+    if (fbs[0].fb == NULL) {           /* read-only: never brings the flip API up from here */
+        G_P("not ready\n");
+        return (int)(o < size ? o : size);
+    }
+    adev = flip_adev(fbs[0].fb);
+    dev = adev_to_drm(adev);
+    gtt = ttm_manager_type(&adev->mman.bdev, TTM_PL_TT);
+    vram = ttm_manager_type(&adev->mman.bdev, TTM_PL_VRAM);
+    G_P("gtt used %llu size %llu vram used %llu size %llu\n",
+        gtt ? (unsigned long long)ttm_resource_manager_usage(gtt) : 0ULL, gtt ? (unsigned long long)gtt->size : 0ULL,
+        vram ? (unsigned long long)ttm_resource_manager_usage(vram) : 0ULL, vram ? (unsigned long long)vram->size : 0ULL);
+    G_P("pid name cpu_resident gtt_resident vram_resident gtt_evicted vram_evicted bos\n");
+    mutex_lock(&dev->filelist_mutex);
+    list_for_each_entry(file, &dev->filelist, lhead) {
+        struct amdgpu_fpriv *fpriv = file->driver_priv;
+        struct amdgpu_mem_stats ms[__AMDGPU_PL_NUM];
+        struct amdgpu_task_info *ti;
+        uint32_t bos = 0;
+
+        if (fpriv == NULL)
+            continue;
+        memset(ms, 0, sizeof(ms));
+        amdgpu_vm_get_memory(&fpriv->vm, ms);
+        spin_lock(&file->table_lock);
+        idr_for_each(&file->object_idr, gtt_count_bo, &bos);
+        spin_unlock(&file->table_lock);
+        ti = amdgpu_vm_get_task_info_vm(&fpriv->vm);
+        G_P("%d %s %llu %llu %llu %llu %llu %u\n", ti ? (int)ti->tgid : -1, ti ? ti->process_name : "?",
+            (unsigned long long)ms[TTM_PL_SYSTEM].drm.resident, (unsigned long long)ms[TTM_PL_TT].drm.resident,
+            (unsigned long long)ms[TTM_PL_VRAM].drm.resident, (unsigned long long)ms[TTM_PL_TT].evicted,
+            (unsigned long long)ms[TTM_PL_VRAM].evicted, bos);
+        if (ti)
+            amdgpu_vm_put_task_info(ti);
+    }
+    mutex_unlock(&dev->filelist_mutex);
+#undef G_P
+    return (int)(o < size ? o : size);
 }

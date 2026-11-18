@@ -291,6 +291,20 @@ NMX_CNT(nmx_flip_nofence, gNmxFlipNoFence, "out-31: fence-only flips refused bec
 NMX_CNT(nmx_surf_fence_set, gNmxSurfFenceSet, "out-31: CS jobs recorded as an IOSurface's last fence");
 NMX_CNT(nmx_flip_notified, gNmxFlipNotified, "out-31: pageflip IRQ notifications sent to NMXAccel");
 NMX_CNT(nmx_vbl_delivered, gNmxVblDelivered, "out-31: CRTC vblanks handed to the framebuffer's VBL sink");
+extern "C" int nmx_gtt_format(char *buf, size_t size);
+static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 16 * 1024;
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = nmx_gtt_format(buf, size);
+    if (n < 0) n = 0;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_gtt, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0, nmx_gtt_sysctl,
+            "A", "out-31: GTT and VRAM used/size, and per open DRM file: pid, name, resident bytes per placement, evicted, BOs");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -394,6 +408,7 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_surf_fence_set);
     sysctl_register_oid(&sysctl__debug_nmx_flip_notified);
     sysctl_register_oid(&sysctl__debug_nmx_vbl_delivered);
+    sysctl_register_oid(&sysctl__debug_nmx_gtt);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);
