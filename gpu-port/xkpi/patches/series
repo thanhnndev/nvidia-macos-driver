@@ -40,3 +40,4 @@ amdgpu-nmx-surface-fence.patch
 amdgpu-dm-nmx-flipdone.patch
 amdgpu-vm-task-tgid.patch
 amdgpu-vm-fault-name.patch
+amdgpu-vm-fini-wait-diag.patch

@@ -1,0 +1,102 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2989,8 +2989,83 @@
+ 			return false;
+ 	}
+ 	return true;
++}
++
++#ifdef NMXKPI
++/*
++ * ga403wm 2026-11-19 (BOOT-TIMELINE 4): VTDecoderXPCService [19187] hung 2 h 14 min in amdgpu_vm_fini+0x105 on out-37,
++ * the wait for vm->last_tlb_flush, with every scheduler idle and no ring timeout logged: a page-table job that never
++ * reached a ring. To name it the next time: the wait stays unbounded (freeing page tables while a job may still write
++ * them is worse than a stuck exit), but after 5 s, then every 60 s, the fence, its scheduler state, the VM's two
++ * page-table entities (queue, stopped, the dependency they wait on) and the root's unsignalled fences are logged.
++ * The root reservation is held here, so the root's fence list is stable; an entity's dependency is read without its
++ * lock, which is safe only because nothing moves while this is stuck.
++ */
++static void nmx_vm_fence_desc(struct amdgpu_device *adev, const char *what, struct dma_fence *f)
++{
++	struct drm_sched_fence *sf;
++
++	if (!f) {
++		dev_err(adev->dev, "vm_fini:   %s: none\n", what);
++		return;
++	}
++	sf = to_drm_sched_fence(f);
++	dev_err(adev->dev, "vm_fini:   %s: %s:%s ctx %llu seq %llu signaled %d error %d%s\n", what,
++		f->ops->get_driver_name(f), f->ops->get_timeline_name(f), (unsigned long long)f->context,
++		(unsigned long long)f->seqno, dma_fence_is_signaled(f), f->error, sf ? "" : " (not a scheduler fence)");
++	if (sf)
++		dev_err(adev->dev, "vm_fini:     scheduler %s, scheduled %d, hardware fence %s seq %llu signaled %d\n",
++			sf->sched ? sf->sched->name : "?", dma_fence_is_signaled(&sf->scheduled),
++			sf->parent ? sf->parent->ops->get_timeline_name(sf->parent) : "none (not on a ring)",
++			sf->parent ? (unsigned long long)sf->parent->seqno : 0ULL,
++			sf->parent ? dma_fence_is_signaled(sf->parent) : -1);
+ }
+ 
++static void nmx_vm_entity_desc(struct amdgpu_device *adev, const char *what, struct drm_sched_entity *e)
++{
++	struct dma_fence *dep = READ_ONCE(e->dependency);
++
++	dev_err(adev->dev, "vm_fini:   entity %s: %d jobs queued, stopped %d, scheduler %s\n", what,
++		spsc_queue_count(&e->job_queue), e->stopped, e->rq && e->rq->sched ? e->rq->sched->name : "none");
++	if (dep)
++		nmx_vm_fence_desc(adev, "  it waits on", dep);
++}
++
++static void nmx_vm_fini_wait(struct amdgpu_device *adev, struct amdgpu_vm *vm, struct amdgpu_bo *root,
++			     struct dma_fence *f, const char *what)
++{
++	long t = msecs_to_jiffies(5000);
++	unsigned int waited = 0;
++
++	while (dma_fence_wait_timeout(f, false, t) == 0) {
++		struct dma_resv_iter cursor;
++		struct dma_fence *r;
++		int n = 0;
++
++		waited += jiffies_to_msecs(t) / 1000;
++		dev_err(adev->dev, "vm_fini: %s (pid %d) still waits on vm->%s after %u s:\n",
++			vm->task_info ? vm->task_info->process_name : "?", vm->task_info ? vm->task_info->tgid : -1,
++			what, waited);
++		nmx_vm_fence_desc(adev, what, f);
++		nmx_vm_entity_desc(adev, "immediate", &vm->immediate);
++		nmx_vm_entity_desc(adev, "delayed", &vm->delayed);
++		dma_resv_for_each_fence(&cursor, root->tbo.base.resv, DMA_RESV_USAGE_BOOKKEEP, r) {
++			if (dma_fence_is_signaled(r))
++				continue;
++			if (n++ == 16)
++				break;
++			nmx_vm_fence_desc(adev, dma_resv_iter_usage(&cursor) == DMA_RESV_USAGE_KERNEL ? "root (kernel)" :
++					  dma_resv_iter_usage(&cursor) == DMA_RESV_USAGE_WRITE ? "root (write)" :
++					  dma_resv_iter_usage(&cursor) == DMA_RESV_USAGE_READ ? "root (read)" :
++					  "root (bookkeep)", r);
++		}
++		if (!n)
++			dev_err(adev->dev, "vm_fini:   root: no unsignalled fence\n");
++		t = msecs_to_jiffies(60000);
++	}
++}
++#endif
++
+ /**
+  * amdgpu_vm_fini - tear down a vm instance
+  *
+@@ -3015,9 +3090,15 @@
+ 	root = amdgpu_bo_ref(vm->root.bo);
+ 	amdgpu_bo_reserve(root, true);
+ 	amdgpu_vm_set_pasid(adev, vm, 0);
++#ifdef NMXKPI
++	nmx_vm_fini_wait(adev, vm, root, vm->last_unlocked, "last_unlocked");
++	dma_fence_put(vm->last_unlocked);
++	nmx_vm_fini_wait(adev, vm, root, vm->last_tlb_flush, "last_tlb_flush");
++#else
+ 	dma_fence_wait(vm->last_unlocked, false);
+ 	dma_fence_put(vm->last_unlocked);
+ 	dma_fence_wait(vm->last_tlb_flush, false);
++#endif
+ 	/* Make sure that all fence callbacks have completed */
+ 	spin_lock_irqsave(vm->last_tlb_flush->lock, flags);
+ 	spin_unlock_irqrestore(vm->last_tlb_flush->lock, flags);
