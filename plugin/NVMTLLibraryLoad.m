@@ -21,6 +21,7 @@ extern char **environ;
 
 void nvlog(const char *fmt, ...);
 void nvlog_report(const char *fmt, ...);
+void nvlog_capped(const char *fmt, ...);
 
 #import <CommonCrypto/CommonDigest.h>
 #define NVMTL_AIR_OPT   "/Library/GPUBundles/nvmtl/air-opt"
@@ -1175,7 +1176,7 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
         if (dt > 500000000ull) { static _Atomic unsigned slowSaid;
             if (atomic_fetch_add(&slowSaid, 1) < 32) {
                 NSString *js = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-                nvlog_report("fc cache: slow miss %s %.0f ms, constants %s", name.UTF8String, dt / 1e6,
+                nvlog_capped("fc cache: slow miss %s %.0f ms, constants %s", name.UTF8String, dt / 1e6,
                              js.length > 900 ? [js substringToIndex:900].UTF8String : js.UTF8String ?: "?"); } }
         unsigned long long m = nvmtl_fc_stat_miss_max_ns;
         while (dt > m && !atomic_compare_exchange_weak(&nvmtl_fc_stat_miss_max_ns, &m, dt)) {} }

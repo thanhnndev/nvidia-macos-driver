@@ -109,6 +109,11 @@ void nvlog(const char *fmt, ...) {
 void nvlog_report(const char *fmt, ...) {
     va_list a; va_start(a, fmt); nvlog_emit(0, 1, fmt, a); va_end(a);
 }
+// Lines whose caller caps them (not periodic, e.g. the 32 "fc cache: slow miss" lines): no 8-per-format limit, and,
+// like nvlog, not in the release syslog unless they report a failure (review of fa238db)
+void nvlog_capped(const char *fmt, ...) {
+    va_list a; va_start(a, fmt); nvlog_emit(0, 0, fmt, a); va_end(a);
+}
 static void nvlog_emit(uint64_t rep, int report, const char *fmt, va_list a) {
     char b[1024]; vsnprintf(b, sizeof b, fmt, a);
     char t[1152];

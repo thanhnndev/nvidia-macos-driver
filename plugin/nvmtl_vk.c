@@ -3091,11 +3091,16 @@ static int nvmtl_btsh_seed_on(void)
    NVMTL_BTSH_SEED_MAX_MS (default 250): a torn or missed frame lasts at most that long. */
 static uint64_t nvmtl_btsh_seed_max_ns(void)
 {
-    /* NVMTL_BTSH_SEED_MAX_MS=0 turns the staleness net off (copy only on a seed move); otherwise 1..10000 ms */
+    /* NVMTL_BTSH_SEED_MAX_MS=0 (exactly) turns the staleness net off (copy only on a seed move); a number 1..10000
+       sets it in ms (larger is clamped); anything else (empty, negative, not a number) keeps the 250 ms default */
     static uint64_t ns;
-    if (!ns) { const char *e = getenv("NVMTL_BTSH_SEED_MAX_MS"); long v = e ? strtol(e, NULL, 10) : 250;
-               if (v <= 0) ns = UINT64_MAX;
-               else { if (v > 10000) v = 10000; ns = (uint64_t)v * 1000000ull; } }
+    if (!ns) {
+        const char *e = getenv("NVMTL_BTSH_SEED_MAX_MS");
+        long v = 250;
+        if (e && *e) { char *end = NULL; const long x = strtol(e, &end, 10); if (end && end != e && *end == 0 && x >= 0) v = x; }
+        if (v == 0) ns = UINT64_MAX;
+        else { if (v > 10000) v = 10000; ns = (uint64_t)v * 1000000ull; }
+    }
     return ns;
 }
 int nvmtl_vk_btsh_seed_on(void) { return nvmtl_btsh_seed_on(); }
