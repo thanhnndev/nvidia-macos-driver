@@ -338,6 +338,9 @@ int  nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, 
                                         const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
 /* a read-only shadowed alias of an IOSurface plane: copy its rows only when the surface's seed moved (1: watched) */
 int  nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf);
+/* WS-CPU 8.7 step 1: per-present census (commits, waits, submits, object churn, desc-cache), one line per 30 s */
+enum { NVC_COMMIT, NVC_CAWUS, NVC_WSCHED, NVC_WCOMP, NVC_SUBMIT, NVC_VIEW_NEW, NVC_VIEW_DEL, NVC_BUF_NEW, NVC_BUF_DEL, NVC_N };
+void nvmtl_vk_frame_census(int what);
 int  nvmtl_vk_image_placed_fits(const nvk_image *img, size_t len);
 int  nvmtl_vk_image_create_typed_placed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_heap *heap, size_t offset, nvk_image *out);
 int  nvmtl_vk_depth_create_ex_placed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t aspect, nvk_heap *heap, size_t offset, nvk_image *out);

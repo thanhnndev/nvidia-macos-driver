@@ -2998,9 +2998,22 @@ static nvmtl_btsh *nvmtl_btsh_take_locked(const void *key)
     return NULL;
 }
 static PFN_vkCreateImageView g_btsh_real_cv; static PFN_vkDestroyImageView g_btsh_real_dv; static PFN_vkDestroyImage g_btsh_real_di;
+static PFN_vkCreateBuffer g_fc_real_cb; static PFN_vkDestroyBuffer g_fc_real_db;
+static VKAPI_ATTR VkResult VKAPI_CALL nvmtl_fc_create_buffer(VkDevice d, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *b)
+{
+    VkResult r = g_fc_real_cb(d, ci, a, b);
+    if (r == VK_SUCCESS) nvmtl_vk_frame_census(NVC_BUF_NEW);
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL nvmtl_fc_destroy_buffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks *a)
+{
+    if (b) nvmtl_vk_frame_census(NVC_BUF_DEL);
+    g_fc_real_db(d, b, a);
+}
 static VKAPI_ATTR VkResult VKAPI_CALL nvmtl_btsh_create_view(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a, VkImageView *v)
 {
     VkResult r = g_btsh_real_cv(d, ci, a, v);
+    if (r == VK_SUCCESS) nvmtl_vk_frame_census(NVC_VIEW_NEW);
     if (r == VK_SUCCESS && ci) nvmtl_audit_view_made((const void *)ci->image, (const void *)*v);
     if (r == VK_SUCCESS && ci && atomic_load(&g_btsh_live)) {
         pthread_mutex_lock(&g_btsh_lock);
@@ -3013,6 +3026,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL nvmtl_btsh_create_view(VkDevice d, const V
 static VKAPI_ATTR void VKAPI_CALL nvmtl_btsh_destroy_view(VkDevice d, VkImageView v, const VkAllocationCallbacks *a)
 {
     nvmtl_btsh *s = NULL;
+    if (v) nvmtl_vk_frame_census(NVC_VIEW_DEL);
     if (v && atomic_load(&g_btsh_live)) { pthread_mutex_lock(&g_btsh_lock); s = nvmtl_btsh_take_locked((const void *)v); pthread_mutex_unlock(&g_btsh_lock); }
     nvmtl_audit_handle_gone((const void *)v);
     g_btsh_real_dv(d, v, a);
@@ -3032,6 +3046,10 @@ void nvmtl_btsh_hook(void)
     g_btsh_real_cv = pvkCreateImageView; pvkCreateImageView = nvmtl_btsh_create_view;
     g_btsh_real_dv = pvkDestroyImageView; pvkDestroyImageView = nvmtl_btsh_destroy_view;
     g_btsh_real_di = pvkDestroyImage; pvkDestroyImage = nvmtl_btsh_destroy_image;
+    if (pvkCreateBuffer && pvkDestroyBuffer && !g_fc_real_cb) {
+        g_fc_real_cb = pvkCreateBuffer; pvkCreateBuffer = nvmtl_fc_create_buffer;
+        g_fc_real_db = pvkDestroyBuffer; pvkDestroyBuffer = nvmtl_fc_destroy_buffer;
+    }
 }
 /* The command buffer keeps a reference to every shadow it uses until it retires. */
 static void nvmtl_btsh_note(nvk_cmdbuf *c, const void *key)
@@ -3535,6 +3553,32 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     return set;
 }
 #include "nvmtl_desc_cache.h"
+/* WS-CPU 8.7 step 1 (2026-11-19): what a present costs in submits and object churn. CAWUS (commitAndWaitUntilSubmitted)
+   is WindowServer's present path, so per-CAWUS ratios are per present. One line per 30 s through nvlog_report. */
+static _Atomic unsigned long long g_fc[NVC_N];
+static _Atomic unsigned long long g_fc_t0;
+void nvmtl_vk_frame_census(int what)
+{
+    if (what < 0 || what >= NVC_N) return;
+    atomic_fetch_add_explicit(&g_fc[what], 1, memory_order_relaxed);
+    if (what != NVC_COMMIT) return;
+    const unsigned long long now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    unsigned long long t0 = atomic_load(&g_fc_t0);
+    if (!t0) { atomic_compare_exchange_strong(&g_fc_t0, &t0, now); return; }
+    if (now - t0 < 30000000000ull || !atomic_compare_exchange_strong(&g_fc_t0, &t0, now)) return;
+    static unsigned long long last[NVC_N], dclast[2];
+    unsigned long long d[NVC_N];
+    for (int i = 0; i < NVC_N; i++) { const unsigned long long v = atomic_load(&g_fc[i]); d[i] = v - last[i]; last[i] = v; }
+    const unsigned long long hit = __atomic_load_n(&g_dc_hit, __ATOMIC_RELAXED), miss = __atomic_load_n(&g_dc_miss, __ATOMIC_RELAXED);
+    const unsigned long long dh = hit - dclast[0], dm = miss - dclast[1]; dclast[0] = hit; dclast[1] = miss;
+    const double p = d[NVC_CAWUS] ? (double)d[NVC_CAWUS] : 1.0;
+    nvlog_report("frame census %.0f s: %llu commits, %llu commitAndWaitUntilSubmitted (presents), waits: %llu scheduled %llu completed; "
+                 "%llu vkQueueSubmit; per present: %.2f commits, %.2f submits, %.2f views made / %.2f destroyed, %.2f VkBuffers made / %.2f destroyed, "
+                 "%.2f desc-cache misses (%.1f %% of %llu lookups)",
+                 (double)(now - t0) / 1e9, d[NVC_COMMIT], d[NVC_CAWUS], d[NVC_WSCHED], d[NVC_WCOMP], d[NVC_SUBMIT],
+                 d[NVC_COMMIT] / p, d[NVC_SUBMIT] / p, d[NVC_VIEW_NEW] / p, d[NVC_VIEW_DEL] / p, d[NVC_BUF_NEW] / p, d[NVC_BUF_DEL] / p,
+                 dm / p, dh + dm ? 100.0 * (double)dm / (double)(dh + dm) : 0.0, dh + dm);
+}
 /* *dyn gets the dynamic offset of binding 640 that goes with the returned set (0 unless the desc-cache reused a set
    and moved its address table to a newer slot of the same page). */
 static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p, uint32_t *dyn)
@@ -6493,6 +6537,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     nvmtl_wit_control(wseq);
     const uint64_t sE = nvmtl_perf_now();
     if (pt[0]) { pt[1] = pt[0] + (sA - pt[0]) + (sD - sC); pt[2] = pt[1] + (sB - sA) + (sE - sD); pt[3] = pt[2] + (sC - sB); }
+    nvmtl_vk_frame_census(NVC_SUBMIT);
     result = g_state == 1 ? pvkQueueSubmit(g_queue, 1, &si, fence) : VK_ERROR_DEVICE_LOST;
     /* ga403wm cs-enomem: an out-of-memory submit was not submitted and the device is fine (Vulkan spec; RADV returns
      * VK_ERROR_OUT_OF_HOST_MEMORY for the kernel's "Not enough memory for command submission"). Under memory pressure
