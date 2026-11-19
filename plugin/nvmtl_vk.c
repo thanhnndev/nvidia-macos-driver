@@ -2421,12 +2421,13 @@ _Static_assert(NVMTL_STEX_BINDING_NUMBER == 480 && NVMTL_NSTEX == 128, "nvmtl_sp
  * RADV descriptor BO (321-binding layout: 33 buffers x 16 B, 128 + 128 mutable images x 32 B, 32 samplers x 16 B per set),
  * CPU-mapped and so pinned for the life of the process; every Metal process carried it while the busiest one
  * (WindowServer) never had more than 36 sets live in one command buffer (S2b step 1, 2026-11-19). 256 sets = 2.3 MiB.
- * NVMTL_DESC_FIRST_SETS overrides the first pool (4096 = the old fixed size). */
+ * NVMTL_DESC_FIRST_SETS overrides the first pool (4096 = the old fixed size; at least 32 = NVMTL_DESC_BATCH_MAX, or every
+ * batch allocation would fail in it and open the next pool). */
 static unsigned nvmtl_desc_pool_sets(unsigned k)
 {
     static unsigned first;
     if (!first) { const char *e = getenv("NVMTL_DESC_FIRST_SETS"); long v = e && *e ? atol(e) : 256;
-                  first = v < 16 ? 16 : v > NVMTL_MAX_SETS ? NVMTL_MAX_SETS : (unsigned)v; }
+                  first = v < 32 ? 32 : v > NVMTL_MAX_SETS ? NVMTL_MAX_SETS : (unsigned)v; }
     unsigned long n = (unsigned long)first << (k < 8 ? k : 8);
     return n > NVMTL_MAX_SETS ? NVMTL_MAX_SETS : (unsigned)n;
 }
