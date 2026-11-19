@@ -2944,7 +2944,7 @@ typedef struct nvmtl_btsh {
        seed moved since the last copy, the rule the private-image path keeps (nvmtlSurfaceIn). seed/seeded are read and
        written only by nvmtl_btsh_pre under nvmtl_submit_mutex, so the copy that set them is queued before every command
        buffer that skips. */
-    IOSurfaceRef surf; uint32_t seed; int seeded;
+    IOSurfaceRef surf; uint32_t seed; int seeded; uint64_t copied_ns;
 } nvmtl_btsh;
 typedef struct { const void *key; nvmtl_btsh *s; } nvmtl_btsh_ent;
 static pthread_mutex_t g_btsh_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -3085,6 +3085,29 @@ static int nvmtl_btsh_seed_on(void)
         nvlog("buffer texture: read-only surface-plane shadows copy %s", on ? "only when the IOSurface seed moved" : "in every command buffer (NVMTL_BTSH_SEED=0)"); }
     return on;
 }
+/* Review of 4b2835e (main, 2026-11-19): the seed moves at IOSurfaceLock, not at unlock (measured), so a copy taken
+   while a CPU writer holds its lock records the new seed over half-written rows; and a producer may never move it
+   (camera, kernel-side writers). A watched shadow is therefore also copied when its last copy is older than
+   NVMTL_BTSH_SEED_MAX_MS (default 250): a torn or missed frame lasts at most that long. */
+static uint64_t nvmtl_btsh_seed_max_ns(void)
+{
+    static uint64_t ns;
+    if (!ns) { const char *e = getenv("NVMTL_BTSH_SEED_MAX_MS"); long v = e ? strtol(e, NULL, 10) : 250;
+               if (v < 1) v = 1; if (v > 10000) v = 10000; ns = (uint64_t)v * 1000000ull; }
+    return ns;
+}
+int nvmtl_vk_btsh_seed_on(void) { return nvmtl_btsh_seed_on(); }
+/* Moves the seed of a multi-plane surface the GPU writes through a host import (our writer side of the seed rule):
+   at commit (so a reader that submits before our completion does not keep the previous trip's seed) and again after
+   completion (nvmtlSurfaceOut). Off with NVMTL_BTSH_SEED=0. Returns the seed after the move, 0 when not moved. */
+uint32_t nvmtl_vk_surface_seed_bump(void *surf)
+{
+    if (!surf || !nvmtl_btsh_seed_on() || IOSurfaceGetPlaneCount((IOSurfaceRef)surf) <= 1) return 0;
+    uint32_t seed = 0;
+    if (IOSurfaceLock((IOSurfaceRef)surf, 0, NULL) != kIOReturnSuccess) return 0;
+    if (IOSurfaceUnlock((IOSurfaceRef)surf, 0, &seed) != kIOReturnSuccess) return 0;
+    return seed;
+}
 int nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf)
 {
     if (!img || !img->img || !surf || !atomic_load(&g_btsh_live) || !nvmtl_btsh_seed_on()) return 0;
@@ -3117,7 +3140,8 @@ static void nvmtl_btsh_rows(VkCommandBuffer cb, const nvmtl_btsh *cs, int in)
         return;
     }
     VkBufferCopy stackr[64]; VkBufferCopy *r = s->h <= 64 ? stackr : malloc(sizeof *r * s->h);
-    if (!r) { nvlog("buffer texture: shadow copy of %u rows skipped (out of memory)", s->h); return; }
+    if (!r) { if (in) s->seeded = 0;   // not copied: the next command buffer copies again
+              nvlog("buffer texture: shadow copy of %u rows skipped (out of memory)", s->h); return; }
     for (uint32_t y = 0; y < s->h; y++) {
         const VkDeviceSize app = s->soff + (VkDeviceSize)y * s->spitch, own = (VkDeviceSize)y * s->apitch;
         r[y] = in ? (VkBufferCopy){ app, own, s->rowbytes } : (VkBufferCopy){ own, app, s->rowbytes };
@@ -6371,10 +6395,16 @@ static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
     /* which shadows need their rows: all but a watched surface plane whose seed did not move (nvmtl_btsh.surf) */
     unsigned char need_st[256], *need = c->nbtsh <= sizeof need_st ? need_st : malloc(c->nbtsh);
     unsigned nneed = 0, nskip = 0;
+    const uint64_t tnow = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     for (unsigned i = 0; i < c->nbtsh; i++) {
         nvmtl_btsh *s = (nvmtl_btsh *)c->btsh[i];
         int go = 1;
-        if (s->surf) { const uint32_t now = IOSurfaceGetSeed(s->surf); go = !s->seeded || s->seed != now; s->seed = now; s->seeded = 1; }
+        if (s->surf) {
+            const uint32_t now = IOSurfaceGetSeed(s->surf);
+            go = !s->seeded || s->seed != now || tnow - s->copied_ns >= nvmtl_btsh_seed_max_ns();
+            s->seed = now; s->seeded = 1;
+            if (go) s->copied_ns = tnow;
+        }
         if (need) need[i] = (unsigned char)go;
         else go = 1;   // out of memory for the list: copy everything (the seeds just taken stay valid: those rows are queued now)
         nneed += go; nskip += !go;

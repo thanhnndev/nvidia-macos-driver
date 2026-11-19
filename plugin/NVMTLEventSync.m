@@ -68,6 +68,9 @@ static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
         NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
         for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
             if (!t->_surf) continue;
+            // review of 4b2835e, finding 2: move a host-imported multi-plane surface's seed at commit too, so a reader that
+            // submits before our completion bump (nvmtlSurfaceOut) sees a new seed and copies (its watched shadow)
+            if (t->_hostOn && !t->_hostRO) (void)nvmtl_vk_surface_seed_bump((void *)t->_surf);
             if (!writes) { writes = [NSMutableDictionary new]; [nvmtl_surface_writers setObject:writes forKey:cb->_queue]; }
             NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
             write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
