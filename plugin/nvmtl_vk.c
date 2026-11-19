@@ -1166,7 +1166,8 @@ static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
     return -1;
 }
 
-#define NVMTL_POOL_BLOCK (32u << 20)
+#define NVMTL_POOL_BLOCK (32u << 20)  /* largest system-RAM pool block */
+#define NVMTL_POOL_BLOCK_FIRST (4u << 20)  /* first block; each new one doubles up to NVMTL_POOL_BLOCK (S2b step 1) */
 #define NVMTL_POOL_MAX   (4u << 20)
 #define NVMTL_POOL_KEEP  2
 static size_t g_bar1_bytes; static int g_bar1_off;
@@ -2416,6 +2417,19 @@ static uint32_t nvmtl_ssbo_align(void)
 _Static_assert(NVMTL_STEX_BINDING_NUMBER == 480 && NVMTL_NSTEX == 128, "nvmtl_spirv_stex_hi() scans for this band by value");
 
 #define NVMTL_MAX_SETS 4096
+/* Descriptor pools grow: pool k holds first << k sets (k <= 4), capped at NVMTL_MAX_SETS. One 4096-set pool is a 36 MiB
+ * RADV descriptor BO (321-binding layout: 33 buffers x 16 B, 128 + 128 mutable images x 32 B, 32 samplers x 16 B per set),
+ * CPU-mapped and so pinned for the life of the process; every Metal process carried it while the busiest one
+ * (WindowServer) never had more than 36 sets live in one command buffer (S2b step 1, 2026-11-19). 256 sets = 2.3 MiB.
+ * NVMTL_DESC_FIRST_SETS overrides the first pool (4096 = the old fixed size). */
+static unsigned nvmtl_desc_pool_sets(unsigned k)
+{
+    static unsigned first;
+    if (!first) { const char *e = getenv("NVMTL_DESC_FIRST_SETS"); long v = e && *e ? atol(e) : 256;
+                  first = v < 16 ? 16 : v > NVMTL_MAX_SETS ? NVMTL_MAX_SETS : (unsigned)v; }
+    unsigned long n = (unsigned long)first << (k < 8 ? k : 8);
+    return n > NVMTL_MAX_SETS ? NVMTL_MAX_SETS : (unsigned)n;
+}
 int nvmtl_vk_dual_src(void) { return g_dual; }
 int nvmtl_spirv_has_index1(const void *p, size_t n)
 {
@@ -2517,7 +2531,7 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  void *dc; } nvmtl_bindtable;
 
 static VkDescriptorSetLayout g_setLayout;
-#define NVMTL_MAX_POOLS 64
+#define NVMTL_MAX_POOLS 68          /* >= the old 64 x 4096 sets with the growing first pools */
 static VkDescriptorPool      g_descPools[NVMTL_MAX_POOLS];
 static unsigned              g_ndescPools;
 static pthread_mutex_t       g_desc_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2699,17 +2713,18 @@ static VkDescriptorType binding_type(uint32_t i)
 static int nvmtl_desc_pool_open(void)
 {
     if (g_ndescPools == NVMTL_MAX_POOLS) {
-        nvlog("vk: descriptor pool CEILING: %u pools x %d sets all live in one frame — draws are being skipped", g_ndescPools, NVMTL_MAX_SETS);
+        nvlog("vk: descriptor pool CEILING: %u pools (up to %d sets each) all live in one frame — draws are being skipped", g_ndescPools, NVMTL_MAX_SETS);
         return -1;
     }
+    const unsigned ns = nvmtl_desc_pool_sets(g_ndescPools);
     VkDescriptorPoolSize sizes[5] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (NVMTL_NBUF + 1) * NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  NVMTL_NTEX  * NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_SAMPLER,        NVMTL_NSAMP * NVMTL_MAX_SETS },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  NVMTL_NSTEX * NVMTL_MAX_SETS } };
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, ns },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (NVMTL_NBUF + 1) * ns },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  NVMTL_NTEX  * ns },
+        { VK_DESCRIPTOR_TYPE_SAMPLER,        NVMTL_NSAMP * ns },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  NVMTL_NSTEX * ns } };
     VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL,
-        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, NVMTL_MAX_SETS, 5, sizes };
+        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, ns, 5, sizes };
     static const VkDescriptorType mut4[4] = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                               VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER };
     VkMutableDescriptorTypeListEXT plists[5] = { { 0, NULL }, { 0, NULL }, { 4, mut4 }, { 0, NULL }, { 4, mut4 } };
@@ -2717,10 +2732,12 @@ static int nvmtl_desc_pool_open(void)
     if (g_mutable_layout) { sizes[2].type = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; pci.pNext = &pmi; }
     if (g_mutable_stex) sizes[4].type = VK_DESCRIPTOR_TYPE_MUTABLE_EXT; else plists[4] = (VkMutableDescriptorTypeListEXT){ 0, NULL };
     VKCK(pvkCreateDescriptorPool(g_dev, &pci, NULL, &g_descPools[g_ndescPools]), "vkCreateDescriptorPool");
+    unsigned before = 0; for (unsigned k = 0; k < g_ndescPools; k++) before += nvmtl_desc_pool_sets(k);
     g_ndescPools++;
     if (g_ndescPools > 1)
-        nvlog("vk: descriptor pool %u opened — one frame needed more than %u sets (%u draws)",
-              g_ndescPools, (g_ndescPools - 1) * NVMTL_MAX_SETS, (g_ndescPools - 1) * NVMTL_MAX_SETS / 2);
+        nvlog("vk: descriptor pool %u opened (%u sets) — the open pools (%u sets) were full or too fragmented for a batch",
+              g_ndescPools, ns, before);
+    else nvlog("vk: descriptor pool 1 opened (%u sets; later pools double up to %d, NVMTL_DESC_FIRST_SETS)", ns, NVMTL_MAX_SETS);
     return 0;
 }
 
@@ -8424,7 +8441,12 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
     for (; blk; blk = blk->next) if (pool_block_take(blk, len, &off)) { got = 1; break; }
     if (!got) {
         pool_block *nb = calloc(1, sizeof *nb);
-        if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
+        /* System-RAM blocks start at 4 MiB and double: a 32 MiB first block was CPU-mapped (pinned) in every Metal
+         * process while most held a few KB of pooled buffers in it. len <= NVMTL_POOL_MAX (4 MiB) always fits. */
+        size_t bsz = NVMTL_POOL_BLOCK_FIRST;
+        if (!vram) { for (pool_block *p = *head; p && bsz < NVMTL_POOL_BLOCK; p = p->next) bsz *= 2;
+                     while (bsz < len) bsz *= 2; }
+        if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(bsz, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
         nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++;
         nvlog("buffer pool: block #%llu mapped (%zu MiB, %s; %llu VRAM blocks, memory type %u); %llu pooled buffers live in %llu bytes of ranges",
               (unsigned long long)g_pool_blocks, nb->heap.size >> 20, pool_place_why(vram), (unsigned long long)g_vpool_blocks,
