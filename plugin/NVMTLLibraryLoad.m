@@ -1134,6 +1134,9 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
     return d;
 }
 
+// WS-CPU fix 1: specialization counters for the 30 s "pipelines:" report (nvmtl_vk.c). The per-miss "fc cache: miss" line
+// is rate-limited by nvlog after 8, and one miss of WindowServer's fixed_frag_lpf_cpf cost 2.7-3.6 s (2026-11-19 12:36).
+_Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns;
 NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *name, NSDictionary *constants,
                                        const uint32_t *idx, const uint32_t *sizes,
                                        const uint8_t *const *payloads, size_t n, NSString **err)
@@ -1148,13 +1151,13 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     const BOOL fcCacheOn = path && !getenv("NVMTL_FCCACHE_OFF");   // no folder, no key: NSCache throws on a nil key
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:path] : nil;
-    if (hit) { gFcHit++; nvmtl_cache_touch(path.fileSystemRepresentation); return hit; }   // keep the trimmer's age order
+    if (hit) { gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation); return hit; }   // keep the trimmer's age order
     if (fcCacheOn) hit = [NSData dataWithContentsOfFile:path];
     uint32_t magic = 0;
     if (hit.length >= 20 && hit.length % 4 == 0) {
         memcpy(&magic, hit.bytes, 4);
         if (magic == 0x07230203) {
-            gFcHit++; nvmtl_cache_touch(path.fileSystemRepresentation);
+            gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation);
             [nvmtl_memo() setObject:hit forKey:path cost:hit.length];
             nvlog("fc cache: HIT %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
                   (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
@@ -1164,6 +1167,10 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     }
     gFcMiss++;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
+    {   const unsigned long long dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+        nvmtl_fc_stat_misses++; nvmtl_fc_stat_miss_ns += dt;
+        unsigned long long m = nvmtl_fc_stat_miss_max_ns;
+        while (dt > m && !atomic_compare_exchange_weak(&nvmtl_fc_stat_miss_max_ns, &m, dt)) {} }
     if (result) {
         if (path && [result writeToFile:path atomically:YES]) gFcStored++;
         if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:path cost:result.length];

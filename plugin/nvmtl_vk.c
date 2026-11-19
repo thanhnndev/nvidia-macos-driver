@@ -269,7 +269,7 @@ void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, siz
     X(vkQueueSubmit) X(vkQueueBindSparse) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDestroyFence) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyBuffer) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkDeviceWaitIdle) X(vkFreeCommandBuffers) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdBindVertexBuffers) X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCreateSampler) X(vkDestroySampler) X(vkFreeDescriptorSets) X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdFillBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetBufferDeviceAddress) X(vkCmdWriteTimestamp) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) X(vkGetQueryPoolResults) X(vkDestroyQueryPool) X(vkResetQueryPool) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatchIndirect) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
     X(vkDestroyBuffer) X(vkFreeMemory) X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyFramebuffer) X(vkDestroyCommandPool) \
-    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask)
+    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCreatePipelineCache)
 static int g_dyn3;
 static int g_tess;
 static int g_indep;
@@ -4498,6 +4498,87 @@ static void nvmtl_failed_pipeline(nvk_pipeline *pipeline)
     memset(pipeline, 0, sizeof *pipeline);
 }
 _Static_assert(sizeof(VkRenderPass) == sizeof(void *) && _Alignof(VkRenderPass) == _Alignof(void *), "VkRenderPass bridge ABI");
+/* WS-CPU fix 1 (docs/WS-CPU.md section 7): WindowServer's com.apple.coreanimation.pipelines thread used up to a core
+ * creating pipelines (2026-11-19 12:36 spindump: 9.9 s of CPU in 10 s). This counts every render and compute pipeline
+ * this process creates, with an approximate key (FNV-1a of the SPIR-V, the render-target state and the formats), and
+ * every 30 s logs how many were made, how many repeated a key already built in this process (what a memo would save),
+ * the time spent and the slowest one. Optional: a VkPipelineCache shared by every pipeline of the process, so RADV
+ * returns a repeated pipeline from its cache instead of compiling NIR again. Off by default; on while
+ * /Library/NullMoth/nvmtl-pipeline-cache exists (checked every 5 s, so main can A/B at runtime) or NVMTL_PIPELINE_CACHE=1
+ * (=0 forces it off). Once made, the cache object stays for the process; switching off only stops passing it. */
+static pthread_mutex_t g_plstat_mu = PTHREAD_MUTEX_INITIALIZER;
+#define NVMTL_PSTAT_KEYS 8192
+static uint64_t g_plstat_seen[NVMTL_PSTAT_KEYS];   /* open-addressed set of keys built in this process (0 = empty) */
+static unsigned g_plstat_seenN;
+static struct { uint64_t render, compute, repeats, fresh, ns, maxNs, spvBytes, maxVn, maxFn, cached, lastMs, failed; } g_plstat;
+static VkPipelineCache g_pcache;
+static int g_pcache_on;
+static uint64_t g_pcache_checkMs;
+static uint64_t nvmtl_fnv1a(const void *p, size_t n, uint64_t h)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    if (!b) return h;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+static uint64_t nvmtl_pstat_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull; }
+/* the cache to pass to vkCreate*Pipelines: VK_NULL_HANDLE unless the switch is on */
+static VkPipelineCache nvmtl_pcache(void)
+{
+    pthread_mutex_lock(&g_plstat_mu);
+    const uint64_t now = nvmtl_pstat_now_ms();
+    if (!g_pcache_checkMs || now - g_pcache_checkMs >= 5000) {
+        g_pcache_checkMs = now;
+        const char *e = getenv("NVMTL_PIPELINE_CACHE"); struct stat st;
+        const int on = e ? e[0] == '1' : stat("/Library/NullMoth/nvmtl-pipeline-cache", &st) == 0;
+        if (on != g_pcache_on) nvlog("pipelines: VkPipelineCache %s (/Library/NullMoth/nvmtl-pipeline-cache, NVMTL_PIPELINE_CACHE=%s)",
+                                     on ? "ON" : "off", e ? e : "unset");
+        g_pcache_on = on;
+    }
+    if (g_pcache_on && !g_pcache && pvkCreatePipelineCache) {
+        VkPipelineCacheCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL };
+        VkResult r = pvkCreatePipelineCache(g_dev, &ci, NULL, &g_pcache);
+        if (r != VK_SUCCESS) { g_pcache = VK_NULL_HANDLE; g_pcache_on = 0; nvlog("pipelines: vkCreatePipelineCache -> %d, cache off", r); }
+    }
+    VkPipelineCache c = g_pcache_on ? g_pcache : VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_plstat_mu);
+    return c;
+}
+static void nvmtl_pstat_record(int compute, uint64_t key, uint64_t ns, size_t vn, size_t fn, int failed, int cached)
+{
+    pthread_mutex_lock(&g_plstat_mu);
+    if (compute) g_plstat.compute++; else g_plstat.render++;
+    if (failed) g_plstat.failed++;
+    if (cached) g_plstat.cached++;
+    g_plstat.ns += ns; g_plstat.spvBytes += vn + fn;
+    if (ns > g_plstat.maxNs) { g_plstat.maxNs = ns; g_plstat.maxVn = vn; g_plstat.maxFn = fn; }
+    if (!key) key = 1;
+    int repeat = 0;
+    if (g_plstat_seenN < NVMTL_PSTAT_KEYS * 3 / 4) {
+        for (uint64_t i = key & (NVMTL_PSTAT_KEYS - 1);; i = (i + 1) & (NVMTL_PSTAT_KEYS - 1)) {
+            if (g_plstat_seen[i] == key) { repeat = 1; break; }
+            if (!g_plstat_seen[i]) { g_plstat_seen[i] = key; g_plstat_seenN++; break; }
+        }
+    }
+    if (repeat) g_plstat.repeats++; else g_plstat.fresh++;
+    const uint64_t now = nvmtl_pstat_now_ms();
+    if (!g_plstat.lastMs) g_plstat.lastMs = now;
+    if (now - g_plstat.lastMs >= 30000) {
+        extern _Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns;
+        const unsigned long long fh = atomic_exchange(&nvmtl_fc_stat_hits, 0), fm = atomic_exchange(&nvmtl_fc_stat_misses, 0),
+                                 fns = atomic_exchange(&nvmtl_fc_stat_miss_ns, 0), fmax = atomic_exchange(&nvmtl_fc_stat_miss_max_ns, 0);
+        nvlog("pipelines: specializations (AIR->SPIR-V with constants): %llu cache hits, %llu misses translated in %.1f ms (slowest %.1f ms)",
+              fh, fm, fns / 1e6, fmax / 1e6);
+        nvlog("pipelines: %llu s: render %llu, compute %llu (new key %llu, repeat of a key built earlier in this process %llu, failed %llu), "
+              "%.1f ms creating, slowest %.1f ms (%llu+%llu B SPIR-V), %llu KB SPIR-V in, VkPipelineCache %s (%llu passed it), %u keys seen",
+              (unsigned long long)((now - g_plstat.lastMs) / 1000), (unsigned long long)g_plstat.render, (unsigned long long)g_plstat.compute,
+              (unsigned long long)g_plstat.fresh, (unsigned long long)g_plstat.repeats, (unsigned long long)g_plstat.failed,
+              g_plstat.ns / 1e6, g_plstat.maxNs / 1e6, (unsigned long long)g_plstat.maxVn, (unsigned long long)g_plstat.maxFn,
+              (unsigned long long)(g_plstat.spvBytes >> 10), g_pcache_on ? "on" : "off", (unsigned long long)g_plstat.cached, g_plstat_seenN);
+        memset(&g_plstat, 0, sizeof g_plstat); g_plstat.lastMs = now;
+    }
+    pthread_mutex_unlock(&g_plstat_mu);
+}
 #define NVMTL_PIPELINE_STAGE(call, what) do { VkResult stage_result = (call); if (stage_result != VK_SUCCESS) { nvlog("vk: %s -> %d", what, stage_result); goto pipeline_failed; } } while (0)
 static int nvmtl_vk_pipeline_create_impl(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, uint32_t depthfmt, const void *blend_,
                                          const void *vin_, uint32_t samples, const nvk_tess_desc *td, const nvk_rt *rt, void *out_);
@@ -4527,7 +4608,16 @@ static int nvmtl_vk_pipeline_create_impl(const void *vs, size_t vn, const void *
                                          const void *vin_, uint32_t samples, const nvk_tess_desc *td, const nvk_rt *rt, void *out_)
 {
     nvk_pipeline pending = {0};
+    const uint64_t pt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     int result = nvmtl_vk_pipeline_create_impl_lifetime_body(vs, vn, fs, fn, vkfmt, depthfmt, blend_, vin_, samples, td, rt, &pending);
+    {   /* WS-CPU fix 1 counter: approximate key = shaders + attachment state (vertex layout and blend pointers left out) */
+        const uint32_t fmts[3] = { vkfmt, depthfmt, samples };
+        uint64_t k = nvmtl_fnv1a(vs, vn, 0xcbf29ce484222325ull);
+        k = nvmtl_fnv1a(fs, fn, k); k = nvmtl_fnv1a(fmts, sizeof fmts, k);
+        if (rt) k = nvmtl_fnv1a(rt, sizeof *rt, k);
+        if (td) k = nvmtl_fnv1a(td, sizeof *td, k);
+        nvmtl_pstat_record(0, k, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - pt0, vn, fn, result != 0, g_pcache_on && g_pcache);
+    }
     if (result) { nvmtl_failed_pipeline(&pending); memset(out_, 0, sizeof pending); }
     else *(nvk_pipeline *)out_ = pending;
     return result;
@@ -4705,7 +4795,7 @@ static int nvmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn
         VK_TRUE, VK_TRUE, VK_COMPARE_OP_LESS, VK_FALSE, VK_FALSE, { 0 }, { 0 }, 0.0f, 1.0f };
     VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, nstages, stages,
         &vi, &ia, td ? &tss : NULL, &vps, &rs, &ms, hasDepth ? &ds : NULL, &cb, &dsci, out->layout, out->rp, 0, VK_NULL_HANDLE, -1 };
-    NVMTL_PIPELINE_STAGE(nvmtl_opaque_CreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gp, NULL, &out->pipe), "vkCreateGraphicsPipelines");
+    NVMTL_PIPELINE_STAGE(nvmtl_opaque_CreateGraphicsPipelines(g_dev, nvmtl_pcache(), 1, &gp, NULL, &out->pipe), "vkCreateGraphicsPipelines");
     if (tcm) pvkDestroyShaderModule(g_dev, tcm, NULL);
     if (tvm) pvkDestroyShaderModule(g_dev, tvm, NULL);
     pvkDestroyShaderModule(g_dev, fmod, NULL);
@@ -4825,7 +4915,10 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     VkComputePipelineCreateInfo cpi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", NULL },
         out->layout, VK_NULL_HANDLE, -1 };
-    VKCK(nvmtl_opaque_CreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &cpi, NULL, &out->pipe), "vkCreateComputePipelines");
+    {   const uint64_t pt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW); const VkPipelineCache pc = nvmtl_pcache();
+        const VkResult pr = nvmtl_opaque_CreateComputePipelines(g_dev, pc, 1, &cpi, NULL, &out->pipe);
+        nvmtl_pstat_record(1, nvmtl_fnv1a(cs, n, 0x84222325cbf29ce4ull), clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - pt0, n, 0, pr != VK_SUCCESS, pc != VK_NULL_HANDLE);
+        VKCK(pr, "vkCreateComputePipelines"); }
     out->mod = mod;
     return 0;
 }
