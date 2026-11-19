@@ -142,6 +142,8 @@ static volatile int nmx_reaping;
 static struct task_struct *nmx_tasks_pending[NMX_TASKS_PENDING];
 static int nmx_tasks_npending;
 static unsigned nmx_tasks_leaked;           /* pending list full: the task (and its mm reference) is kept */
+static unsigned nmx_tasks_deferred;         /* retired while their thread was inside an entry point (kept) */
+static unsigned nmx_tasks_deferred_done;    /* ... and handed over by that thread as it left */
 void (*nmx_task_release_hook)(struct task_struct *ts);
 void (*nmx_proc_release_hook)(struct proc *p);
 static struct proc nmx_kernproc_rec = { .p_pid = 0, .p_comm = "kernel_task" };
@@ -294,6 +296,7 @@ static void nmx_thread_recycle(struct nmx_thread_rec *r, uint64_t tid)
     r->td.td_pflags = 0;
     r->td.td_fpop = NULL;
     r->td.td_nmx_open = NULL;
+    __atomic_store_n(&r->td.td_nmx_entry, 0, __ATOMIC_RELAXED);
     r->td.td_siglist = 0;
     r->td.td_wchan = NULL;
     r->td.td_wmesg = NULL;
@@ -884,6 +887,7 @@ void nmx_proc_reap(void)
     nmx_procs_retired = NULL;
     nmx_tl_unlock();
     /* 'retired' is ours now; the thread table is walked one bucket per lock hold (interrupts are off meanwhile) */
+    const unsigned deferred0 = nmx_tasks_deferred;
     if (retired != NULL)
         for (unsigned b = 0; b < NMX_THREAD_BUCKETS; b++) {
             nmx_tl_lock();
@@ -892,14 +896,28 @@ void nmx_proc_reap(void)
                     if (t->td.td_proc == &r->p) {
                         /* a thread of the dead process: its record waits for its thread_t to be recycled */
                         t->td.td_proc = nmx_kernproc;
+                        /* ga403wm exit hang (VTDecoderXPCService 2026-11-19 14:42): proc_find fails for a process in
+                         * exit while its last thread still runs the driver's close (NMXAccel clientDied -> vnode
+                         * close -> nmx_cdev_close -> drm_release -> amdgpu_vm_fini -> dma_fence_wait). Releasing its
+                         * task here freed the task_struct that thread sleeps on and that the fence callback wakes
+                         * (dma_fence_default_wait_cb -> wake_up_task(cb.task)): the wakeup read freed memory, found
+                         * no sleeping state, and the thread slept forever. A thread inside an entry point keeps its
+                         * task; it hands it over itself as it leaves (nmx_thread_entry_leave). */
+                        u_int was = __atomic_fetch_or(&t->td.td_nmx_entry, NMX_ENTRY_REAP, __ATOMIC_SEQ_CST);
                         if (t->td.td_lkpi_task != NULL) {
-                            nmx_task_pending_locked(t->td.td_lkpi_task);
-                            t->td.td_lkpi_task = NULL;
+                            if ((was & NMX_ENTRY_DEPTH) == 0) {
+                                nmx_task_pending_locked(t->td.td_lkpi_task);
+                                t->td.td_lkpi_task = NULL;
+                            } else
+                                nmx_tasks_deferred++;
                         }
                         break;
                     }
             nmx_tl_unlock();
         }
+    if (nmx_tasks_deferred != deferred0)
+        printf("NullMoth xkpi: %u thread(s) of retired processes are inside the driver (exit-time close); their Linux "
+               "tasks stay until they leave (%u so far)\n", nmx_tasks_deferred - deferred0, nmx_tasks_deferred);
     for (struct nmx_proc_rec *r = grave, *n; r; r = n) {
         n = r->next;
         IOFree(r, sizeof(*r));
@@ -930,6 +948,43 @@ void nmx_proc_reap(void)
             nmx_task_release_hook(ts);
     }
     __atomic_store_n(&nmx_reaping, 0, __ATOMIC_RELEASE);
+}
+
+/*
+ * Device-node entry points bracket their work with these (nmx_linux_cdev.c enter/leave). The word holds the entry
+ * depth and NMX_ENTRY_REAP, set by nmx_proc_reap when the thread's process was retired. Both sides change it with one
+ * atomic read-modify-write, so they are ordered: the reaper either sees the thread inside (depth > 0) and leaves its
+ * task attached, or sees it outside and detaches the task in the same registry-lock hold as its fetch_or.
+ */
+void nmx_thread_entry_enter(struct thread *td)
+{
+    u_int was = __atomic_fetch_add(&td->td_nmx_entry, 1, __ATOMIC_SEQ_CST);
+    if (was & NMX_ENTRY_REAP) {
+        /* the reaper may have detached the task just before: its store of td_lkpi_task = NULL is made under the
+         * registry lock, so pass through the lock before LinuxKPI reads td_lkpi_task (current) */
+        nmx_tl_lock();
+        nmx_tl_unlock();
+    }
+}
+
+void nmx_thread_entry_leave(struct thread *td)
+{
+    u_int was = __atomic_fetch_sub(&td->td_nmx_entry, 1, __ATOMIC_SEQ_CST);
+    if ((was & NMX_ENTRY_DEPTH) != 1 || !(was & NMX_ENTRY_REAP))
+        return;
+    /* the outermost entry of a thread whose process was retired while it was inside: hand its task to the reaper */
+    struct task_struct *ts = NULL;
+    nmx_tl_lock();
+    if (td->td_lkpi_task != NULL) {
+        ts = td->td_lkpi_task;
+        nmx_task_pending_locked(ts);
+        td->td_lkpi_task = NULL;
+        nmx_tasks_deferred_done++;
+    }
+    nmx_tl_unlock();
+    if (ts != NULL)
+        printf("NullMoth xkpi: thread %d of a retired process left the driver; its Linux task is released now "
+               "(%u kept while inside so far)\n", td->td_tid, nmx_tasks_deferred_done);
 }
 
 /* detaches every thread's Linux state and releases it outside the registry lock (unload) */

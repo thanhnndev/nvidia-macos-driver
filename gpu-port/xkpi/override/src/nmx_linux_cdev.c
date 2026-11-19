@@ -234,6 +234,7 @@ static struct nmx_open *open_find(int id)
 static struct nmx_open *enter(struct nmx_open *o)
 {
     struct thread *td = curthread;
+    nmx_thread_entry_enter(td);
     struct nmx_open *prev = td->td_nmx_open;
     td->td_nmx_open = o;
     return prev;
@@ -241,7 +242,9 @@ static struct nmx_open *enter(struct nmx_open *o)
 
 static void leave(struct nmx_open *prev)
 {
-    curthread->td_nmx_open = prev;
+    struct thread *td = curthread;
+    td->td_nmx_open = prev;
+    nmx_thread_entry_leave(td);
 }
 
 int devfs_set_cdevpriv(void *priv, d_priv_dtor_t *dtr)

@@ -49,7 +49,12 @@ struct thread {
     const char *td_wmesg;
     int td_crit_saved;              /* interrupt state at the outermost nmx_critical_enter (last: layout of the rest kept) */
     uint64_t td_xnu_tid;            /* thread_tid() of the thread the record was made for: tells a recycled thread_t apart */
+    u_int td_nmx_entry;             /* device-node entry depth (low bits) | NMX_ENTRY_REAP: see nmx_thread_entry_enter */
 };
+#define NMX_ENTRY_REAP  0x80000000u
+#define NMX_ENTRY_DEPTH 0x7fffffffu
+void nmx_thread_entry_enter(struct thread *td);
+void nmx_thread_entry_leave(struct thread *td);
 #define TDF_KTH_SUSP 0x00000100
 #define TDP_KTHREAD 0x00200000
 #define TDP_NOFAULTING 0x00000080
