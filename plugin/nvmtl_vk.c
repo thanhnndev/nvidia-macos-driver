@@ -3091,23 +3091,43 @@ static int nvmtl_btsh_seed_on(void)
    NVMTL_BTSH_SEED_MAX_MS (default 250): a torn or missed frame lasts at most that long. */
 static uint64_t nvmtl_btsh_seed_max_ns(void)
 {
+    /* NVMTL_BTSH_SEED_MAX_MS=0 turns the staleness net off (copy only on a seed move); otherwise 1..10000 ms */
     static uint64_t ns;
     if (!ns) { const char *e = getenv("NVMTL_BTSH_SEED_MAX_MS"); long v = e ? strtol(e, NULL, 10) : 250;
-               if (v < 1) v = 1; if (v > 10000) v = 10000; ns = (uint64_t)v * 1000000ull; }
+               if (v <= 0) ns = UINT64_MAX;
+               else { if (v > 10000) v = 10000; ns = (uint64_t)v * 1000000ull; } }
     return ns;
 }
 int nvmtl_vk_btsh_seed_on(void) { return nvmtl_btsh_seed_on(); }
 /* Moves the seed of a multi-plane surface the GPU writes through a host import (our writer side of the seed rule):
    at commit (so a reader that submits before our completion does not keep the previous trip's seed) and again after
    completion (nvmtlSurfaceOut). Off with NVMTL_BTSH_SEED=0. Returns the seed after the move, 0 when not moved. */
-uint32_t nvmtl_vk_surface_seed_bump(void *surf)
+/* Review of 43ccb65 (c): a two-plane writer has a texture per plane, so commit and completion moved the seed twice
+   each. Inside a batch (nvmtl_vk_surface_seed_batch_begin/end, one thread, one loop over a command buffer's surfaces)
+   a surface moves once and later planes get the seed of that move. */
+#define NVMTL_SEED_BATCH 16
+static __thread struct { int depth; unsigned n; void *surf[NVMTL_SEED_BATCH]; uint32_t seed[NVMTL_SEED_BATCH]; } t_seed_batch;
+void nvmtl_vk_surface_seed_batch_begin(void) { if (t_seed_batch.depth++ == 0) t_seed_batch.n = 0; }
+void nvmtl_vk_surface_seed_batch_end(void) { if (t_seed_batch.depth > 0 && --t_seed_batch.depth == 0) t_seed_batch.n = 0; }
+static uint32_t nvmtl_surface_seed_bump(void *surf, int dedupe)
 {
     if (!surf || !nvmtl_btsh_seed_on() || IOSurfaceGetPlaneCount((IOSurfaceRef)surf) <= 1) return 0;
+    unsigned slot = t_seed_batch.n;
+    if (t_seed_batch.depth)
+        for (unsigned i = 0; i < t_seed_batch.n; i++) if (t_seed_batch.surf[i] == surf) {
+            if (dedupe) return t_seed_batch.seed[i];
+            slot = i; break; }
     uint32_t seed = 0;
     if (IOSurfaceLock((IOSurfaceRef)surf, 0, NULL) != kIOReturnSuccess) return 0;
     if (IOSurfaceUnlock((IOSurfaceRef)surf, 0, &seed) != kIOReturnSuccess) return 0;
+    if (t_seed_batch.depth && slot < NVMTL_SEED_BATCH) {
+        t_seed_batch.surf[slot] = surf; t_seed_batch.seed[slot] = seed; if (slot == t_seed_batch.n) t_seed_batch.n++; }
     return seed;
 }
+uint32_t nvmtl_vk_surface_seed_bump(void *surf) { return nvmtl_surface_seed_bump(surf, 1); }
+/* always moves it (a CPU readback just wrote this plane's rows after its own lock moved the seed); later deduped bumps
+   in the batch get this newer seed */
+uint32_t nvmtl_vk_surface_seed_bump_now(void *surf) { return nvmtl_surface_seed_bump(surf, 0); }
 int nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf)
 {
     if (!img || !img->img || !surf || !atomic_load(&g_btsh_live) || !nvmtl_btsh_seed_on()) return 0;
@@ -3586,7 +3606,8 @@ void nvmtl_vk_frame_census(int what)
     if (what < 0 || what >= NVC_N) return;
     atomic_fetch_add_explicit(&g_fc[what], 1, memory_order_relaxed);
     if (what != NVC_COMMIT) return;
-    const unsigned long long now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    /* awake time: an interval that spans a system sleep would otherwise dilute the rates */
+    const unsigned long long now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     unsigned long long t0 = atomic_load(&g_fc_t0);
     if (!t0) { atomic_compare_exchange_strong(&g_fc_t0, &t0, now); return; }
     if (now - t0 < 30000000000ull || !atomic_compare_exchange_strong(&g_fc_t0, &t0, now)) return;

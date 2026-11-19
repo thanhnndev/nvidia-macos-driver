@@ -66,6 +66,7 @@ static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
         NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
+        nvmtl_vk_surface_seed_batch_begin();    // one seed move per surface, not per plane texture
         for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
             if (!t->_surf) continue;
             // review of 4b2835e, finding 2: move a host-imported multi-plane surface's seed at commit too, so a reader that
@@ -76,6 +77,7 @@ static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
             write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
             writes[nvmtl_surface_writer_key(t)] = write;
         }
+        nvmtl_vk_surface_seed_batch_end();
     }
 }
 static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
@@ -601,7 +603,9 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (result == 0) [self nvmtlCollectDeviceTiming:&part->commands];
         BOOL published = result == 0;
         if (published) {
+            nvmtl_vk_surface_seed_batch_begin();    // one seed move per surface, not per plane texture
             for (NVMTLTexture *texture in part->surfaces) if (![texture nvmtlSurfaceOut]) published = NO;
+            nvmtl_vk_surface_seed_batch_end();
             for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
         }
         if (!published) {

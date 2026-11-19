@@ -1308,6 +1308,9 @@ void nvmtl_frame_stats_surfin(uint64_t ns, size_t bytes) {
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
+    // review of 43ccb65 (a): the write lock moved the seed when it was taken, before the rows above were written, so a
+    // reader's watched shadow copying meanwhile recorded that seed over half-written rows. Move it again now they are in.
+    if (!lockopt) { const uint32_t s2 = nvmtl_vk_surface_seed_bump_now((void *)r->_surf); if (s2) seed = s2; }
     r->_surfSeed = seed; r->_surfSynced = YES;
     r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);

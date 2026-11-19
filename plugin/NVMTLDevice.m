@@ -97,23 +97,26 @@ const char *nvmtl_log_path(void) {
     }
     return path;
 }
-static void nvlog_emit(uint64_t rep, const char *fmt, va_list a);
+static void nvlog_emit(uint64_t rep, int report, const char *fmt, va_list a);
 void nvlog(const char *fmt, ...) {
     uint64_t rep; if (nvlog_dropped(fmt, &rep)) return;
-    va_list a; va_start(a, fmt); nvlog_emit(rep, fmt, a); va_end(a);
+    va_list a; va_start(a, fmt); nvlog_emit(rep, 0, fmt, a); va_end(a);
 }
 // Periodic reports (the 30 s surface-keep and pipelines lines) are rate-limited by their callers; through nvlog they
-// stopped after 8 lines per format (2026-11-19 out-39: no surface-keep report after 4 min of uptime).
+// stopped after 8 lines per format (2026-11-19 out-39: no surface-keep report after 4 min of uptime). Release builds
+// keep them too (review of 43ccb65: the frame census, like the surface-keep and pipelines lines, was filtered out by
+// nvmtl_log_failure): one line per 30 s per report per process.
 void nvlog_report(const char *fmt, ...) {
-    va_list a; va_start(a, fmt); nvlog_emit(0, fmt, a); va_end(a);
+    va_list a; va_start(a, fmt); nvlog_emit(0, 1, fmt, a); va_end(a);
 }
-static void nvlog_emit(uint64_t rep, const char *fmt, va_list a) {
+static void nvlog_emit(uint64_t rep, int report, const char *fmt, va_list a) {
     char b[1024]; vsnprintf(b, sizeof b, fmt, a);
     char t[1152];
     if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
     else     snprintf(t, sizeof t, "%s", b);
 #if NVMTL_RELEASE
     if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
+    else if (report) syslog(LOG_NOTICE, "NullMoth: %s", t);
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
     FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }

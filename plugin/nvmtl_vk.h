@@ -340,6 +340,9 @@ int  nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, 
 int  nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf);
 int  nvmtl_vk_btsh_seed_on(void);
 uint32_t nvmtl_vk_surface_seed_bump(void *surf);
+uint32_t nvmtl_vk_surface_seed_bump_now(void *surf);
+void nvmtl_vk_surface_seed_batch_begin(void);
+void nvmtl_vk_surface_seed_batch_end(void);
 /* WS-CPU 8.7 step 1: per-present census (commits, waits, submits, object churn, desc-cache), one line per 30 s */
 enum { NVC_COMMIT, NVC_CAWUS, NVC_WSCHED, NVC_WCOMP, NVC_SUBMIT, NVC_VIEW_NEW, NVC_VIEW_DEL, NVC_BUF_NEW, NVC_BUF_DEL, NVC_N };
 void nvmtl_vk_frame_census(int what);
