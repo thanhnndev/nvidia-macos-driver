@@ -316,6 +316,30 @@ static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmx_gtt, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0, nmx_gtt_sysctl,
             "A", "out-31: GTT and VRAM used/size, and per open DRM file: pid, name, resident bytes per placement, evicted, BOs");
+extern "C" int nmx_tt_census_format(char *buf, size_t size);
+extern "C" int sysctlbyname(const char *, void *, size_t *, void *, size_t);   /* imported already (nmx_kernel.c) */
+static int nmx_tt_census_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 16 * 1024;
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = nmx_tt_census_format(buf, size);
+    if (n < 0) n = 0;
+    int level = -1, avail = -1;
+    size_t len = sizeof level;
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) != 0) level = -1;
+    len = sizeof avail;
+    if (sysctlbyname("kern.memorystatus_level", &avail, &len, NULL, 0) != 0) avail = -1;
+    if ((size_t)n < size)
+        n += snprintf(buf + n, size - (size_t)n, "pressure_level %d memorystatus_level %d\n", level, avail);
+    if ((size_t)n > size) n = (int)size;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_tt_census, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_tt_census_sysctl, "A",
+            "FRAME-PATH 12.13 S1: per process resident GPU pages split pinned/userptr/idle/busy (read-only), and the VM pressure level");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -427,6 +451,7 @@ static void nmx_sysctl_install(void)
     sysctl_register_oid(&sysctl__debug_nmx_flip_notified);
     sysctl_register_oid(&sysctl__debug_nmx_vbl_delivered);
     sysctl_register_oid(&sysctl__debug_nmx_gtt);
+    sysctl_register_oid(&sysctl__debug_nmx_tt_census);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
     sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);
