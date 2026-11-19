@@ -1642,38 +1642,47 @@ static int gtt_count_bo(int id, void *p, void *data)
  * user-memory imports: Step142 parks those), and the rest (TTM swap-out's candidates) split by whether every fence on
  * the BO has signalled now. A BO imported by two files is counted in both (handles, like the bos column of nmx_gtt).
  */
-struct tt_census { uint64_t n, res, pin, uptr, idle, busy, vram; };
+struct tt_census { uint64_t n, res, pin, uptr, idle, busy, vram, locked; };
+/* Read under the BO's reservation, as amdgpu_bo_print_info does: a concurrent move (the park sweep runs every second)
+ * can free bo->tbo.resource or clear bo->tbo.ttm. Trylock only (we are inside the table spinlock, and must not wait on a
+ * submit): a BO someone holds is counted as "locked" and not classified. The lock is held for a few loads only, so a
+ * concurrent handle_moved that finds it held takes its clear path no more often than it does for any other holder. */
 static int tt_census_bo(int id, void *p, void *data)
 {
     struct tt_census *c = data;
     struct drm_gem_object *gem = p;
     struct amdgpu_bo *bo;
     struct ttm_resource *r;
+    struct ttm_tt *tt;
     uint64_t pages;
 
     if (gem == NULL)
         return 0;
     bo = gem_to_amdgpu_bo(gem);
-    r = bo->tbo.resource;
     c->n++;
-    if (r == NULL)
-        return 0;
-    pages = (uint64_t)PFN_UP(amdgpu_bo_size(bo));
-    if (r->mem_type == TTM_PL_VRAM) {          /* the carve-out: not pages of system RAM */
-        c->vram += pages;
+    if (!dma_resv_trylock(bo->tbo.base.resv)) {
+        c->locked++;
         return 0;
     }
-    if (bo->tbo.ttm == NULL || !ttm_tt_is_populated(bo->tbo.ttm) || (bo->tbo.ttm->page_flags & TTM_TT_FLAG_SWAPPED))
-        return 0;
-    c->res += pages;
-    if (bo->tbo.pin_count)
-        c->pin += pages;
-    else if (bo->tbo.ttm->page_flags & TTM_TT_FLAG_EXTERNAL)
-        c->uptr += pages;
-    else if (dma_resv_test_signaled(bo->tbo.base.resv, DMA_RESV_USAGE_BOOKKEEP))
-        c->idle += pages;
-    else
-        c->busy += pages;
+    r = bo->tbo.resource;
+    tt = bo->tbo.ttm;
+    pages = (uint64_t)PFN_UP(amdgpu_bo_size(bo));
+    if (r == NULL) {
+        /* nothing resident */
+    } else if (r->mem_type == TTM_PL_VRAM) {   /* the carve-out: not pages of system RAM */
+        c->vram += pages;
+    } else if (tt != NULL && ttm_tt_is_populated(tt) && !(tt->page_flags & TTM_TT_FLAG_SWAPPED)) {
+        c->res += pages;
+        if (bo->tbo.pin_count)
+            c->pin += pages;
+        else if (tt->page_flags & TTM_TT_FLAG_EXTERNAL)
+            c->uptr += pages;
+        else if (dma_resv_test_signaled(bo->tbo.base.resv, DMA_RESV_USAGE_BOOKKEEP))
+            c->idle += pages;
+        else
+            c->busy += pages;
+    }
+    dma_resv_unlock(bo->tbo.base.resv);
     return 0;
 }
 
@@ -1691,7 +1700,7 @@ int nmx_tt_census_format(char *buf, size_t size)
     }
     dev = adev_to_drm(flip_adev(fbs[0].fb));
     memset(&all, 0, sizeof(all));
-    G_P("pid name bos resident_pages pinned_pages userptr_pages idle_pages busy_pages vram_pages\n");
+    G_P("pid name bos resident_pages pinned_pages userptr_pages idle_pages busy_pages vram_pages locked_bos\n");
     mutex_lock(&dev->filelist_mutex);
     list_for_each_entry(file, &dev->filelist, lhead) {
         struct amdgpu_fpriv *fpriv = file->driver_priv;
@@ -1705,20 +1714,22 @@ int nmx_tt_census_format(char *buf, size_t size)
         idr_for_each(&file->object_idr, tt_census_bo, &c);
         spin_unlock(&file->table_lock);
         all.n += c.n; all.res += c.res; all.pin += c.pin; all.uptr += c.uptr;
-        all.idle += c.idle; all.busy += c.busy; all.vram += c.vram;
-        if (c.res == 0 && c.vram == 0)
+        all.idle += c.idle; all.busy += c.busy; all.vram += c.vram; all.locked += c.locked;
+        if (c.res == 0 && c.vram == 0 && c.locked == 0)
             continue;
         ti = amdgpu_vm_get_task_info_vm(&fpriv->vm);
-        G_P("%d %s %llu %llu %llu %llu %llu %llu %llu\n", ti ? (int)ti->tgid : -1, ti ? ti->process_name : "?",
+        G_P("%d %s %llu %llu %llu %llu %llu %llu %llu %llu\n", ti ? (int)ti->tgid : -1, ti ? ti->process_name : "?",
             (unsigned long long)c.n, (unsigned long long)c.res, (unsigned long long)c.pin, (unsigned long long)c.uptr,
-            (unsigned long long)c.idle, (unsigned long long)c.busy, (unsigned long long)c.vram);
+            (unsigned long long)c.idle, (unsigned long long)c.busy, (unsigned long long)c.vram, (unsigned long long)c.locked);
         if (ti)
             amdgpu_vm_put_task_info(ti);
     }
     mutex_unlock(&dev->filelist_mutex);
-    G_P("total %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)all.n, (unsigned long long)all.res,
+    G_P("total %llu %llu %llu %llu %llu %llu %llu %llu\n", (unsigned long long)all.n, (unsigned long long)all.res,
         (unsigned long long)all.pin, (unsigned long long)all.uptr, (unsigned long long)all.idle,
-        (unsigned long long)all.busy, (unsigned long long)all.vram);
+        (unsigned long long)all.busy, (unsigned long long)all.vram, (unsigned long long)all.locked);
+    if (o >= size && size > 32)          /* never silently short: the reader sees the cut */
+        snprintf(buf + size - 32, 32, "\nTRUNCATED (buffer %zu)\n", size);
 #undef G_P
     return (int)(o < size ? o : size);
 }
