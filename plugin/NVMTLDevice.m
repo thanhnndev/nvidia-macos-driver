@@ -1177,11 +1177,23 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     }
     lastSweep = now;
     NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new], *dead = [NSMutableArray new];
+    // Each kept backing holds one retain on its surface (nvmtlNewSurfaceTexture). A surface can have several entries: one
+    // per plane (two-plane video, 420v/x420: plane 0 and plane 1 are separate keys) or one per key variant (other-key
+    // misses). Counted against "retain count > 1", those entries saw each other's retains as an outside holder and
+    // refreshed each other forever: WindowServer kept every Aerial wallpaper frame it ever composited (4K 10-bit
+    // two-plane, ~18 BOs / ~330 MB per clip, never released; the surfaces themselves stayed alive, which is the decoder
+    // service's growing "unmapped" footprint). So the retains our own entries hold are counted first, without retaining
+    // (a CFBag with NULL callbacks), and only retains beyond them mean the surface is held elsewhere.
+    CFMutableBagRef own = CFBagCreateMutable(NULL, 0, NULL);
+    [keep enumerateKeysAndObjectsUsingBlock:^(NVMTLSurfKey *k, NVMTLSurfKeep *e, BOOL *stop) {
+        (void)k; (void)stop; __unsafe_unretained NVMTLTexture *b = e->_tex;
+        if (b->_surf && b->_surfOwned) CFBagAddValue(own, b->_surf); }];
     [keep enumerateKeysAndObjectsUsingBlock:^(NVMTLSurfKey *k, NVMTLSurfKeep *e, BOOL *stop) {
         (void)stop; __unsafe_unretained NVMTLTexture *b = e->_tex;   // no extra retain: the retain count below must see only real holders
         // Held elsewhere (WindowServer layer contents): in use now, so its idle time starts when it is released. Without
         // this, a surface on screen for > NVMTL_KEEP_MS without a new wrap expired at the first sweep after its release.
-        if (b->_surf && CFGetRetainCount(b->_surf) > 1) { if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; } return; }
+        if (b->_surf && CFGetRetainCount(b->_surf) > MAX((CFIndex)1, CFBagGetCountOfValue(own, b->_surf))) {
+            if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; } return; }
         // A live wrapper (the backing itself handed out, or a view of it: views hold their parent) is in use too.
         // WindowServer keeps its MTLTexture for a surface across frames without wrapping it again or holding the
         // IOSurface: 2026-11-08 boot, ~1500 expired misses per 30 s, half back within 250 ms of the drop. Only for
@@ -1209,6 +1221,7 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
             [idle addObject:k]; return; }
         [gone addObject:k];
     }];
+    CFRelease(own);
     for (NVMTLSurfKey *k in dead) nvmtl_sk_drop(keep, k, NVMTL_GONE_DEAD);
     for (NVMTLSurfKey *k in gone) {
         NVMTLTexture *b = keep[k]->_tex;
