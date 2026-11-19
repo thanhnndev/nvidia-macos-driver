@@ -945,6 +945,8 @@ static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUIntege
 #undef NVMTL_PLANE_LATE
     t->_hostBuf = hb; t->_hostOn = YES; t->_hostRO = !rw; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
     t->_hostSL = nvmtl_vk_surface_list_mark(&t->_hostBuf) ? YES : NO;
+    // a read-only shadow (plane start or pitch not on 256 B) copies only when the surface's seed moved (WS-CPU 8.6)
+    if (!rw) (void)nvmtl_vk_image_btsh_watch_surface(&t->_i, (void *)surf);
     g_plane_host++; g_plane_host_ro += !rw;
     static unsigned said; if (said++ < 8 || g_plane_host % 2000 == 0)
         nvlog("surface %u plane %lu %ux%u pitch %zu at +%zu (%zu plane(s), fmt '%.4s') -> its own pages (host import, %s; %llu planes, %llu read-only)",

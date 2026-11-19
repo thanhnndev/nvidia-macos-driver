@@ -336,6 +336,8 @@ void nvmtl_vk_heap_destroy(nvk_heap *h);
 int  nvmtl_vk_buffer_create_placed(size_t size, nvk_heap *heap, size_t offset, nvk_buffer *out);
 int  nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
                                         const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
+/* a read-only shadowed alias of an IOSurface plane: copy its rows only when the surface's seed moved (1: watched) */
+int  nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf);
 int  nvmtl_vk_image_placed_fits(const nvk_image *img, size_t len);
 int  nvmtl_vk_image_create_typed_placed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_heap *heap, size_t offset, nvk_image *out);
 int  nvmtl_vk_depth_create_ex_placed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t aspect, nvk_heap *heap, size_t offset, nvk_image *out);

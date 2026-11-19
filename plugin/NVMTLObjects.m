@@ -1276,7 +1276,16 @@ void nvmtl_frame_stats_surfin(uint64_t ns, size_t bytes) {
 }
 - (BOOL)nvmtlSurfaceOut {
     NVMTLTexture *r = _parent ? _parent : self;
-    if (!r->_surf || r->_hostOn) return YES;   // host-backed: the GPU wrote the surface's own pages
+    if (!r->_surf) return YES;
+    if (r->_hostOn) {   // host-backed: the GPU wrote the surface's own pages
+        // WS-CPU 8.6: move the seed of a written plane of a multi-plane surface once the GPU is done, as a CPU writer's
+        // unlock does: a reader's read-only shadow of that plane copies only when the seed moved (nvmtl_vk_image_btsh_watch_surface)
+        if (!r->_hostRO && IOSurfaceGetPlaneCount(r->_surf) > 0) {
+            uint32_t seed = 0;
+            if (IOSurfaceLock(r->_surf, 0, NULL) == kIOReturnSuccess && IOSurfaceUnlock(r->_surf, 0, &seed) == kIOReturnSuccess) r->_surfSeed = seed;
+        }
+        return YES;
+    }
     @synchronized (nvmtl_surface_sync(r)) {
     if (![r nvmtlSurfaceCopyable]) return NO;
     if (r->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)) {

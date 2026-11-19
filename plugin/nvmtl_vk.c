@@ -64,6 +64,7 @@ static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
  * accelerator), RADV for AMD and ANV for Intel (NMXAccel, the accelerator for the GPUs NMXGPU drives).
  */
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 static uint16_t g_vendor;
 static uint16_t nvmtl_pci_vendor_of(io_service_t accel)
 {
@@ -2939,12 +2940,17 @@ typedef struct nvmtl_btsh {
        ~20 % of its main thread during video (docs/890M-TRACE.md, Edge video lag part 4). img's own layout tracking is
        untouched: cimg is never bound or sampled. */
     VkImage cimg; uint32_t w, bpp; _Atomic int cgeneral;
+    /* Read-only shadow of an IOSurface plane (nvmtl_vk_image_btsh_watch_surface): the rows go in only when the surface's
+       seed moved since the last copy, the rule the private-image path keeps (nvmtlSurfaceIn). seed/seeded are read and
+       written only by nvmtl_btsh_pre under nvmtl_submit_mutex, so the copy that set them is queued before every command
+       buffer that skips. */
+    IOSurfaceRef surf; uint32_t seed; int seeded;
 } nvmtl_btsh;
 typedef struct { const void *key; nvmtl_btsh *s; } nvmtl_btsh_ent;
 static pthread_mutex_t g_btsh_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvmtl_btsh_ent *g_btsh_ent; static unsigned g_btsh_n, g_btsh_cap;
 static _Atomic unsigned g_btsh_live;
-static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs, g_btsh_one;
+static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs, g_btsh_one, g_btsh_seedskip;
 static int nvmtl_btsh_onecopy_on(void)
 {
     static int on = -1;
@@ -2963,6 +2969,7 @@ static void nvmtl_btsh_release(nvmtl_btsh *s)
 {
     if (!s || atomic_fetch_sub(&s->ref, 1) != 1) return;
     if (s->cimg) pvkDestroyImage(g_dev, s->cimg, NULL);
+    if (s->surf) CFRelease(s->surf);
     if (s->sh) pvkDestroyBuffer(g_dev, s->sh, NULL);
     if (s->mem) { pvkFreeMemory(g_dev, s->mem, NULL); if (!s->sysmem) g_budget_stale = 1; }
     free(s); atomic_fetch_sub(&g_btsh_live, 1);
@@ -3048,6 +3055,28 @@ static void nvmtl_btsh_note(nvk_cmdbuf *c, const void *key)
     pthread_mutex_unlock(&g_btsh_lock);
 }
 static void nvmtl_btsh_note_img(nvk_cmdbuf *c, const nvk_image *img) { if (img) nvmtl_btsh_note(c, img->img); }
+/* WS-CPU 8.6 (2026-11-19): b855e71 gave WindowServer's two-plane video wrappers (x420 plane 0 at +64) a GPU shadow, and
+   every command buffer that bound one copied the whole plane again: one 20 s 4K x420 clip = ~31.7 GB of shadow copies
+   (prologue uploads 9.96 -> 41.7 GB, out-41 17:20). A read-only shadow of an IOSurface plane now copies only when the
+   surface's seed moved. Writers move it: CPU writers by their write lock, VCNDec after its GPU copy (e210759), and our
+   own GPU writes to host-imported planes in nvmtlSurfaceOut. NVMTL_BTSH_SEED=0: copy in every command buffer as before. */
+static int nvmtl_btsh_seed_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_BTSH_SEED"); on = !(e && e[0] == '0');
+        nvlog("buffer texture: read-only surface-plane shadows copy %s", on ? "only when the IOSurface seed moved" : "in every command buffer (NVMTL_BTSH_SEED=0)"); }
+    return on;
+}
+int nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf)
+{
+    if (!img || !img->img || !surf || !atomic_load(&g_btsh_live) || !nvmtl_btsh_seed_on()) return 0;
+    int ok = 0;
+    pthread_mutex_lock(&g_btsh_lock);
+    nvmtl_btsh *s = nvmtl_btsh_find_locked((const void *)img->img);
+    if (s && !s->writable && !s->surf) { s->surf = (IOSurfaceRef)CFRetain((IOSurfaceRef)surf); ok = 1; }
+    pthread_mutex_unlock(&g_btsh_lock);
+    return ok;
+}
 static void nvmtl_btsh_retire(nvk_cmdbuf *c)
 {
     for (unsigned i = 0; i < c->nbtsh; i++) nvmtl_btsh_release((nvmtl_btsh *)c->btsh[i]);
@@ -6295,8 +6324,24 @@ static void nvmtl_subwho_note(const char *who, uint64_t ns)
    and come back from each one it may write after its last command. */
 static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
 {
+    /* which shadows need their rows: all but a watched surface plane whose seed did not move (nvmtl_btsh.surf) */
+    unsigned char need_st[256], *need = c->nbtsh <= sizeof need_st ? need_st : malloc(c->nbtsh);
+    unsigned nneed = 0, nskip = 0;
+    for (unsigned i = 0; i < c->nbtsh; i++) {
+        nvmtl_btsh *s = (nvmtl_btsh *)c->btsh[i];
+        int go = 1;
+        if (s->surf) { const uint32_t now = IOSurfaceGetSeed(s->surf); go = !s->seeded || s->seed != now; s->seed = now; s->seeded = 1; }
+        if (need) need[i] = (unsigned char)go;
+        else go = 1;   // out of memory for the list: copy everything (the seeds just taken stay valid: those rows are queued now)
+        nneed += go; nskip += !go;
+    }
+    if (nskip) atomic_fetch_add(&g_btsh_seedskip, nskip);
+    if (!nneed) { if (need != need_st) free(need); goto census; }
     if (!p->begun) {
-        if (nvmtl_vk_cmd_begin(NULL, &p->cb)) { g_pre_fail++; nvlog("buffer texture: shadow upload prologue begin FAILED - %u shadows keep old rows", c->nbtsh); return; }
+        if (nvmtl_vk_cmd_begin(NULL, &p->cb)) {
+            g_pre_fail++; nvlog("buffer texture: shadow upload prologue begin FAILED - %u shadows keep old rows", nneed);
+            for (unsigned i = 0; i < c->nbtsh; i++) ((nvmtl_btsh *)c->btsh[i])->seeded = 0;   // copy again next time
+            if (need != need_st) free(need); return; }
         p->begun = 1;
         VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
         pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -6305,17 +6350,20 @@ static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
         pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     for (unsigned i = 0; i < c->nbtsh; i++) {
+        if (need && !need[i]) continue;
         const nvmtl_btsh *s = (const nvmtl_btsh *)c->btsh[i];
         nvmtl_btsh_rows(p->cb.cb, s, 1);
         p->n++; p->copies++; p->bytes += (unsigned long long)s->rowbytes * s->h;
         p->btsh++; p->btsh_bytes += (unsigned long long)s->rowbytes * s->h;
     }
-    atomic_fetch_add(&g_btsh_in, c->nbtsh);
+    if (need != need_st) free(need);
+    atomic_fetch_add(&g_btsh_in, nneed);
+census:;
     const unsigned long long k = atomic_fetch_add(&g_btsh_cbs, 1);
     if (k < 4 || ((k + 1) & 0x3ff) == 0)
-        nvlog("buffer texture: %llu command buffers used shadowed buffer textures (%llu shadows made, %llu of them one-copy, %u live; %llu row uploads, %llu writebacks)",
+        nvlog("buffer texture: %llu command buffers used shadowed buffer textures (%llu shadows made, %llu of them one-copy, %u live; %llu row uploads, %llu skipped at an unchanged surface seed, %llu writebacks)",
               k + 1, (unsigned long long)atomic_load(&g_btsh_made), (unsigned long long)atomic_load(&g_btsh_one), (unsigned)atomic_load(&g_btsh_live),
-              (unsigned long long)atomic_load(&g_btsh_in), (unsigned long long)atomic_load(&g_btsh_out));
+              (unsigned long long)atomic_load(&g_btsh_in), (unsigned long long)atomic_load(&g_btsh_seedskip), (unsigned long long)atomic_load(&g_btsh_out));
 }
 static void nvmtl_btsh_post(nvk_cmdbuf *c)
 {
@@ -6435,6 +6483,7 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
         if (pre->n && pr == VK_SUCCESS) { nvmtl_vk_cb_exact_raw((VkCommandBuffer)pre->cb.cb); cbs[ncb++] = pre->cb.cb; }
         else {
             if (pre->n) { g_pre_fail++; nvlog("vk: pre-submit prologue End -> %d - %u uploads/fills (%llu bytes) LOST, the GPU keeps the old bytes", pr, pre->n, pre->bytes); }
+            for (unsigned i = 0; i < c->nbtsh; i++) ((nvmtl_btsh *)c->btsh[i])->seeded = 0;   // those shadow rows were not copied
             nvmtl_cmd_retire(&pre->cb); nvmtl_pre_drop(pre); pre->begun = 0;
         }
     }
