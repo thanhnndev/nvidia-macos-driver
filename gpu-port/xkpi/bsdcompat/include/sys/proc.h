@@ -23,6 +23,7 @@ struct proc {
                                      * the record holds one mm_users reference on it until the process is gone */
     void *nmx_xnu;                  /* the xnu proc_t */
     uint64_t nmx_start;             /* the process's start time (us): with p_pid, tells a recycled proc_t apart */
+    int nmx_retired;                /* set under the registry lock when nmx_proc_reap retired the record */
 };
 struct thread {
     thread_t td_xnu;                    /* the xnu thread */
@@ -57,8 +58,8 @@ void nmx_thread_entry_enter(struct thread *td);
 void nmx_thread_entry_leave(struct thread *td);
 /* the same bracket for entries that are not device-node calls (sysctl handlers, framebuffer calls): curthread's record,
  * nothing in interrupt context */
-void nmx_entry_begin(void);
-void nmx_entry_end(void);
+struct thread *nmx_entry_begin(void);     /* NULL in interrupt context or before the port started: pass it to end */
+void nmx_entry_end(struct thread *td);
 /* runs fn(arg) under the registry lock if td still belongs to p (not reparented by nmx_proc_reap); -1 if it does not */
 int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg);
 #define TDF_KTH_SUSP 0x00000100

@@ -121,6 +121,15 @@ static void nmx_tl_unlock(void)
     ml_set_interrupts_enabled(was);
 }
 
+/* nmx_thread_lock held. A thread whose td_proc was taken (nmx_curproc) before its record was linked or rebuilt may
+ * name a record retired in between, which the reaper's walk did not see: it belongs to kernproc, like the threads the
+ * walk moved. The record is still allocated: the graveyard frees it one reap after retiring it. */
+static void nmx_thread_proc_fix_locked(struct thread *td)
+{
+    if (td->td_proc != NULL && td->td_proc->nmx_retired)
+        td->td_proc = nmx_kernproc;
+}
+
 #define NMX_PROC_BUCKETS 64
 struct nmx_proc_rec {
     struct proc p;
@@ -176,6 +185,7 @@ static void nmx_proc_retire_locked(struct nmx_proc_rec **pp)
 {
     struct nmx_proc_rec *r = *pp;
     *pp = r->next;
+    r->p.nmx_retired = 1;
     r->next = nmx_procs_retired;
     nmx_procs_retired = r;
 }
@@ -285,6 +295,7 @@ static void nmx_thread_recycle(struct nmx_thread_rec *r, uint64_t tid)
     struct task_struct *ts = r->td.td_lkpi_task;
     r->td.td_lkpi_task = NULL;
     r->td.td_proc = p;
+    nmx_thread_proc_fix_locked(&r->td);
     /* ga403wm Step134: td_name is the Linux task's comm (linux_current.c); left empty, amdgpu's VM fault print named
      * no process ("in process  pid N"), which hid the 15:17 PERMISSION_FAULTS writer */
     strlcpy(r->td.td_name, p->p_comm, sizeof(r->td.td_name));
@@ -339,16 +350,17 @@ static struct thread *nmx_thread_get(int transient, int *created)
         if (nr == NULL)
             panic("NullMoth xkpi: no memory for a thread record");
     }
-    nr->td.td_proc = nmx_curproc();
-    strlcpy(nr->td.td_name, nr->td.td_proc->p_comm, sizeof(nr->td.td_name));   /* Step134: the task's comm */
     nr->td.td_tid = (int)(tid & 0x7fffffff);
     nr->td.td_xnu_tid = tid;
     nr->td.td_priority = PZERO;
     nr->td.td_base_pri = PZERO;
     nr->transient = transient;
+    nr->td.td_proc = nmx_curproc();
+    strlcpy(nr->td.td_name, nr->td.td_proc->p_comm, sizeof(nr->td.td_name));   /* Step134: the task's comm */
     __atomic_store_n(&nr->td.td_xnu, xt, __ATOMIC_RELAXED);
 
     nmx_tl_lock();
+    nmx_thread_proc_fix_locked(&nr->td);
     r = nmx_thread_find(xt);
     if (r == NULL) {
         unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
@@ -999,21 +1011,29 @@ void nmx_thread_entry_leave(struct thread *td)
                "(%u kept while inside so far)\n", td->td_tid, done);
 }
 
-void nmx_entry_begin(void)
+/* review of 37bac65: the driver's sysctls are registered before nmx_port_start made the registry lock and stay after a
+ * failed start or nmx_port_stop; curthread there would take a NULL lock. No record then: nothing to count. */
+struct thread *nmx_entry_begin(void)
 {
-    if (!ml_at_interrupt_context())
-        nmx_thread_entry_enter(nmx_curthread());
+    if (ml_at_interrupt_context() || __atomic_load_n(&nmx_thread_lock, __ATOMIC_ACQUIRE) == NULL)
+        return NULL;
+    struct thread *td = nmx_curthread();
+    nmx_thread_entry_enter(td);
+    return td;
 }
 
-void nmx_entry_end(void)
+void nmx_entry_end(struct thread *td)
 {
-    if (!ml_at_interrupt_context())
-        nmx_thread_entry_leave(nmx_curthread());
+    if (td != NULL)
+        nmx_thread_entry_leave(td);
 }
 
 int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg)
 {
     nmx_tl_lock();
+    /* a record retired before this thread's record was linked (nmx_thread_get/recycle read nmx_curproc first) is
+     * not reached by the reaper's walk: move the thread to kernproc here (review of 37bac65) */
+    nmx_thread_proc_fix_locked(td);
     int r = td->td_proc == p ? fn(arg) : -1;
     nmx_tl_unlock();
     return r;

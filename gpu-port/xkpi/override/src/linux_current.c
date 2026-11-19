@@ -160,7 +160,6 @@ linux_alloc_current(struct thread *td, int flags)
 	 */
 again:
 	proc = td->td_proc;
-	PROC_LOCK(proc);
 	struct linux_current_find fa = { .proc = proc, .ts = ts, .mm = NULL };
 	if (nmx_thread_proc_locked(td, proc, linux_current_find_locked, &fa) < 0)
 		goto again;
