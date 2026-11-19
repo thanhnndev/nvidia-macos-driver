@@ -24,6 +24,7 @@ static int g_sampler_anisotropy, g_sampler_mirror_clamp;
 static int g_scalar_layout;
 
 void nvlog(const char *fmt, ...);
+void nvlog_report(const char *fmt, ...);
 
 static __thread uint32_t g_copy_aspect_override, g_copy_bpp_override;
 void nvmtl_vk_copy_aspect_override(uint32_t aspect, uint32_t bpp) { g_copy_aspect_override = aspect; g_copy_bpp_override = bpp; }
@@ -4571,9 +4572,9 @@ static void nvmtl_pstat_record(int compute, uint64_t key, uint64_t ns, size_t vn
         extern _Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns;
         const unsigned long long fh = atomic_exchange(&nvmtl_fc_stat_hits, 0), fm = atomic_exchange(&nvmtl_fc_stat_misses, 0),
                                  fns = atomic_exchange(&nvmtl_fc_stat_miss_ns, 0), fmax = atomic_exchange(&nvmtl_fc_stat_miss_max_ns, 0);
-        nvlog("pipelines: specializations (AIR->SPIR-V with constants): %llu cache hits, %llu misses translated in %.1f ms (slowest %.1f ms)",
+        nvlog_report("pipelines: specializations (AIR->SPIR-V with constants): %llu cache hits, %llu misses translated in %.1f ms (slowest %.1f ms)",
               fh, fm, fns / 1e6, fmax / 1e6);
-        nvlog("pipelines: %llu s: render %llu, compute %llu (new key %llu, repeat of a key built earlier in this process %llu, failed %llu), "
+        nvlog_report("pipelines: %llu s: render %llu, compute %llu (new key %llu, repeat of a key built earlier in this process %llu, failed %llu), "
               "%.1f ms creating, slowest %.1f ms (%llu+%llu B SPIR-V), %llu KB SPIR-V in, VkPipelineCache %s (%llu passed it), %u keys seen",
               (unsigned long long)((now - g_plstat.lastMs) / 1000), (unsigned long long)g_plstat.render, (unsigned long long)g_plstat.compute,
               (unsigned long long)g_plstat.fresh, (unsigned long long)g_plstat.repeats, (unsigned long long)g_plstat.failed,

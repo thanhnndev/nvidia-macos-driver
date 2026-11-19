@@ -97,10 +97,19 @@ const char *nvmtl_log_path(void) {
     }
     return path;
 }
+static void nvlog_emit(uint64_t rep, const char *fmt, va_list a);
 void nvlog(const char *fmt, ...) {
     uint64_t rep; if (nvlog_dropped(fmt, &rep)) return;
-    char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
-    char t[640];
+    va_list a; va_start(a, fmt); nvlog_emit(rep, fmt, a); va_end(a);
+}
+// Periodic reports (the 30 s surface-keep and pipelines lines) are rate-limited by their callers; through nvlog they
+// stopped after 8 lines per format (2026-11-19 out-39: no surface-keep report after 4 min of uptime).
+void nvlog_report(const char *fmt, ...) {
+    va_list a; va_start(a, fmt); nvlog_emit(0, fmt, a); va_end(a);
+}
+static void nvlog_emit(uint64_t rep, const char *fmt, va_list a) {
+    char b[1024]; vsnprintf(b, sizeof b, fmt, a);
+    char t[1152];
     if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
     else     snprintf(t, sizeof t, "%s", b);
 #if NVMTL_RELEASE
@@ -1052,7 +1061,7 @@ static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MON
 static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
     if (!nvmtl_sk.lastLogMs) { nvmtl_sk.lastLogMs = now; return; }
     if (now - nvmtl_sk.lastLogMs < 30000) return;
-    nvlog("surface keep: %llu s: hits %llu, misses %llu (new surface %llu, same surface other key %llu, after drop: "
+    nvlog_report("surface keep: %llu s: hits %llu, misses %llu (new surface %llu, same surface other key %llu, after drop: "
           "unheld %llu, expired %llu, idle cap %llu, dead %llu), %lu entries, sweep avg %llu us max %llu us; %llu dropped (released off the "
           "main thread), idle %llu MB at the last sweep, slowest sweep dropped %llu; expired came back < 250 ms %llu, < 1 s %llu, "
           "< 3 s %llu, later %llu; held entries refreshed %llu (by a live wrapper %llu, by IOSurfaceIsInUse %llu); idle-cap drops came back < 250 ms %llu, "
