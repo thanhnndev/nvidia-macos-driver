@@ -22,6 +22,11 @@
 #include "nmx_port.h"
 
 extern "C" long long nmx_fb_flip_call(const char *name, void *req);
+/* review of fdffd32: a user thread running driver code outside the device node is counted like a device-node entry, so
+ * nmx_proc_reap keeps its Linux task while it is inside (nmx_kernel.c) */
+extern "C" void nmx_entry_begin(void);
+extern "C" void nmx_entry_end(void);
+struct NmxEntry { NmxEntry() { nmx_entry_begin(); } ~NmxEntry() { nmx_entry_end(); } NmxEntry(const NmxEntry &) = delete; };
 /* frame-path trace (nmx_fb_bridge.c): the timer's phase against the real vblank */
 extern "C" void nmx_ft_vbl_timer(uint64_t frame_ns);
 /* out-31 row 2 (nmx_fb_bridge.c): CRTC vblank sink and the DRM vblank reference; debug.nmx_vbl_irq / nmxvblirq=0 */
@@ -554,7 +559,8 @@ public:
         }
         /* ga403wm Step98/99: the NMXAccel page-flip API (nmx_fb_bridge.c) */
         if (fn && !fStopping) {
-            long long fr = nmx_fb_flip_call(fn->getCStringNoCopy(), p1);
+            long long fr;
+            { NmxEntry entry; fr = nmx_fb_flip_call(fn->getCStringNoCopy(), p1); }
             if (fr >= 0)
                 return (IOReturn)fr;
         }
@@ -718,7 +724,7 @@ public:
         if (attribute == kIOWindowServerActiveAttribute) { trace("setAttribute wsrv", value); return kIOReturnSuccess; }
         if (attribute == kIOPowerAttribute) {
             /* display sleep turns the outputs off; wake lights them again with the same buffer */
-            if (fDev) nmx_fb_power(fDev, value != 0);
+            if (fDev) { NmxEntry entry; nmx_fb_power(fDev, value != 0); }
             if (value) {
                 IOReturn r = IOFramebuffer::setAttribute(attribute, value);
                 handleEvent(kIOFBNotifyDidPowerOn);

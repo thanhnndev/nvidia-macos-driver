@@ -904,12 +904,20 @@ void nmx_proc_reap(void)
                          * no sleeping state, and the thread slept forever. A thread inside an entry point keeps its
                          * task; it hands it over itself as it leaves (nmx_thread_entry_leave). */
                         u_int was = __atomic_fetch_or(&t->td.td_nmx_entry, NMX_ENTRY_REAP, __ATOMIC_SEQ_CST);
-                        if (t->td.td_lkpi_task != NULL) {
-                            if ((was & NMX_ENTRY_DEPTH) == 0) {
+                        if (t->td.td_lkpi_task != NULL && (was & NMX_ENTRY_DEPTH) != 0)
+                            nmx_tasks_deferred++;
+                        else {
+                            if (t->td.td_lkpi_task != NULL) {
                                 nmx_task_pending_locked(t->td.td_lkpi_task);
                                 t->td.td_lkpi_task = NULL;
-                            } else
-                                nmx_tasks_deferred++;
+                            }
+                            /* the thread now belongs to kernproc: tasks it makes later are not this process's, so
+                             * nothing is left to hand over (review of fdffd32: REAP was sticky). An entry that raced
+                             * in after the fetch_or saw REAP and waits for this lock; one after this clear reads the
+                             * NULL through the RMW chain. A thread with no task yet cannot publish one for this
+                             * process any more: linux_alloc_current publishes under this lock only while td_proc is
+                             * still the process (nmx_thread_proc_locked) */
+                            __atomic_fetch_and(&t->td.td_nmx_entry, ~NMX_ENTRY_REAP, __ATOMIC_SEQ_CST);
                         }
                         break;
                     }
@@ -974,17 +982,41 @@ void nmx_thread_entry_leave(struct thread *td)
         return;
     /* the outermost entry of a thread whose process was retired while it was inside: hand its task to the reaper */
     struct task_struct *ts = NULL;
+    unsigned done = 0;
     nmx_tl_lock();
     if (td->td_lkpi_task != NULL) {
         ts = td->td_lkpi_task;
         nmx_task_pending_locked(ts);
         td->td_lkpi_task = NULL;
-        nmx_tasks_deferred_done++;
+        done = ++nmx_tasks_deferred_done;
     }
+    /* handed over once: the thread belongs to kernproc now (reparented by the reaper), so later entries are plain
+     * (review of fdffd32: REAP stayed set and every later entry made a task, handed it over and printed) */
+    __atomic_fetch_and(&td->td_nmx_entry, ~NMX_ENTRY_REAP, __ATOMIC_SEQ_CST);
     nmx_tl_unlock();
-    if (ts != NULL)
+    if (ts != NULL && (done <= 16 || (done & 255) == 0))
         printf("NullMoth xkpi: thread %d of a retired process left the driver; its Linux task is released now "
-               "(%u kept while inside so far)\n", td->td_tid, nmx_tasks_deferred_done);
+               "(%u kept while inside so far)\n", td->td_tid, done);
+}
+
+void nmx_entry_begin(void)
+{
+    if (!ml_at_interrupt_context())
+        nmx_thread_entry_enter(nmx_curthread());
+}
+
+void nmx_entry_end(void)
+{
+    if (!ml_at_interrupt_context())
+        nmx_thread_entry_leave(nmx_curthread());
+}
+
+int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg)
+{
+    nmx_tl_lock();
+    int r = td->td_proc == p ? fn(arg) : -1;
+    nmx_tl_unlock();
+    return r;
 }
 
 /* detaches every thread's Linux state and releases it outside the registry lock (unload) */

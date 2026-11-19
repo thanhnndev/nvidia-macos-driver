@@ -55,6 +55,12 @@ struct thread {
 #define NMX_ENTRY_DEPTH 0x7fffffffu
 void nmx_thread_entry_enter(struct thread *td);
 void nmx_thread_entry_leave(struct thread *td);
+/* the same bracket for entries that are not device-node calls (sysctl handlers, framebuffer calls): curthread's record,
+ * nothing in interrupt context */
+void nmx_entry_begin(void);
+void nmx_entry_end(void);
+/* runs fn(arg) under the registry lock if td still belongs to p (not reparented by nmx_proc_reap); -1 if it does not */
+int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg);
 #define TDF_KTH_SUSP 0x00000100
 #define TDP_KTHREAD 0x00200000
 #define TDP_NOFAULTING 0x00000080

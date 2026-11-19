@@ -171,11 +171,17 @@ static int nmx_grab_sysctl SYSCTL_HANDLER_ARGS
     return sysctl_handle_string(oidp, buf, sizeof buf, req);
 }
 
+/* review of fdffd32: a user thread running driver code outside the device node is counted like a device-node entry, so
+ * nmx_proc_reap keeps its Linux task while it is inside (nmx_kernel.c) */
+extern "C" void nmx_entry_begin(void);
+extern "C" void nmx_entry_end(void);
+struct NmxEntry { NmxEntry() { nmx_entry_begin(); } ~NmxEntry() { nmx_entry_end(); } NmxEntry(const NmxEntry &) = delete; };
 extern "C" int nmx_pin_by_proc_format(char *buf, size_t size);
 static int nmx_pin_by_proc_sysctl SYSCTL_HANDLER_ARGS
 {
     char buf[512];
-    int n = nmx_pin_by_proc_format(buf, sizeof buf);
+    int n;
+    { NmxEntry entry; n = nmx_pin_by_proc_format(buf, sizeof buf); }
     if (n < 0) n = 0;
     if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
     buf[n] = 0;
@@ -189,7 +195,8 @@ static int nmx_frametrace_sysctl SYSCTL_HANDLER_ARGS
     const size_t size = 96 * 1024;
     char *buf = (char *)IOMalloc(size);
     if (!buf) return ENOMEM;
-    int n = nmx_ft_format(buf, size);
+    int n;
+    { NmxEntry entry; n = nmx_ft_format(buf, size); }
     if (n < 0) n = 0;
     int err = SYSCTL_OUT(req, buf, (size_t)n);
     IOFree(buf, size);
@@ -201,7 +208,8 @@ SYSCTL_PROC(_debug, OID_AUTO, nmx_frametrace, CTLTYPE_STRING | CTLFLAG_RD | CTLF
 static int nmx_userwire_by_kind_sysctl SYSCTL_HANDLER_ARGS
 {
     char buf[1024];
-    int n = nmx_userwire_format(buf, sizeof buf);
+    int n;
+    { NmxEntry entry; n = nmx_userwire_format(buf, sizeof buf); }
     if (n < 0) n = 0;
     if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
     buf[n] = 0;
@@ -308,7 +316,8 @@ static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
     const size_t size = 16 * 1024;
     char *buf = (char *)IOMalloc(size);
     if (!buf) return ENOMEM;
-    int n = nmx_gtt_format(buf, size);
+    int n;
+    { NmxEntry entry; n = nmx_gtt_format(buf, size); }
     if (n < 0) n = 0;
     int err = SYSCTL_OUT(req, buf, (size_t)n);
     IOFree(buf, size);
@@ -328,7 +337,8 @@ static int nmx_tt_census_sysctl SYSCTL_HANDLER_ARGS
         return SYSCTL_OUT(req, NULL, size);
     char *buf = (char *)IOMalloc(size);
     if (!buf) return ENOMEM;
-    int n = nmx_tt_census_format(buf, size);
+    int n;
+    { NmxEntry entry; n = nmx_tt_census_format(buf, size); }
     if (n < 0) n = 0;
     if ((size_t)n > size) n = (int)size;
     int err = SYSCTL_OUT(req, buf, (size_t)n);
