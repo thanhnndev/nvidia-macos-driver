@@ -20,6 +20,7 @@
 extern char **environ;
 
 void nvlog(const char *fmt, ...);
+void nvlog_report(const char *fmt, ...);
 
 #import <CommonCrypto/CommonDigest.h>
 #define NVMTL_AIR_OPT   "/Library/GPUBundles/nvmtl/air-opt"
@@ -1169,6 +1170,13 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
     {   const unsigned long long dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
         nvmtl_fc_stat_misses++; nvmtl_fc_stat_miss_ns += dt;
+        // WS-CPU 8.4: a slow miss (fixed_frag_* takes ~3 s) logs the constants it was asked for, so the specialization
+        // WindowServer really uses can be translated offline (the cache file name is only a hash of this JSON).
+        if (dt > 500000000ull) { static _Atomic unsigned slowSaid;
+            if (atomic_fetch_add(&slowSaid, 1) < 32) {
+                NSString *js = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+                nvlog_report("fc cache: slow miss %s %.0f ms, constants %s", name.UTF8String, dt / 1e6,
+                             js.length > 900 ? [js substringToIndex:900].UTF8String : js.UTF8String ?: "?"); } }
         unsigned long long m = nvmtl_fc_stat_miss_max_ns;
         while (dt > m && !atomic_compare_exchange_weak(&nvmtl_fc_stat_miss_max_ns, &m, dt)) {} }
     if (result) {
