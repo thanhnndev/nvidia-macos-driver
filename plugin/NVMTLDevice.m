@@ -919,13 +919,21 @@ static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUIntege
     if (why) { static unsigned said; if (said++ < 8) nvlog("surface %u plane %lu %ux%u: no host import (%s; row %zu, offset %zu, alloc %zu)",
                    (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, why, row, (size_t)(pb - base), alloc); return -1; }
     const size_t span = (alloc + al - 1) & ~(al - 1);
-    if (!nvmtl_span_writable(base, span)) { nvmtl_surf_ro_log(surf, plane, rw); if (rw) return -1; }
+    // WS-CPU item 4 (2026-11-19): every refusal below says why. WindowServer's 3840x2160 two-plane 10-bit surfaces (row
+    // 11524) fell to private images (two CPU uploads per frame) with none of the checks above logging a reason.
+    static _Atomic unsigned nlate;
+#define NVMTL_PLANE_LATE(WHY) do { if (atomic_fetch_add(&nlate, 1) < 16) nvlog("surface %u plane %lu %ux%u fmt '%.4s' vk %u bpp %u: no host import (%s; row %zu, offset %zu, alloc %zu, span %zu, rw %d)", \
+        (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, (const char *)&(uint32_t){ OSSwapHostToBigInt32(IOSurfaceGetPixelFormat(surf)) }, vkf, bpp, \
+        (WHY), row, (size_t)(pb - base), alloc, span, rw); } while (0)
+    if (!nvmtl_span_writable(base, span)) { nvmtl_surf_ro_log(surf, plane, rw); if (rw) { NVMTL_PLANE_LATE("writable wrapper over a read-only mapping"); return -1; } }
     else if (rw && nvmtl_surface_hint(surf, base, span, 1)) nvmtl_prefault_write(base, span);
     if (!rw) (void)nvmtl_surface_hint(surf, base, span, 0);
     nvk_buffer hb;
-    if (nvmtl_vk_buffer_import_host((void *)base, span, &hb)) return -1;
+    if (nvmtl_vk_buffer_import_host((void *)base, span, &hb)) { NVMTL_PLANE_LATE("host-pointer import"); return -1; }
     if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, rw && stex, rw, &hb, pb - base, row, &t->_i)) {
+        NVMTL_PLANE_LATE("linear alias or shadow image");
         nvmtl_vk_buffer_destroy(&hb); return -1; }
+#undef NVMTL_PLANE_LATE
     t->_hostBuf = hb; t->_hostOn = YES; t->_hostRO = !rw; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
     t->_hostSL = nvmtl_vk_surface_list_mark(&t->_hostBuf) ? YES : NO;
     g_plane_host++; g_plane_host_ro += !rw;
