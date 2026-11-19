@@ -8133,6 +8133,20 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         nvlog("buffer texture: bytesPerRow %zu cannot hold %u texels of %u B", row_pitch, w, bpp); return -1; }
     // RADV's linear pitch rule (256 B); a pitch it would refuse gets a shadow image (nvmtl_btsh)
     int shadow = g_linmod && row_pitch % 256 && nvmtl_btsh_on();
+    // The same for the start: a linear image binds at a multiple of 256 B. Two-plane video surfaces (x420/420v/420f) put
+    // plane 0 at offset 64 and plane 1 at 64 + the luma size, so both aliases were refused at bind ("alignment") and
+    // WindowServer took private images with two CPU uploads per frame (24 MB per 4K 10-bit frame; FRAME-PATH 11.6, WS-CPU
+    // 8, 2026-11-19 15:56 "linear alias or shadow image"). A read-only wrapper gets the shadow instead: one GPU copy from
+    // the host-imported pages when the surface changes. Writable wrappers keep the old refusal (a shadow is not copied
+    // back to the pages). NVMTL_BTSH_OFFSET=0: old behaviour.
+    if (!shadow && g_linmod && !render && !storage && (b->moff + offset) % 256 && !(offset % bpp) && nvmtl_btsh_on()) {
+        static int offOn = -1;
+        if (offOn < 0) { const char *e = getenv("NVMTL_BTSH_OFFSET"); offOn = !(e && e[0] == '0'); }
+        shadow = offOn;
+        static _Atomic unsigned said;
+        if (shadow && atomic_fetch_add(&said, 1) < 4)
+            nvlog("buffer texture: %ux%u VkFormat %u starts at %zu (not a multiple of 256): GPU shadow instead of a private image", w, h, vkfmt, b->moff + offset);
+    }
     size_t ipitch = shadow ? ((size_t)w * bpp + 255) & ~(size_t)255 : row_pitch;
     if (g_linmod && !shadow && row_pitch % 32) {
         nvlog("buffer texture: bytesPerRow %zu is not a multiple of 32 B (the texture header's linear pitch unit)", row_pitch); return -1; }
