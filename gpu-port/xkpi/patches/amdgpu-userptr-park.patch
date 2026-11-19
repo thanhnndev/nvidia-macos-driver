@@ -15,7 +15,7 @@
  int amdgpu_ttm_tt_set_userptr(struct ttm_buffer_object *bo,
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
-@@ -686,9 +686,285 @@
+@@ -686,9 +686,284 @@
  	uint32_t		userflags;
  	bool			bound;
  	int32_t			pool_id;
@@ -222,6 +222,10 @@
 +			dma_resv_unlock(rresv);
 +			goto out;
 +		}
++		/* review N2: always write the PTEs. A clear from an earlier park attempt (dropped, or force-signalled by
++		 * a reset) leaves bo_va->cleared = true, and amdgpu_vm_bo_update would then issue nothing and hand back
++		 * an older vm->last_update while the PTEs may still be valid */
++		container_of(base, struct amdgpu_bo_va, base)->cleared = false;
 +		r = amdgpu_vm_bo_update(amdgpu_ttm_adev(bo->bdev), container_of(base, struct amdgpu_bo_va, base), true);
 +		f = r ? NULL : dma_fence_get(vm->last_update);	/* clear = true updates go to vm->last_update */
 +		dma_resv_unlock(rresv);
@@ -237,13 +241,8 @@
 +		if (gtt->nmx_fpt && !dma_fence_is_signaled(gtt->nmx_fpt))
 +			goto out;
 +		if (gtt->nmx_fpt && dma_fence_get_status(gtt->nmx_fpt) < 0) {
-+			/* a GPU reset force-signalled the clear job: the PTEs may still be valid. amdgpu_vm_bo_update set
-+			 * bo_va->cleared, so a plain restart would issue no update and wait on this (or a later, unrelated)
-+			 * fence: mark the mapping not cleared under the root reservation and redo stage 1 -> 2 now */
-+			if (!dma_resv_trylock(rresv))
-+				goto out;
-+			container_of(base, struct amdgpu_bo_va, base)->cleared = false;
-+			dma_resv_unlock(rresv);
++			/* a GPU reset force-signalled the clear job: the PTEs may still be valid. Redo stage 1 -> 2: stage 1
++			 * resets bo_va->cleared, so the next sweep writes V = 0 again with a fence of its own */
 +			__atomic_add_fetch(&gNmxParkAbort, 1, __ATOMIC_RELAXED);
 +			dma_fence_put(gtt->nmx_fpt);
 +			gtt->nmx_fpt = NULL;
@@ -301,7 +300,7 @@
  
  #ifdef CONFIG_DRM_AMDGPU_USERPTR
  /*
-@@ -1087,7 +1363,24 @@
+@@ -1087,7 +1362,24 @@
  				       struct ttm_tt *ttm)
  {
  	struct amdgpu_ttm_tt *gtt = ttm_to_amdgpu_ttm_tt(ttm);
@@ -326,7 +325,7 @@
  	if (gtt->usertask)
  		put_task_struct(gtt->usertask);
  
-@@ -1163,6 +1456,20 @@
+@@ -1163,6 +1455,20 @@
  
  	/* user pages are bound by amdgpu_ttm_tt_pin_userptr() */
  	if (gtt->userptr) {
@@ -347,7 +346,7 @@
  		ttm->sg = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
  		if (!ttm->sg)
  			return -ENOMEM;
-@@ -1209,7 +1516,13 @@
+@@ -1209,7 +1515,13 @@
  	if (gtt->userptr) {
  #ifdef NMXKPI
  		/* ga403wm Step92: the pages were pinned when the BO was made; put them */
@@ -362,7 +361,7 @@
  			pgoff_t k;
  
  			for (k = 0; k < ttm->num_pages; k++)
-@@ -2077,6 +2390,10 @@
+@@ -2077,6 +2389,10 @@
  	if (!adev->mman.initialized)
  		return;
  
