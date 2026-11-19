@@ -4503,8 +4503,8 @@ _Static_assert(sizeof(VkRenderPass) == sizeof(void *) && _Alignof(VkRenderPass) 
  * this process creates, with an approximate key (FNV-1a of the SPIR-V, the render-target state and the formats), and
  * every 30 s logs how many were made, how many repeated a key already built in this process (what a memo would save),
  * the time spent and the slowest one. Optional: a VkPipelineCache shared by every pipeline of the process, so RADV
- * returns a repeated pipeline from its cache instead of compiling NIR again. Off by default; on while
- * /Library/NullMoth/nvmtl-pipeline-cache exists (checked every 5 s, so main can A/B at runtime) or NVMTL_PIPELINE_CACHE=1
+ * returns a repeated pipeline from its cache instead of compiling NIR again. Off by default; on in WindowServer while
+ * /Library/NullMoth/nvmtl-pipeline-cache exists (checked every 5 s, so main can A/B at runtime), anywhere with NVMTL_PIPELINE_CACHE=1
  * (=0 forces it off). Once made, the cache object stays for the process; switching off only stops passing it. */
 static pthread_mutex_t g_plstat_mu = PTHREAD_MUTEX_INITIALIZER;
 #define NVMTL_PSTAT_KEYS 8192
@@ -4527,10 +4527,14 @@ static VkPipelineCache nvmtl_pcache(void)
 {
     pthread_mutex_lock(&g_plstat_mu);
     const uint64_t now = nvmtl_pstat_now_ms();
-    if (!g_pcache_checkMs || now - g_pcache_checkMs >= 5000) {
+    /* The switch file is only looked at by WindowServer (rechecked every 5 s). A sandboxed process may be denied the
+     * stat and log a sandbox violation each time, so everything else goes by NVMTL_PIPELINE_CACHE alone. */
+    static int isWS = -1;
+    if (isWS < 0) { const char *me = getprogname(); isWS = me && !strcmp(me, "WindowServer"); }
+    if (!g_pcache_checkMs || (isWS && now - g_pcache_checkMs >= 5000)) {
         g_pcache_checkMs = now;
         const char *e = getenv("NVMTL_PIPELINE_CACHE"); struct stat st;
-        const int on = e ? e[0] == '1' : stat("/Library/NullMoth/nvmtl-pipeline-cache", &st) == 0;
+        const int on = e ? e[0] == '1' : isWS && stat("/Library/NullMoth/nvmtl-pipeline-cache", &st) == 0;
         if (on != g_pcache_on) nvlog("pipelines: VkPipelineCache %s (/Library/NullMoth/nvmtl-pipeline-cache, NVMTL_PIPELINE_CACHE=%s)",
                                      on ? "ON" : "off", e ? e : "unset");
         g_pcache_on = on;
