@@ -4215,8 +4215,12 @@ static _Atomic unsigned long long g_g1_refused;
    Entries live in the spvcache folder (same owner, same trimmer) as <sha256>.low1.<translator tag>.c3.spv. The key
    is SHA-256 over: the input SPIR-V, the effective flags, the table mode (UBO/SSBO), the align guard, the plugin's own
    image UUID and the NVMTL_* knobs that change the emitted code (list below; the translator reads several).
-   File: "NVLW" | u32 version 1 | u32 status (1 = module, 0 = refused/nil) | u32 info[4] | SPIR-V.
-   NVMTL_LOWER_DISKCACHE=0 turns it off. A torn or foreign file is a miss (and is rewritten). */
+   low2 (review of 0f2a94a): a sealed file (nvmtl_seal: tag "NVLW", version 2, lengths + SHA-256 over meta and payload);
+   meta = u32 status (1 = module, 0 = the deterministic G1 refusal) | u32 info[4]; payload = the SPIR-V (empty for 0).
+   Only answers that repeat are stored: a module, or the G1 refusal. A nil from an allocation failure, and the as-is
+   module of a translator refusal, are not (one transient failure must not become a permanent one in every process).
+   NVMTL_LOWER_DISKCACHE=0 turns it off; so does an image without a UUID (the key would not change with the plugin).
+   A torn, flipped or foreign file is a miss (and is rewritten). */
 static _Atomic unsigned long g_low_hit, g_low_miss, g_low_stored, g_low_bad;
 static NSString *nvmtl_lower_disk_path(const void *data, size_t len, uint32_t flags) {
     static int on = -1; static unsigned char envh[CC_SHA256_DIGEST_LENGTH]; static char self[1200];
@@ -4236,11 +4240,13 @@ static NSString *nvmtl_lower_disk_path(const void *data, size_t len, uint32_t fl
         for (NSString *x in kv) { const char *u = x.UTF8String; CC_SHA256_Update(&c, u, (CC_LONG)strlen(u) + 1); }
         CC_SHA256_Final(envh, &c);
         nvmtl_image_ident((const void *)&nvmtl_lower_disk_path, self, sizeof self);
-        nvlog("lower cache: %s (NVMTL_LOWER_DISKCACHE=%s, %lu code-changing NVMTL_* knobs in the key)", on ? "disk ON" : "disk OFF",
-              e ? e : "unset", (unsigned long)kv.count);
+        const int noid = self[0] == '?' || !strncmp(self, "no-uuid", 7) || !strncmp(self, "not-64-bit", 10);
+        if (noid) on = 0;
+        nvlog("lower cache: %s (NVMTL_LOWER_DISKCACHE=%s, %lu code-changing NVMTL_* knobs in the key%s)", on ? "disk ON" : "disk OFF",
+              e ? e : "unset", (unsigned long)kv.count, noid ? "; OFF: no image UUID to key on" : "");
     });
     if (!on || !nvmtl_xlate_ready() || !xlate_lower || !data || !len) return nil;
-    const uint32_t mode[4] = { 1u /* key version */, flags, (uint32_t)nvmtl_table_ubo(), (uint32_t)nvmtl_align_guard_on() | (xlate_lower_ex ? 2u : 0u) };
+    const uint32_t mode[4] = { 2u /* key version */, flags, (uint32_t)nvmtl_table_ubo(), (uint32_t)nvmtl_align_guard_on() | (xlate_lower_ex ? 2u : 0u) };
     unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX c; CC_SHA256_Init(&c);
     CC_SHA256_Update(&c, mode, sizeof mode);
     CC_SHA256_Update(&c, envh, sizeof envh);
@@ -4248,34 +4254,36 @@ static NSString *nvmtl_lower_disk_path(const void *data, size_t len, uint32_t fl
     const uint64_t n64 = len; CC_SHA256_Update(&c, &n64, sizeof n64);
     for (size_t off = 0; off < len; off += 1u << 30) CC_SHA256_Update(&c, (const char *)data + off, (CC_LONG)MIN((size_t)1u << 30, len - off));
     CC_SHA256_Final(h, &c);
-    return nvmtl_spvcache_path_digest(h, @"low1");
+    return nvmtl_spvcache_path_digest(h, @"low2");
 }
 static NSData *nvmtl_lower_disk_read(NSString *path, uint32_t info[4], int *had) {
     *had = 0;
     NSData *f = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
     if (!f) { atomic_fetch_add(&g_low_miss, 1); return nil; }
-    const uint32_t *w = (const uint32_t *)f.bytes; const size_t hdr = 7 * sizeof(uint32_t);
-    const int ok = f.length >= hdr && !memcmp(w, "NVLW", 4) && w[1] == 1 && w[2] <= 1 && (f.length - hdr) % 4 == 0
-        && (w[2] == 0 ? f.length == hdr : (f.length - hdr >= 20 && w[7] == 0x07230203u));
-    if (!ok) { atomic_fetch_add(&g_low_bad, 1); atomic_fetch_add(&g_low_miss, 1); return nil; }
-    memcpy(info, w + 3, 4 * sizeof *info);
+    uint32_t meta[5]; NSData *d = nil;
+    const int ok = nvmtl_unseal(f, "NVLW", 2, meta, sizeof meta, &d) && meta[0] <= 1 && (meta[0] ? nvmtl_is_spirv(d) : !d);
+    if (!ok) {
+        const unsigned long b = atomic_fetch_add(&g_low_bad, 1) + 1; atomic_fetch_add(&g_low_miss, 1);
+        if (b <= 8) nvlog("lower cache: BAD entry %s (%lu B: torn, flipped or foreign) - miss, rewritten", path.lastPathComponent.UTF8String,
+                          (unsigned long)f.length);
+        return nil;
+    }
+    memcpy(info, meta + 1, 4 * sizeof *info);
     *had = 1;
     const unsigned long k = atomic_fetch_add(&g_low_hit, 1) + 1;
     nvmtl_cache_touch(path.fileSystemRepresentation);
     if (!(k & (k - 1))) nvlog("lower cache: %lu disk hits, %lu misses, %lu stored, %lu bad", k, (unsigned long)g_low_miss,
                               (unsigned long)g_low_stored, (unsigned long)g_low_bad);
-    return w[2] ? [NSData dataWithBytes:(const char *)f.bytes + hdr length:f.length - hdr] : nil;
+    return meta[0] ? d : nil;
 }
 static void nvmtl_lower_disk_write(NSString *path, NSData *d, const uint32_t info[4]) {
-    const uint32_t hdr[7] = { 0, 1, d ? 1u : 0u, info[0], info[1], info[2], info[3] };
-    NSMutableData *f = [NSMutableData dataWithBytes:hdr length:sizeof hdr];
-    memcpy(f.mutableBytes, "NVLW", 4);
-    if (d) [f appendData:d];
-    if ([f writeToFile:path atomically:YES]) atomic_fetch_add(&g_low_stored, 1);
+    const uint32_t meta[5] = { d ? 1u : 0u, info[0], info[1], info[2], info[3] };
+    NSData *f = nvmtl_seal("NVLW", 2, meta, sizeof meta, d);
+    if (f && [f writeToFile:path atomically:YES]) { atomic_fetch_add(&g_low_stored, 1); nvmtl_spvcache_added(f.length); }
     else { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 4) nvlog("lower cache: STORE FAILED %s", path.lastPathComponent.UTF8String); }
 }
-static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info);
-static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info);
+static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det);
+static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det);
 static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t flags, uint32_t *info) {
     static NSMutableDictionary *cache; static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
     NSMutableData *key = [NSMutableData dataWithBytes:&flags length:sizeof flags];
@@ -4304,28 +4312,31 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
        warm pipeline cost (120-200 ms per Core Animation fragment specialization, lowered twice) in our own process. */
     static int pt = -1; if (pt < 0) { const char *e = getenv("NVMTL_PIPE_TIMING"); pt = e && *e == '1'; }
     const uint64_t pt0 = pt ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
-    NSData *d = nvmtl_address_shader_g_uncached(data, len, flags, got);
+    int det = 0;   /* 1: this answer repeats (translator module, or the G1 refusal) and may be kept */
+    NSData *d = nvmtl_address_shader_g_uncached(data, len, flags, got, &det);
     if (pt) nvlog_report("pipe timing: address lowering (translator, uncached) %zu -> %lu B, flags %u: %.2f ms", len, (unsigned long)d.length, flags,
                          (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - pt0) / 1e6);
     if (info) memcpy(info, got, sizeof got);
-    if (dpath) nvmtl_lower_disk_write(dpath, d, got);
+    if (dpath && det) nvmtl_lower_disk_write(dpath, d, got);
+    if (!d && !det) return nil;   /* a transient nil (allocation failure) is not remembered in memory either */
     pthread_mutex_lock(&lk);
     if (!cache || cache.count >= 4096) cache = [NSMutableDictionary new];
     cache[key] = @[d ?: (id)[NSNull null], [NSData dataWithBytes:got length:sizeof got]];
     pthread_mutex_unlock(&lk);
     return d;
 }
-static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info) {
-    NSData *d = nvmtl_address_shader_g0(data, len, flags, info);
+static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det) {
+    NSData *d = nvmtl_address_shader_g0(data, len, flags, info, det);
     if (d && nvmtl_table_ubo() && nvmtl_spirv_ssbo_table(d.bytes, d.length)) {
         const unsigned long long k = atomic_fetch_add(&g_g1_refused, 1) + 1;
         if (k <= 16 || !(k & (k - 1))) nvlog("G1: a module still declares a STORAGE-buffer table at 640 while the table is Uniform - REFUSED (%llu so far; NVMTL_TABLE_SSBO=1 restores it)", k);
-        return nil;
+        return nil;   /* *det stays as g0 set it: the refusal follows from a deterministic module */
     }
     return d;
 }
-static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info) {
+static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det) {
     if (info) memset(info, 0, 4 * sizeof *info);
+    *det = 0;
     __attribute__((objc_precise_lifetime)) NSData *prepared = nvmtl_preserve_readonly_metadata([NSData dataWithBytes:data length:len]);
     data = prepared.bytes; len = prepared.length;
     static unsigned said;
@@ -4342,7 +4353,9 @@ static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t fl
         return nvmtl_safe_physical_shader(data, len);
     }
     if (info && !nvmtl_align_guard_on()) memset(info, 0, 4 * sizeof *info);
-    NSData *result = nvmtl_safe_physical_shader(out, n); xlate_free(out, n); return result;
+    NSData *result = nvmtl_safe_physical_shader(out, n); xlate_free(out, n);
+    *det = result != nil;   /* the translator's module, through our passes; nil there is malformed input or no memory */
+    return result;
 }
 static NSData *nvmtl_address_shader(const void *data, size_t len) {
     uint32_t info[4];

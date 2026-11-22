@@ -378,6 +378,47 @@ static BOOL nvmtl_is_spirv(NSData *d) {
     memcpy(&magic, d.bytes, 4);
     return magic == 0x07230203;
 }
+/* Sealed cache file (review of 0f2a94a): a file torn on a word boundary or with flipped bits after a hard reset must be a
+ * miss, not an answer that repeats every start. Layout: tag[4] | u32 version | u32 meta bytes | u32 payload bytes |
+ * SHA-256 over (version, meta bytes, payload bytes, meta, payload) | meta | payload. Both lengths must add up to the file
+ * size exactly. Meta and payload are word multiples, so the payload stays 4-byte aligned. */
+#define NVMTL_SEAL_HDR (16u + CC_SHA256_DIGEST_LENGTH)
+static void nvmtl_seal_digest(const uint32_t v[3], const void *meta, const void *payload, size_t pn, unsigned char h[CC_SHA256_DIGEST_LENGTH]) {
+    CC_SHA256_CTX c; CC_SHA256_Init(&c);
+    CC_SHA256_Update(&c, v, 3 * sizeof *v);
+    if (v[1]) CC_SHA256_Update(&c, meta, v[1]);
+    for (size_t off = 0; off < pn; off += 1u << 30) CC_SHA256_Update(&c, (const char *)payload + off, (CC_LONG)MIN((size_t)1u << 30, pn - off));
+    CC_SHA256_Final(h, &c);
+}
+static NSData *nvmtl_seal(const char tag[4], uint32_t version, const void *meta, uint32_t metan, NSData *payload) {
+    if (metan % 4 || payload.length % 4 || payload.length > UINT32_MAX) return nil;
+    const uint32_t v[3] = { version, metan, (uint32_t)payload.length };
+    NSMutableData *f = [NSMutableData dataWithLength:NVMTL_SEAL_HDR];
+    memcpy(f.mutableBytes, tag, 4); memcpy((char *)f.mutableBytes + 4, v, sizeof v);
+    nvmtl_seal_digest(v, meta, payload.bytes, payload.length, (unsigned char *)f.mutableBytes + 16);
+    if (metan) [f appendBytes:meta length:metan];
+    if (payload.length) [f appendData:payload];
+    return f;
+}
+/* 1 = intact: meta copied out (metan bytes exactly), *payload = a copy of the payload (nil when empty). 0 = missing, torn,
+ * foreign or another version. */
+static int nvmtl_unseal(NSData *f, const char tag[4], uint32_t version, void *meta, uint32_t metan, NSData **payload) {
+    if (payload) *payload = nil;
+    if (f.length < NVMTL_SEAL_HDR || memcmp(f.bytes, tag, 4)) return 0;
+    uint32_t v[3]; memcpy(v, (const char *)f.bytes + 4, sizeof v);
+    if (v[0] != version || v[1] != metan || v[2] % 4 || f.length != (size_t)NVMTL_SEAL_HDR + v[1] + v[2]) return 0;
+    const char *m = (const char *)f.bytes + NVMTL_SEAL_HDR, *p = m + v[1];
+    unsigned char h[CC_SHA256_DIGEST_LENGTH];
+    nvmtl_seal_digest(v, m, p, v[2], h);
+    if (memcmp(h, (const char *)f.bytes + 16, sizeof h)) return 0;
+    if (metan) memcpy(meta, m, metan);
+    if (payload && v[2]) *payload = [NSData dataWithBytes:p length:v[2]];
+    return 1;
+}
+/* Cache stores outside the spv path count toward the trimmer's re-arm too (review nit: the fc and low stores did not). */
+static void nvmtl_spvcache_added(unsigned long long bytes) {
+    atomic_fetch_add_explicit(&gSpvAdded, bytes, memory_order_relaxed);
+}
 static NSCache *nvmtl_memo(void) {
     static NSCache *c; static dispatch_once_t once;
     dispatch_once(&once, ^{ c = [NSCache new]; c.totalCostLimit = 96u << 20; c.countLimit = 256; });
@@ -1149,16 +1190,22 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     NSData *json = [NSJSONSerialization dataWithJSONObject:config options:NSJSONWritingSortedKeys error:NULL];
     NVMTLAirDigest *airDigest = nvmtl_air_state(ll);
     if (!json || !airDigest) return nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
-    NSString *path = nvmtl_spvcache_path_air(airDigest, json, @"fc1");
+    /* fc2 (review of 0f2a94a): sealed file (nvmtl_seal: lengths + SHA-256), fc1 was raw SPIR-V checked by magic only. The
+       memo keeps the bare SPIR-V. A bad file is a miss and the miss path rewrites it. */
+    NSString *path = nvmtl_spvcache_path_air(airDigest, json, @"fc2");
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     const BOOL fcCacheOn = path && !getenv("NVMTL_FCCACHE_OFF");   // no folder, no key: NSCache throws on a nil key
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:path] : nil;
     if (hit) { gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation); return hit; }   // keep the trimmer's age order
-    if (fcCacheOn) hit = [NSData dataWithContentsOfFile:path];
-    uint32_t magic = 0;
-    if (hit.length >= 20 && hit.length % 4 == 0) {
-        memcpy(&magic, hit.bytes, 4);
-        if (magic == 0x07230203) {
+    NSData *file = fcCacheOn ? [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil] : nil;
+    if (file) {
+        if (!nvmtl_unseal(file, "NVFC", 2, NULL, 0, &hit) || !nvmtl_is_spirv(hit)) {
+            hit = nil; static _Atomic unsigned bad;
+            if (atomic_fetch_add(&bad, 1) < 8) nvlog("fc cache: BAD entry %s (%lu B: torn, flipped or foreign) - miss, rewritten",
+                                                     path.lastPathComponent.UTF8String, (unsigned long)file.length);
+        }
+        file = nil;
+        if (hit) {
             gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation);
             [nvmtl_memo() setObject:hit forKey:path cost:hit.length];
             nvlog("fc cache: HIT %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
@@ -1181,7 +1228,8 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
         unsigned long long m = nvmtl_fc_stat_miss_max_ns;
         while (dt > m && !atomic_compare_exchange_weak(&nvmtl_fc_stat_miss_max_ns, &m, dt)) {} }
     if (result) {
-        if (path && [result writeToFile:path atomically:YES]) gFcStored++;
+        NSData *sealed = path && nvmtl_is_spirv(result) ? nvmtl_seal("NVFC", 2, NULL, 0, result) : nil;
+        if (sealed && [sealed writeToFile:path atomically:YES]) { gFcStored++; nvmtl_spvcache_added(sealed.length); }
         if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:path cost:result.length];
         nvlog("fc cache: miss %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
               (unsigned long)result.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
