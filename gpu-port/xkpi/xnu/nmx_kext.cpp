@@ -231,9 +231,13 @@ SYSCTL_PROC(_debug, OID_AUTO, nmx_grab, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LO
             0, 0, nmx_grab_sysctl, "A",
             "last 16 VMID assignments: hub, vmid, flush decision, VM context, VMID owner, page directory");
 
+/* review of c53afe6: page-sized malloc/free in interrupt context (nmx_malloc.c big_lock_take), count and last caller */
+extern "C" volatile int64_t nmx_malloc_irq_hits, nmx_malloc_irq_caller;
 #define NMX_CNT(nm, var, desc) \
     SYSCTL_QUAD(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (SInt64 *)&var, desc)
 NMX_CNT(nmx_jobs, gNmxJobs, "AMD submissions whose VM/flush decision was recorded");
+NMX_CNT(nmx_malloc_irq, nmx_malloc_irq_hits, "page-sized malloc/free taken in primary interrupt context (expected 0)");
+NMX_CNT(nmx_malloc_irq_caller, nmx_malloc_irq_caller, "return address of the last of those (kext-relative: subtract the load address)");
 NMX_CNT(nmx_jobs_flushed, gNmxJobsFlushed, "of those, submissions that emitted a VM flush");
 NMX_CNT(nmx_jobs_no_flush, gNmxJobsNoFlush, "of those, submissions with no VM flush");
 NMX_CNT(nmx_timeouts, gNmxTimeouts, "AMD submissions the scheduler reported as timed out");

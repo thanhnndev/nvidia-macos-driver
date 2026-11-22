@@ -43,13 +43,26 @@ static struct big_rec *big_table[BIG_BUCKETS];
 /* Invariant: big_lock (a spin lock that does NOT disable interrupts) is never taken in primary interrupt context. No
  * malloc/free of a block >= PAGE_SIZE runs there (LinuxKPI's GFP_ATOMIC allocations in IRQ handlers are small, and
  * amdgpu's IRQ work runs in threads); one that did could spin forever on a lock its own CPU holds. Checked on
- * every take: a named panic instead of a silent spin (review of 0266402). */
+ * every take (review of 0266402 / c53afe6): a hit is counted (debug.nmx_malloc_irq, last caller in
+ * debug.nmx_malloc_irq_caller) and logged with its caller (first 4, then every 1024th), and the lock is taken as
+ * before. It panics only in a build with -DNMX_MALLOC_IRQ_PANIC: never observed on this machine, so a hit at boot must
+ * not take the display driver down. */
 static lck_spin_t *big_lock;
 extern boolean_t ml_at_interrupt_context(void);
-static inline void big_lock_take(void)
+volatile int64_t nmx_malloc_irq_hits;          /* read by debug.nmx_malloc_irq (nmx_kext.cpp) */
+volatile int64_t nmx_malloc_irq_caller;        /* return address of the last hit's malloc/free caller */
+static __attribute__((always_inline)) inline void big_lock_take(void)
 {
-    if (__builtin_expect(ml_at_interrupt_context(), 0))
-        panic("NullMoth xkpi: big_lock taken in interrupt context (malloc/free of a page-sized block)");
+    if (__builtin_expect(ml_at_interrupt_context(), 0)) {
+        void *ra = __builtin_return_address(0);     /* inlined: the caller of malloc / free / contig* */
+        const int64_t n = __atomic_add_fetch(&nmx_malloc_irq_hits, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&nmx_malloc_irq_caller, (int64_t)(uintptr_t)ra, __ATOMIC_RELAXED);
+        if (n <= 4 || (n & 1023) == 0)
+            printf("NullMoth xkpi: page-sized malloc/free in interrupt context (%lld so far), caller %p\n", (long long)n, ra);
+#ifdef NMX_MALLOC_IRQ_PANIC
+        panic("NullMoth xkpi: big_lock taken in interrupt context (malloc/free of a page-sized block), caller %p", ra);
+#endif
+    }
     lck_spin_lock(big_lock);
 }
 
