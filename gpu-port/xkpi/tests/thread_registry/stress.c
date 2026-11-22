@@ -12,11 +12,12 @@ typedef void *thread_t; typedef int pid_t_; typedef int lwpid_t; typedef unsigne
 #define MAXCPU 64
 #define PZERO 80
 struct task_struct; struct file; struct nmx_open; struct ucred;
-struct proc { int p_pid; char p_comm[20]; void *nmx_xnu; uint64_t nmx_start; int p_siglist; };
+struct proc { int p_pid; char p_comm[20]; void *nmx_xnu; uint64_t nmx_start; int p_siglist; int nmx_retired; };
+extern struct proc *nmx_kernproc;
 struct thread { thread_t td_xnu; struct proc *td_proc; struct task_struct *td_lkpi_task; int td_tid; unsigned char td_priority, td_base_pri;
   int td_pinned, td_critnest, td_intr_nesting_level, td_flags, td_owepreempt, td_inhibitors; struct { int code; long args[8]; } td_sa;
   struct file *td_fpop; struct nmx_open *td_nmx_open; struct ucred *td_ucred; unsigned td_siglist, td_sigmask; int td_pflags; char td_name[32];
-  void *td_wchan; const char *td_wmesg; int td_crit_saved; uint64_t td_xnu_tid; };
+  void *td_wchan; const char *td_wmesg; int td_crit_saved; uint64_t td_xnu_tid; unsigned td_nmx_entry; };
 typedef os_unfair_lock lck_spin_t;
 static void lck_spin_lock(lck_spin_t *l) { os_unfair_lock_lock(l); }
 static void lck_spin_unlock(lck_spin_t *l) { os_unfair_lock_unlock(l); }

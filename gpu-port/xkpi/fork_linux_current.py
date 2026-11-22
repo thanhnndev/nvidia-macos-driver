@@ -36,54 +36,102 @@ find_other_mm(struct proc *p)
 	return (NULL);
 }
 """)
-# record a new mm on the process so later threads share it. PROC_LOCK is no lock here, so the mm is published with
-# a compare-and-swap: two first threads of one process must not each install their own (a userptr BO made on one
-# thread would then fail the mm check of a submit from the other).
-i = s.index("\tproc = td->td_proc;\n\n\tPROC_LOCK(proc);\n\tmm_other = find_other_mm(proc);\n")
-j = s.index("\t/* store pointer to task struct */\n", i)
-s = s[:i] + """	proc = td->td_proc;
+# record a new mm on the process so later threads share it (37bac65): PROC_LOCK is no lock here, so the mm is looked up
+# and published (compare-and-swap) and the task stored under the port's registry lock while td_proc is still the
+# process read (nmx_thread_proc_locked, with the two helpers below); a thread moved to kernproc meanwhile looks again.
+# Two first threads of one process must not each install their own mm (a userptr BO made on one thread would then
+# fail the mm check of a submit from the other), and nothing may be published into a retired record.
+replace_once("\tstruct mm_struct *mm, *mm_other;\n", "\tstruct mm_struct *mm;\n")
+replace_once("int\nlinux_alloc_current(", r"""/* macOS port: run under the registry lock by nmx_thread_proc_locked (a spin lock: nothing here may sleep) */
+struct linux_current_find {
+	struct proc *proc;
+	struct task_struct *ts;
+	struct mm_struct *mm;
+};
 
-	/* macOS port: release what exited processes and recycled thread records left (it may sleep) */
+static int
+linux_current_find_locked(void *arg)
+{
+	struct linux_current_find *a = arg;
+
+	a->mm = find_other_mm(a->proc);
+	if (a->mm != NULL) {
+		a->ts->mm = a->mm;
+		/* store pointer to task struct */
+		a->ts->task_thread->td_lkpi_task = a->ts;
+	}
+	return (0);
+}
+
+struct linux_current_pub {
+	struct proc *proc;
+	struct task_struct *ts;
+	struct mm_struct *mm;
+	int published;
+};
+
+static int
+linux_current_publish_locked(void *arg)
+{
+	struct linux_current_pub *a = arg;
+
+	if (!atomic_cmpset_ptr((volatile uintptr_t *)&a->proc->p_lkpi_mm, 0, (uintptr_t)a->mm)) {
+		a->published = -1;
+		return (0);
+	}
+	a->ts->mm = a->mm;
+	a->ts->task_thread->td_lkpi_task = a->ts;
+	a->published = 1;
+	return (0);
+}
+
+""" + "int\nlinux_alloc_current(")
+i = s.index("\tproc = td->td_proc;\n\n\tPROC_LOCK(proc);\n\tmm_other = find_other_mm(proc);\n")
+j = s.index("\treturn (0);\n}", i)
+s = s[:i] + r"""	/* macOS port: release what exited processes and recycled thread records left (it may sleep). It runs before
+	 * td_proc is read: it can retire this thread's own process (an exit-time close, when proc_find already fails)
+	 * and move the thread to kernproc (review of fdffd32) */
 	if ((flags & M_WAITOK) != 0)
 		nmx_proc_reap();
 
-	PROC_LOCK(proc);
-	mm_other = find_other_mm(proc);
-
-	/* use allocated mm_struct as a fallback */
-	if (mm_other == NULL) {
-		PROC_UNLOCK(proc);
-		mm = uma_zalloc(linux_mm_zone, flags | M_ZERO);
+	/*
+	 * macOS port: the mm is looked up and published, and the task stored, under the port's registry lock while
+	 * td_proc is still the process read here (nmx_thread_proc_locked). nmx_proc_reap moves a retired process's threads
+	 * to kernproc under that lock and drops the record's mm after that walk, so nothing is published into a retired
+	 * record (it would be freed without mmput, leaking the mm and its Mach task reference) and a record freed during
+	 * the allocation below is never written: the check fails and the lookup starts over with the new td_proc.
+	 */
+again:
+	proc = td->td_proc;
+	struct linux_current_find fa = { .proc = proc, .ts = ts, .mm = NULL };
+	if (nmx_thread_proc_locked(td, proc, linux_current_find_locked, &fa) < 0)
+		goto again;
+	if (fa.mm == NULL) {
 		if (mm == NULL) {
-			uma_zfree(linux_current_zone, ts);
-			return (ENOMEM);
+			mm = uma_zalloc(linux_mm_zone, flags | M_ZERO);
+			if (mm == NULL) {
+				uma_zfree(linux_current_zone, ts);
+				return (ENOMEM);
+			}
+			/* setup new mm_struct: one user for this task, one for the process record */
+			init_rwsem(&mm->mmap_sem);
+			atomic_set(&mm->mm_count, 1);
+			atomic_set(&mm->mm_users, 2);
+			/* macOS port: remember the Mach task, for driver workers that copy to this process. Noted before
+			 * it is published: once it is, the reaper can drop the last reference (linux_mm_dtor forgets it) */
+			nmx_xnu_mm_note_task(mm);
 		}
-		/* setup new mm_struct: one user for this task, one for the process record */
-		init_rwsem(&mm->mmap_sem);
-		atomic_set(&mm->mm_count, 1);
-		atomic_set(&mm->mm_users, 2);
+		struct linux_current_pub pa = { .proc = proc, .ts = ts, .mm = mm, .published = 0 };
+		if (nmx_thread_proc_locked(td, proc, linux_current_publish_locked, &pa) < 0 || pa.published < 0)
+			goto again;	/* reparented, or another thread of this process published first: look again */
+		mm = NULL;
+	}
 
-		PROC_LOCK(proc);
-		for (;;) {
-			if (atomic_cmpset_ptr((volatile uintptr_t *)&proc->p_lkpi_mm, 0, (uintptr_t)mm)) {
-				/* set mm_struct pointer */
-				ts->mm = mm;
-				/* macOS port: remember the Mach task, for driver workers that copy to this process */
-				nmx_xnu_mm_note_task(mm);
-				/* clear pointer to not free memory */
-				mm = NULL;
-				break;
-			}
-			/* another thread of this process published one first: share it */
-			mm_other = find_other_mm(proc);
-			if (mm_other != NULL) {
-				ts->mm = mm_other;
-				sx_destroy(&mm->mmap_sem.sx);
-				break;
-			}
-		}
-	} else {
-		ts->mm = mm_other;
+	/* free the mm_struct another thread's made unneeded, if any */
+	if (mm != NULL) {
+		nmx_xnu_mm_forget(mm);
+		sx_destroy(&mm->mmap_sem.sx);
+		uma_zfree(linux_mm_zone, mm);
 	}
 
 """ + s[j:]

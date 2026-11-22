@@ -241,6 +241,35 @@ struct proc *nmx_curproc(void)
     return nmx_proc_for(current_proc());
 }
 
+/* nmx_thread_lock held: p is a record still linked in nmx_procs[] (or kernproc), so it is not freed while the lock is
+ * held. A record retired after nmx_proc_for returned is unlinked, and two reaps later freed. */
+static int nmx_proc_linked_locked(const struct proc *p, void *xnu)
+{
+    if (p == nmx_kernproc)
+        return 1;
+    for (struct nmx_proc_rec *r = nmx_procs[bucket_of(xnu, NMX_PROC_BUCKETS)]; r; r = r->next)
+        if (&r->p == p)
+            return 1;
+    return 0;
+}
+
+/* the calling process's record, returned with nmx_thread_lock HELD and checked to be linked under it (review of
+ * b083256: nmx_thread_get / nmx_thread_recycle took nmx_curproc() unlocked and then read the record, which a reap in
+ * between could retire and free). A record retired in between is looked up again; after a few tries, kernproc. */
+static struct proc *nmx_curproc_lock(void)
+{
+    void *xnu = current_proc();
+    for (int tries = 0;; tries++) {
+        struct proc *p = nmx_proc_for(xnu);
+        nmx_tl_lock();
+        if (nmx_proc_linked_locked(p, xnu))
+            return p;
+        if (tries >= 3)
+            return nmx_kernproc;
+        nmx_tl_unlock();
+    }
+}
+
 pid_t nmx_proc_pid(struct proc *p)
 {
     return p ? p->p_pid : 0;
@@ -290,8 +319,7 @@ static void nmx_task_pending_locked(struct task_struct *ts)
  */
 static void nmx_thread_recycle(struct nmx_thread_rec *r, uint64_t tid)
 {
-    struct proc *p = nmx_curproc();     /* takes nmx_thread_lock itself */
-    nmx_tl_lock();
+    struct proc *p = nmx_curproc_lock();     /* returns with nmx_thread_lock held, p linked */
     struct task_struct *ts = r->td.td_lkpi_task;
     r->td.td_lkpi_task = NULL;
     r->td.td_proc = p;
@@ -355,11 +383,11 @@ static struct thread *nmx_thread_get(int transient, int *created)
     nr->td.td_priority = PZERO;
     nr->td.td_base_pri = PZERO;
     nr->transient = transient;
-    nr->td.td_proc = nmx_curproc();
-    strlcpy(nr->td.td_name, nr->td.td_proc->p_comm, sizeof(nr->td.td_name));   /* Step134: the task's comm */
     __atomic_store_n(&nr->td.td_xnu, xt, __ATOMIC_RELAXED);
 
-    nmx_tl_lock();
+    /* the record is not linked yet, so no reader sees td_proc / td_name before they are set here, under the lock */
+    nr->td.td_proc = nmx_curproc_lock();     /* returns with nmx_thread_lock held, the record linked */
+    strlcpy(nr->td.td_name, nr->td.td_proc->p_comm, sizeof(nr->td.td_name));   /* Step134: the task's comm */
     nmx_thread_proc_fix_locked(&nr->td);
     r = nmx_thread_find(xt);
     if (r == NULL) {
@@ -705,6 +733,11 @@ void nmx_module_event(void *arg)
 uint64_t tsc_freq;
 extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 
+/* device-node / sysctl entries: in-flight count and started flag (nmx_entry_begin, review of b083256) */
+static volatile int nmx_entry_open;          /* set by nmx_kernel_init once the registry lock exists */
+static volatile unsigned nmx_entry_inflight;
+extern void IOSleep(unsigned int milliseconds);
+
 int nmx_kernel_init(void)
 {
     clock_timebase_info(&nmx_tb);
@@ -715,6 +748,7 @@ int nmx_kernel_init(void)
     nmx_thread_lock = lck_spin_alloc_init(nmx_lck_grp, LCK_ATTR_NULL);
     if (nmx_thread_lock == NULL)
         return ENOMEM;
+    __atomic_store_n(&nmx_entry_open, 1, __ATOMIC_SEQ_CST);
     mp_ncpus = nmx_xnu_ncpus();
     mp_ncores = mp_ncpus;
     mp_maxid = mp_ncpus - 1;
@@ -728,8 +762,10 @@ int nmx_kernel_init(void)
     return 0;
 }
 
+static void nmx_entry_close_and_drain(void);
 void nmx_kernel_fini(void)
 {
+    nmx_entry_close_and_drain();
     if (nmx_thread_lock) {
         for (unsigned b = 0; b < NMX_THREAD_BUCKETS; b++) {
             struct nmx_thread_rec *r = nmx_threads[b];
@@ -1013,19 +1049,44 @@ void nmx_thread_entry_leave(struct thread *td)
 
 /* review of 37bac65: the driver's sysctls are registered before nmx_port_start made the registry lock and stay after a
  * failed start or nmx_port_stop; curthread there would take a NULL lock. No record then: nothing to count. */
+/* Review of b083256: the NULL check above was check-then-use against nmx_kernel_fini, which frees the lock and the
+ * records. An entry now counts itself in flight first and then checks the started flag (both seq_cst); fini clears
+ * the flag first and then waits for the count to drain, so an entry either sees the flag cleared or is waited for. */
+
 struct thread *nmx_entry_begin(void)
 {
-    if (ml_at_interrupt_context() || __atomic_load_n(&nmx_thread_lock, __ATOMIC_ACQUIRE) == NULL)
+    if (ml_at_interrupt_context())
         return NULL;
-    struct thread *td = nmx_curthread();
+    __atomic_fetch_add(&nmx_entry_inflight, 1, __ATOMIC_SEQ_CST);
+    struct thread *td = NULL;
+    if (__atomic_load_n(&nmx_entry_open, __ATOMIC_SEQ_CST))
+        td = nmx_curthread();
+    if (td == NULL) {
+        __atomic_fetch_sub(&nmx_entry_inflight, 1, __ATOMIC_SEQ_CST);
+        return NULL;
+    }
     nmx_thread_entry_enter(td);
     return td;
 }
 
 void nmx_entry_end(struct thread *td)
 {
-    if (td != NULL)
-        nmx_thread_entry_leave(td);
+    if (td == NULL)
+        return;
+    nmx_thread_entry_leave(td);
+    __atomic_fetch_sub(&nmx_entry_inflight, 1, __ATOMIC_SEQ_CST);
+}
+
+/* closes the entries and waits until none is inside (nmx_kernel_fini, before the lock and the records go) */
+static void nmx_entry_close_and_drain(void)
+{
+    __atomic_store_n(&nmx_entry_open, 0, __ATOMIC_SEQ_CST);
+    for (unsigned ms = 0; __atomic_load_n(&nmx_entry_inflight, __ATOMIC_SEQ_CST) != 0; ms++) {
+        if (ms == 1000 || (ms && (ms % 10000) == 0))
+            printf("NullMoth xkpi: unload waits for %u driver entr%s still inside (%u ms)\n",
+                   nmx_entry_inflight, nmx_entry_inflight == 1 ? "y" : "ies", ms);
+        IOSleep(1);
+    }
 }
 
 int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg)
