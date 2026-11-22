@@ -42,6 +42,19 @@ struct big_rec {
 static struct big_rec *big_table[BIG_BUCKETS];
 static lck_spin_t *big_lock;
 
+/*
+ * Single-page blocks freed are kept (up to NMX_PAGE_KEEP) and handed out again, with their record, instead of an
+ * IOMallocAligned + IOMalloc and IOFreeAligned + IOFree pair each time (WS-CPU 9.3). Linux takes these from the
+ * kmalloc-4k slab. Every command submission makes and drops at least one: drm_exec_init's object array is
+ * PAGE_SIZE / sizeof(void *) pointers (amdgpu_cs_parser_bos, and the GEM paths that lock with drm_exec), and with it
+ * the bo list of a larger submit. In WindowServer's spindump drm_exec_init/fini were 18 of 119 samples of
+ * amdgpu_cs_ioctl. Kept blocks are out of big_table (a free of one is the same error as now) and go at unload.
+ */
+#define NMX_PAGE_KEEP 64
+static struct big_rec *page_keep[NMX_PAGE_KEEP];
+static unsigned page_keep_n;
+static uint64_t page_keep_hits, page_keep_misses;
+
 static unsigned big_bucket(const void *p)
 {
     return (unsigned)(((uintptr_t)p >> PAGE_SHIFT) & (BIG_BUCKETS - 1));
@@ -72,6 +85,26 @@ void *malloc(size_t size, struct malloc_type *type, int flags)
         size = 1;
     if (size >= PAGE_SIZE) {
         size_t rounded = round_page(size);
+        if (rounded == PAGE_SIZE) {
+            struct big_rec *kept = NULL;
+            lck_spin_lock(big_lock);
+            if (page_keep_n) {
+                kept = page_keep[--page_keep_n];
+                page_keep_hits++;
+                kept->type = type;
+                unsigned b = big_bucket(kept->addr);
+                kept->next = big_table[b];
+                big_table[b] = kept;
+            } else
+                page_keep_misses++;
+            lck_spin_unlock(big_lock);
+            if (kept) {
+                if (flags & M_ZERO)
+                    bzero(kept->addr, PAGE_SIZE);
+                account(type, PAGE_SIZE);
+                return kept->addr;
+            }
+        }
         struct big_rec *rec = IOMalloc(sizeof(*rec));
         if (rec == NULL)
             return NULL;
@@ -147,6 +180,17 @@ void free(void *addr, struct malloc_type *type)
         struct big_rec *r = big_take(addr);
         if (r) {
             account(r->type, -(int64_t)r->size);
+            if (!r->contig && r->size == PAGE_SIZE) {
+                int kept = 0;
+                lck_spin_lock(big_lock);
+                if (page_keep_n < NMX_PAGE_KEEP) {
+                    page_keep[page_keep_n++] = r;
+                    kept = 1;
+                }
+                lck_spin_unlock(big_lock);
+                if (kept)
+                    return;
+            }
             if (r->contig)
                 kmem_free(r->addr, r->size);
             else
@@ -388,6 +432,13 @@ void nmx_malloc_fini(void)
             leaked++;
     if (leaked)
         printf("NullMoth xkpi: %d large allocation(s) still held at unload\n", leaked);
+    printf("NullMoth xkpi: single-page blocks: %llu reused, %llu new; %u kept at unload, freed now\n",
+           (unsigned long long)page_keep_hits, (unsigned long long)page_keep_misses, page_keep_n);
+    while (page_keep_n) {
+        struct big_rec *r = page_keep[--page_keep_n];
+        IOFreeAligned(r->addr, r->size);
+        IOFree(r, sizeof(*r));
+    }
     lck_spin_free(big_lock, nmx_lck_grp);
     big_lock = NULL;
 }
