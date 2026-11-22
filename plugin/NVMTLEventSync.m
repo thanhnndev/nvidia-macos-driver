@@ -141,13 +141,37 @@ static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
         if (!t->_surf || [seen containsObject:(__bridge id)t->_surf]) continue;
         [seen addObject:(__bridge id)t->_surf];
         const unsigned long long n = atomic_fetch_add(&gNmxFenceSeq, 1) + 1;
-        // frame-path trace (FRAME-PATH.md section 7): the commit time rides in the same IOSurface call (one IPC)
-        IOSurfaceSetValues(t->_surf, (__bridge CFDictionaryRef)@{ @"NMXFencePending": @(n),
-                                                                  @"NMXFencePendingT": @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) });
+        // WS-CPU 9.3: NMXFencePending is no longer written here. It goes out with NMXFenceSubmitted in ONE IOSurface call
+        // when the last surface-writing part is submitted on this thread (submit-ahead, WindowServer's normal case), or
+        // alone at the end of nvmtlSubmitWithEvents otherwise: either way before commit returns, so before the swap.
+        // The commit time (frame-path trace, FRAME-PATH.md section 7) is taken now and written with it.
         if (!cb->_nmxFence) cb->_nmxFence = [NSMutableArray new];
-        [cb->_nmxFence addObject:@[(__bridge id)t->_surf, @(n)]];
+        [cb->_nmxFence addObject:@[(__bridge id)t->_surf, @(n), @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW))]];
     }
     cb->_nmxFenced = cb->_nmxFence.count != 0;
+    cb->_nmxPendSent = NO;
+}
+static _Atomic unsigned long long gNmxPendMerged, gNmxPendAlone;
+/* Writes NMXFencePending (once per command buffer) and, with submitted, NMXFenceSubmitted in the same call. */
+static void nvmtl_nmx_fence_publish(NVMTLCommandBuffer *cb, BOOL submitted) {
+    @synchronized ([NVMTLCommandBuffer class]) {
+        NSArray *marks = cb->_nmxFence;
+        if (!marks.count || (cb->_nmxPendSent && (!submitted || cb->_nmxSubSent))) return;
+        const BOOL pend = !cb->_nmxPendSent;
+        for (NSArray *m in marks) {
+            NSDictionary *v = pend && submitted ? @{ @"NMXFencePending": m[1], @"NMXFencePendingT": m[2], @"NMXFenceSubmitted": m[1] }
+                            : pend ? @{ @"NMXFencePending": m[1], @"NMXFencePendingT": m[2] }
+                            : @{ @"NMXFenceSubmitted": m[1] };
+            IOSurfaceSetValues((__bridge IOSurfaceRef)m[0], (__bridge CFDictionaryRef)v);
+        }
+        if (pend) atomic_fetch_add(submitted ? &gNmxPendMerged : &gNmxPendAlone, 1);
+        cb->_nmxPendSent = YES;
+        if (submitted) cb->_nmxSubSent = YES;
+        const unsigned long long k = gNmxPendMerged + gNmxPendAlone;
+        if (k == 1 || !(k & (k - 1)) || !(k & 0xFFFF))
+            nvlog("commit: fence marks: %llu with NMXFenceSubmitted in one call, %llu Pending alone (part not yet submitted)",
+                  (unsigned long long)gNmxPendMerged, (unsigned long long)gNmxPendAlone);
+    }
 }
 // out-31 (FRAME-PATH row 1): NMXGPU records each CS job's fence against the IOSurfaces it writes, and NMXAccel lets the
 // display commit wait for it in the kernel - but only for a frame whose CS is already in the kernel. "Scheduled" is
@@ -157,12 +181,11 @@ static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
 // it waits for NMXFenceDone as before. Runs on the submitting thread, not the completion thread.
 static void nvmtl_nmx_fence_submitted(NVMTLCommandBuffer *cb, NSInteger partIndex) {
     if (cb->_nmxSubSent || !cb->_nmxFence.count || partIndex < cb->_nmxLastSurfPart) return;
-    cb->_nmxSubSent = YES;
-    for (NSArray *m in cb->_nmxFence)
-        IOSurfaceSetValue((__bridge IOSurfaceRef)m[0], CFSTR("NMXFenceSubmitted"), (__bridge CFNumberRef)m[1]);
+    nvmtl_nmx_fence_publish(cb, YES);
 }
 static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb, double gpuEndSeconds) {
-    NSArray *marks = cb->_nmxFence; cb->_nmxFence = nil;
+    NSArray *marks;
+    @synchronized ([NVMTLCommandBuffer class]) { marks = cb->_nmxFence; cb->_nmxFence = nil; }
     if (!marks.count) return;
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_nmx_fence_done) nvmtl_nmx_fence_done = [NSMapTable weakToStrongObjectsMapTable];
@@ -649,6 +672,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
         nvmtl_pump_buffers();
+        nvmtl_nmx_fence_publish(self, NO);   // NMXFencePending, if submit-ahead did not already send it with Submitted
     }
 }
 @end

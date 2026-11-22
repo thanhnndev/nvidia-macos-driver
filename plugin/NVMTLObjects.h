@@ -122,6 +122,7 @@ extern id gNVMTLMainDevice;
   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
   NSMutableArray *_nmxFence; BOOL _nmxFenced; // [IOSurface, seq] pairs marked NMXFencePending at commit (WindowServer)
   NSInteger _nmxLastSurfPart; BOOL _nmxSubSent; // out-31: last part writing a marked surface; NMXFenceSubmitted written
+  BOOL _nmxPendSent; // WS-CPU 9.3: NMXFencePending written (with Submitted when the submit was ahead)
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
   unsigned _nEncSealed;
   CFTimeInterval _gpuStart, _gpuEnd;
