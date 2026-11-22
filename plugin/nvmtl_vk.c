@@ -25,6 +25,7 @@ static int g_scalar_layout;
 
 void nvlog(const char *fmt, ...);
 void nvlog_report(const char *fmt, ...);
+void nvlog_capped(const char *fmt, ...);
 
 static __thread uint32_t g_copy_aspect_override, g_copy_bpp_override;
 void nvmtl_vk_copy_aspect_override(uint32_t aspect, uint32_t bpp) { g_copy_aspect_override = aspect; g_copy_bpp_override = bpp; }
@@ -747,9 +748,33 @@ static void nvmtl_vkmsg_arm(void)
     }
 }
 
+static int nvmtl_vk_initialize_body(void);
+/*
+ * The Mesa shader disk cache dir for this process, set only while the driver is brought up (Mesa reads it when it
+ * creates the physical device's disk cache) and put back afterwards (2026-11-22). Left in the environment, it leaked
+ * into every child: loginwindow (root, no writable HOME) set root's own cache dir, and the apps it reopens at login
+ * (Claude, Electron apps, XKey, Cloudflare WARP) inherited a dir they cannot create, so Mesa disabled their disk
+ * cache ("Failed to create ... for shader cache (Permission denied)---disabling") and they recompiled every shader at
+ * every launch. An inherited dir this process cannot use is also set aside here, so Mesa falls back to the user's
+ * own (~/.cache/mesa_shader_cache) or the dir chosen below.
+ */
 static int nvmtl_vk_initialize(void)
 {
     if (g_state) return g_state == 1 ? 0 : -1;
+    char *orig = getenv("MESA_SHADER_CACHE_DIR") ? strdup(getenv("MESA_SHADER_CACHE_DIR")) : NULL;
+    if (orig && !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
+        struct stat st;
+        const int usable = stat(orig, &st) == 0 ? access(orig, W_OK) == 0 : mkdir(orig, 0700) == 0;
+        if (!usable) { unsetenv("MESA_SHADER_CACHE_DIR");
+            nvlog("vk: %s: inherited MESA_SHADER_CACHE_DIR %s is not writable here - set aside for this process", getprogname(), orig); }
+    }
+    const int r = nvmtl_vk_initialize_body();
+    if (orig) setenv("MESA_SHADER_CACHE_DIR", orig, 1); else unsetenv("MESA_SHADER_CACHE_DIR");
+    free(orig);
+    return r;
+}
+static int nvmtl_vk_initialize_body(void)
+{
     g_state = -1;
     if (!getenv("NVRM_FLUSH_TIMEOUT_MS")) {
         char budget[32]; snprintf(budget, sizeof budget, "%ld", nvmtl_gpu_wait_budget_ms());
@@ -2950,7 +2975,7 @@ typedef struct { const void *key; nvmtl_btsh *s; } nvmtl_btsh_ent;
 static pthread_mutex_t g_btsh_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvmtl_btsh_ent *g_btsh_ent; static unsigned g_btsh_n, g_btsh_cap;
 static _Atomic unsigned g_btsh_live;
-static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs, g_btsh_one, g_btsh_seedskip;
+static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs, g_btsh_one, g_btsh_seedskip, g_btsh_watched, g_btsh_watch_miss;
 static int nvmtl_btsh_onecopy_on(void)
 {
     static int on = -1;
@@ -3141,6 +3166,7 @@ int nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf)
     nvmtl_btsh *s = nvmtl_btsh_find_locked((const void *)img->img);
     if (s && !s->writable && !s->surf) { s->surf = (IOSurfaceRef)CFRetain((IOSurfaceRef)surf); ok = 1; }
     pthread_mutex_unlock(&g_btsh_lock);
+    atomic_fetch_add(ok ? &g_btsh_watched : &g_btsh_watch_miss, 1);   // 2026-11-22 x420 check: is the gate engaged at all
     return ok;
 }
 static void nvmtl_btsh_retire(nvk_cmdbuf *c)
@@ -6460,10 +6486,13 @@ static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
     atomic_fetch_add(&g_btsh_in, nneed);
 census:;
     const unsigned long long k = atomic_fetch_add(&g_btsh_cbs, 1);
+    /* 2026-11-22: through nvlog this stopped after its 8th line (4096 command buffers, a minute after login), so no x420
+       check could read the skipped count; every 1024th now (nvlog_capped: no per-format cap, debug log only) */
     if (k < 4 || ((k + 1) & 0x3ff) == 0)
-        nvlog("buffer texture: %llu command buffers used shadowed buffer textures (%llu shadows made, %llu of them one-copy, %u live; %llu row uploads, %llu skipped at an unchanged surface seed, %llu writebacks)",
+        nvlog_capped("buffer texture: %llu command buffers used shadowed buffer textures (%llu shadows made, %llu of them one-copy, %u live; %llu row uploads, %llu skipped at an unchanged surface seed, %llu writebacks; surface-plane shadows watched %llu, not found %llu)",
               k + 1, (unsigned long long)atomic_load(&g_btsh_made), (unsigned long long)atomic_load(&g_btsh_one), (unsigned)atomic_load(&g_btsh_live),
-              (unsigned long long)atomic_load(&g_btsh_in), (unsigned long long)atomic_load(&g_btsh_seedskip), (unsigned long long)atomic_load(&g_btsh_out));
+              (unsigned long long)atomic_load(&g_btsh_in), (unsigned long long)atomic_load(&g_btsh_seedskip), (unsigned long long)atomic_load(&g_btsh_out),
+              (unsigned long long)atomic_load(&g_btsh_watched), (unsigned long long)atomic_load(&g_btsh_watch_miss));
 }
 static void nvmtl_btsh_post(nvk_cmdbuf *c)
 {
