@@ -758,13 +758,21 @@ static int nvmtl_vk_initialize_body(void);
  * every launch. An inherited dir this process cannot use is also set aside here, so Mesa falls back to the user's
  * own (~/.cache/mesa_shader_cache) or the dir chosen below.
  */
+/* Writable for this process as Mesa will use it: checked with the effective uid (access() uses the real one, and
+   WindowServer runs with ruid 0, euid 88) and, for an existing dir, owned by that euid, since Mesa's disk cache turns
+   itself off for a dir it does not own (review of 5f302db). */
+static int nvmtl_dir_usable(const char *path, int create)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return create && mkdir(path, 0700) == 0;
+    return S_ISDIR(st.st_mode) && st.st_uid == geteuid() && faccessat(AT_FDCWD, path, W_OK, AT_EACCESS) == 0;
+}
 static int nvmtl_vk_initialize(void)
 {
     if (g_state) return g_state == 1 ? 0 : -1;
     char *orig = getenv("MESA_SHADER_CACHE_DIR") ? strdup(getenv("MESA_SHADER_CACHE_DIR")) : NULL;
     if (orig && !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
-        struct stat st;
-        const int usable = stat(orig, &st) == 0 ? access(orig, W_OK) == 0 : mkdir(orig, 0700) == 0;
+        const int usable = nvmtl_dir_usable(orig, 1);
         if (!usable) { unsetenv("MESA_SHADER_CACHE_DIR");
             nvlog("vk: %s: inherited MESA_SHADER_CACHE_DIR %s is not writable here - set aside for this process", getprogname(), orig); }
     }
@@ -783,12 +791,12 @@ static int nvmtl_vk_initialize_body(void)
     }
     if (!getenv("MESA_SHADER_CACHE_DIR") && !getenv("XDG_CACHE_HOME") && !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
         const char *home = getenv("HOME");
-        if (!home || access(home, W_OK) != 0) {
+        if (!home || faccessat(AT_FDCWD, home, W_OK, AT_EACCESS) != 0) {
             char ucd[PATH_MAX], dir[PATH_MAX];
             const size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd);
             if (n > 0 && n <= sizeof ucd && snprintf(dir, sizeof dir, "%snvmtl-mesa", ucd) < (int)sizeof dir) {
                 mkdir(dir, 0700);
-                if (access(dir, W_OK) == 0) { setenv("MESA_SHADER_CACHE_DIR", dir, 1);
+                if (nvmtl_dir_usable(dir, 0)) { setenv("MESA_SHADER_CACHE_DIR", dir, 1);
                     nvlog("vk: %s has no writable HOME (%s) - Mesa shader disk cache at %s", getprogname(), home ?: "unset", dir); }
                 else nvlog("vk: %s: no writable Mesa cache dir (%s) - NAK recompiles every start", getprogname(), dir);
             }

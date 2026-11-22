@@ -1141,12 +1141,18 @@ static void nvmtl_sk_drop(NSMutableDictionary *keep, NVMTLSurfKey *k, unsigned w
     const uint64_t now = nvmtl_keep_now_ms(), idle = old ? MIN(now - old->_last, (uint64_t)0xfffff) : 0;
     nvmtl_sk_dropAt[sid] = @((now << 20) | idle);
 }
+// The nvmtl_sk* statistics and bookkeeping (and the sweep's statics) are process-wide while each device's table is
+// guarded by @synchronized(device): two devices in one process (review of 7ceff16) would mutate them concurrently, so
+// they take this lock too, always inside the device lock (device -> g_sk_lock, never the other way).
+static pthread_mutex_t g_sk_lock = PTHREAD_MUTEX_INITIALIZER;
 static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
+    pthread_mutex_lock(&g_sk_lock);
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     NVMTLSurfKeep *e = keep[key];
     if (e) e->_last = e->_wrap = nvmtl_keep_now_ms();
     nvmtl_sk.hits++;
     if (keep) nvmtl_sk_report(keep, e ? e->_last : nvmtl_keep_now_ms());
+    pthread_mutex_unlock(&g_sk_lock);
 }
 static void nvmtl_sk_release_bag(void) {
     if (!nvmtl_sk_bag.count) return;
@@ -1164,8 +1170,14 @@ static size_t nvmtl_sk_bytes(NVMTLTexture *b) { return b->_surf ? IOSurfaceGetAl
 // 2026-11-08 YouTube spindump: 46 % of the WS main thread was re-imports of entries idle 4-9 s at the drop (mostly
 // 2880x1800 layers) that came back right after; NVMTL_KEEP_MS is now 30 s, NVMTL_KEEP_IDLE_MAX / _MB still bound it.
 static void nvmtl_surface_keep_timer(id dev);
-// key == nil: a sweep only (the idle timer below), nothing inserted and no miss counted.
+static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t);
+// key == nil: a sweep only (the idle timer below), nothing inserted and no miss counted. Called under @synchronized(dev).
 static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
+    pthread_mutex_lock(&g_sk_lock);
+    nvmtl_surface_keep_locked(dev, key, t);
+    pthread_mutex_unlock(&g_sk_lock);
+}
+static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1, sweepMs = -1, keepSmallMs = -1, smallBytes = -1; static uint64_t keepIdleBytes, lastSweep; static int dropDead = -1;
     if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 30000;
                       e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48;
@@ -1299,26 +1311,33 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
 // 0 = off) while the table has entries, under the same @synchronized(device) as the insert path; drops are released
 // off this queue as before. Started by the first insert; it stops itself when the table is empty and the next insert
 // starts it again.
+// One timer per device (an associated object, tested and set under @synchronized(device) like the table): with one
+// static timer a second device in the process got none while the first table had entries (review of 7ceff16).
+// The handler holds the device strongly only for one sweep; if that is the last reference the device is released on
+// this utility queue (dealloc is queue-agnostic).
+static char nvmtl_surface_keep_timer_key;
 static void nvmtl_surface_keep_timer(id dev) {
-    static dispatch_source_t timer; static long periodMs = -1;
+    static long periodMs = -1;
     if (periodMs < 0) { const char *e = getenv("NVMTL_KEEP_TIMER_MS"); periodMs = e ? atol(e) : 5000; }
-    if (periodMs <= 0 || timer) return;
+    if (periodMs <= 0 || objc_getAssociatedObject(dev, &nvmtl_surface_keep_timer_key)) return;
     static dispatch_queue_t q; static dispatch_once_t once;
     dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.surface-keep.sweep", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
     __weak id wdev = dev;
     dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     dispatch_source_set_timer(s, dispatch_time(DISPATCH_TIME_NOW, (int64_t)periodMs * NSEC_PER_MSEC), (uint64_t)periodMs * NSEC_PER_MSEC,
                               (uint64_t)periodMs * NSEC_PER_MSEC / 2);   // wide leeway: coalesced with other wakeups
+    __weak dispatch_source_t ws = s;
     dispatch_source_set_event_handler(s, ^{
+        dispatch_source_t me = ws;
         id d = wdev;
-        if (!d) { dispatch_source_cancel(s); return; }   // the device is gone (timer stays non-nil: nothing restarts it)
+        if (!d) { if (me) dispatch_source_cancel(me); return; }   // the device is gone, and its timer with it
         @synchronized (d) {   // the insert path tests and sets the timer under this lock too
             NSMutableDictionary *keep = objc_getAssociatedObject(d, &nvmtl_surface_keep_key);
             if (keep.count) nvmtl_surface_keep(d, nil, nil);
-            if (!keep.count) { dispatch_source_cancel(s); timer = nil; }
+            if (!keep.count) { if (me) dispatch_source_cancel(me); objc_setAssociatedObject(d, &nvmtl_surface_keep_timer_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
         }
     });
-    timer = s;
+    objc_setAssociatedObject(dev, &nvmtl_surface_keep_timer_key, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // the device keeps its timer alive
     dispatch_resume(s);
 }
 // Whether a shader can write this surface texture: a storage image, or one nvmtl_storage_view_for (NVMTLObjects.m) can
