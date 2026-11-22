@@ -320,7 +320,7 @@ static void nvmtl_dc_insert(nvk_cmdbuf *c, const nvmtl_dc_probe *pr, VkDescripto
  *    global epochs: a VkBuffer or view destroyed elsewhere no longer throws every entry away.
  *  - Lifetime: every command buffer that uses an entry pins it (ref) until it retires; only an unpinned entry is
  *    evicted (its set freed). The table is a fixed array with chained buckets under one mutex.
- *  - Off: NVMTL_NO_XDESCCACHE=1 (environment, read at start), or with the desc-cache itself. */
+ *  - Default off; NVMTL_XDESCCACHE=1 (environment or nvrm610.conf, read at start) turns it on. */
 #define NVMTL_XDC_CAP 1024
 #define NVMTL_XDC_NB  2048
 typedef struct nvmtl_xdc_ent { uint64_t h, sig; uint64_t *k; uint32_t klen, hi, ref, tick; int next;
@@ -332,8 +332,10 @@ static uint64_t g_xdc_hit, g_xdc_miss, g_xdc_ins, g_xdc_evict, g_xdc_stale, g_xd
 static int nvmtl_xdc_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_NO_XDESCCACHE"); on = !(e && *e && *e != '0');
-        nvlog("vk: device-level desc-cache %s (NVMTL_NO_XDESCCACHE=%s)", on ? "ON - descriptor sets are kept across command buffers" : "OFF", e ? e : "unset"); }
+    /* Default OFF (main, 2026-11-22): ~7 us per present does not pay for a new cross-command-buffer lifetime in
+       WindowServer. NVMTL_XDESCCACHE=1 turns it on. */
+    if (on < 0) { const char *e = getenv("NVMTL_XDESCCACHE"); on = e && *e == '1';
+        nvlog("vk: device-level desc-cache %s (NVMTL_XDESCCACHE=%s)", on ? "ON - descriptor sets are kept across command buffers" : "OFF (default)", e ? e : "unset"); }
     return on && nvmtl_table_ubo();
 }
 static void nvmtl_xdc_init_locked(void)
