@@ -30,7 +30,10 @@
 enum { NVMTL_DC_DEP_IMG = 1, NVMTL_DC_DEP_BUF = 2 };
 typedef struct { uint64_t h; VkDescriptorSet set; VkBuffer pbuf; uint32_t koff, klen, idx, hi, poff, ie, be;
                  uint8_t used, addr, dep; } nvmtl_dc_ent;
-typedef struct { unsigned n, an; nvmtl_dc_ent e[NVMTL_DC_CAP]; uint64_t arena[NVMTL_DC_ARENA]; } nvmtl_dcache;
+struct nvmtl_xdc_ent;
+typedef struct { unsigned n, an; nvmtl_dc_ent e[NVMTL_DC_CAP]; uint64_t arena[NVMTL_DC_ARENA];
+                 struct nvmtl_xdc_ent **pins; unsigned npin, cappin;   /* device-level entries this command buffer uses */
+               } nvmtl_dcache;
 
 static uint32_t g_dc_epoch_img = 1, g_dc_epoch_buf = 1;
 static uint64_t g_dc_hit, g_dc_miss, g_dc_stale, g_dc_page, g_dc_long, g_dc_full, g_dc_ins;
@@ -44,16 +47,27 @@ static PFN_vkDestroyBuffer     g_dc_real_db;  static PFN_vkFreeMemory    g_dc_re
 /* which destroy moved the image epoch (Step101b trace): image view, image, sampler, buffer view */
 static uint64_t g_dc_by_dv, g_dc_by_di, g_dc_by_ds, g_dc_by_dbv;
 #define NVMTL_DC_BY(c) __atomic_add_fetch(&(c), 1, __ATOMIC_RELAXED)
+/* Per-handle epochs for the device-level cache (WS-CPU 8.9): a destroy of a handle that can sit in a key (image view,
+ * sampler, buffer view, buffer) bumps the bucket its value hashes to, before the handle is released for reuse. An entry
+ * remembers the sum of its handles' bucket epochs; the sum only grows, so any destroy of one of its handles (or of a
+ * handle sharing a bucket) makes it stale. Image and memory frees do not count: their views and buffers stay live
+ * handles until destroyed themselves, so the raw value in a key cannot be reused before its own destroy bumps it. */
+#define NVMTL_HEP_N 4096
+static uint32_t g_hep[NVMTL_HEP_N];
+static inline unsigned nvmtl_hep_bucket(const void *h)
+{ uint64_t x = (uint64_t)(uintptr_t)h; x ^= x >> 29; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 32; return (unsigned)x & (NVMTL_HEP_N - 1); }
+static inline void nvmtl_hep_bump(const void *h) { __atomic_add_fetch(&g_hep[nvmtl_hep_bucket(h)], 1, __ATOMIC_SEQ_CST); }
+static inline uint64_t nvmtl_hep_get(const void *h) { return __atomic_load_n(&g_hep[nvmtl_hep_bucket(h)], __ATOMIC_ACQUIRE); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_dv(VkDevice d, VkImageView v, const VkAllocationCallbacks *a)
-{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_dv); } g_dc_real_dv(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_dv); nvmtl_hep_bump(v); } g_dc_real_dv(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_di(VkDevice d, VkImage v, const VkAllocationCallbacks *a)
 { if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_di); } g_dc_real_di(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_ds(VkDevice d, VkSampler v, const VkAllocationCallbacks *a)
-{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_ds); } g_dc_real_ds(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_ds); nvmtl_hep_bump(v); } g_dc_real_ds(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_dbv(VkDevice d, VkBufferView v, const VkAllocationCallbacks *a)
-{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_dbv); } g_dc_real_dbv(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_img); NVMTL_DC_BY(g_dc_by_dbv); nvmtl_hep_bump(v); } g_dc_real_dbv(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_db(VkDevice d, VkBuffer v, const VkAllocationCallbacks *a)
-{ if (v) NVMTL_DC_BUMP(g_dc_epoch_buf); g_dc_real_db(d, v, a); }
+{ if (v) { NVMTL_DC_BUMP(g_dc_epoch_buf); nvmtl_hep_bump(v); } g_dc_real_db(d, v, a); }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_dc_fm(VkDevice d, VkDeviceMemory v, const VkAllocationCallbacks *a)
 { if (v) NVMTL_DC_BUMP(g_dc_epoch_buf); g_dc_real_fm(d, v, a); }
 /* Called once after the device's function pointers are loaded (and after nvmtl_bl_hook_destroy, which it chains). */
@@ -112,9 +126,9 @@ static inline uint64_t nvmtl_dc_mix(uint64_t h, uint64_t v)
  * (d5da629 spent 1-2 words on every binding of the layout; CoreAnimation's pipelines declare ~200, so 163260 of
  * 175475 lookups on the Step100 boot overflowed NVMTL_DC_KEYMAX and were never cached.) */
 static unsigned nvmtl_dc_key(const nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], uint32_t hi, int ubo,
-                             uint64_t *k, uint8_t *dep)
+                             uint64_t *k, uint8_t *dep, uint64_t *sig)
 {
-    unsigned n = 0; *dep = 0;
+    unsigned n = 0; *dep = 0; *sig = 0;
     k[n++] = (uint64_t)which | (uint64_t)hi << 8 | (uint64_t)(ubo != 0) << 40;
     for (int w = 0; w < 4; w++) k[n++] = pm[w];
     for (int w = 0; w < 4; w++) for (uint64_t b = pm[w]; b; b &= b - 1) {
@@ -144,17 +158,17 @@ static unsigned nvmtl_dc_key(const nvmtl_bindtable *t, uint32_t which, const uin
             if (sl->kind == NVMTL_SLOT_BUF && (sl->off % NVMTL_SSBO_ALIGN) == 0) {
                 if (n + 3 > NVMTL_DC_KEYMAX) return 0;
                 k[n++] = (uint64_t)i << 2 | 1; k[n++] = (uint64_t)(uintptr_t)sl->h; k[n++] = (uint64_t)sl->off;
-                *dep |= NVMTL_DC_DEP_BUF;
+                *dep |= NVMTL_DC_DEP_BUF; *sig += nvmtl_hep_get(sl->h);
             }
         } else if (ty == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
             if (sl->kind == NVMTL_SLOT_TEX) {
                 if (n + 2 > NVMTL_DC_KEYMAX) return 0;
-                k[n++] = (uint64_t)i << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG;
+                k[n++] = (uint64_t)i << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG; *sig += nvmtl_hep_get(sl->h);
             }
         } else {
             if (sl->kind == NVMTL_SLOT_SAMP) {
                 if (n + 2 > NVMTL_DC_KEYMAX) return 0;
-                k[n++] = (uint64_t)i << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG;
+                k[n++] = (uint64_t)i << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG; *sig += nvmtl_hep_get(sl->h);
             }
         }
     }
@@ -163,6 +177,7 @@ static unsigned nvmtl_dc_key(const nvmtl_bindtable *t, uint32_t which, const uin
         if (!(sl->kind == NVMTL_SLOT_TEX && sl->h)) continue;
         if (n + 2 > NVMTL_DC_KEYMAX) return 0;
         k[n++] = (uint64_t)(NVMTL_STEX_BASE + j) << 2 | 2; k[n++] = (uint64_t)(uintptr_t)sl->h; *dep |= NVMTL_DC_DEP_IMG;
+        *sig += nvmtl_hep_get(sl->h);
     }
     return n;
 }
@@ -190,8 +205,34 @@ static int nvmtl_dc_stale(const nvmtl_dc_ent *e)
     return ((e->dep & NVMTL_DC_DEP_IMG) && e->ie != __atomic_load_n(&g_dc_epoch_img, __ATOMIC_ACQUIRE)) ||
            ((e->dep & NVMTL_DC_DEP_BUF) && e->be != __atomic_load_n(&g_dc_epoch_buf, __ATOMIC_ACQUIRE));
 }
+/* Miss classes (WS-CPU 8.9): a plain miss is the first use of a key in this command buffer that the device-level cache
+ * (below) did not have either. The seen table remembers keys written before (hash, handle signature, global epochs):
+ *   new   - never written before (or fell out of the table): a new combination of descriptors,
+ *   again - written before and none of its handles destroyed since: a set that could have been reused,
+ *   moved - written before, but one of its handles (or a bucket neighbour) was destroyed since: really new.
+ * "again" also says how many of those the old global epochs would have thrown away (img/buf moved).
+ * Diagnostic only: it decides nothing. */
+#define NVMTL_DC_SEEN 8192
+typedef struct { uint64_t h, sig; uint32_t ie, be; } nvmtl_dc_seen_ent;
+static nvmtl_dc_seen_ent g_dc_seen[NVMTL_DC_SEEN];
+static uint64_t g_dc_c_new, g_dc_c_again, g_dc_c_moved, g_dc_c_again_gimg, g_dc_c_again_gbuf;
+static void nvmtl_dc_seen_classify(uint64_t h, uint64_t sig, uint8_t dep)
+{
+    const nvmtl_dc_seen_ent e = g_dc_seen[h & (NVMTL_DC_SEEN - 1)];   /* racy copy: a torn entry only misclassifies one miss */
+    if (e.h != h) { __atomic_add_fetch(&g_dc_c_new, 1, __ATOMIC_RELAXED); return; }
+    if (e.sig != sig) { __atomic_add_fetch(&g_dc_c_moved, 1, __ATOMIC_RELAXED); return; }
+    __atomic_add_fetch(&g_dc_c_again, 1, __ATOMIC_RELAXED);
+    if ((dep & NVMTL_DC_DEP_IMG) && e.ie != __atomic_load_n(&g_dc_epoch_img, __ATOMIC_RELAXED)) __atomic_add_fetch(&g_dc_c_again_gimg, 1, __ATOMIC_RELAXED);
+    else if ((dep & NVMTL_DC_DEP_BUF) && e.be != __atomic_load_n(&g_dc_epoch_buf, __ATOMIC_RELAXED)) __atomic_add_fetch(&g_dc_c_again_gbuf, 1, __ATOMIC_RELAXED);
+}
+static void nvmtl_dc_seen_note(uint64_t h, uint64_t sig, uint32_t ie, uint32_t be)
+{
+    nvmtl_dc_seen_ent *e = &g_dc_seen[h & (NVMTL_DC_SEEN - 1)];
+    e->h = h; e->sig = sig; e->ie = ie; e->be = be;
+}
+
 /* A lookup in flight between the key and the insert after a miss. */
-typedef struct { nvmtl_dcache *dc; uint64_t h; unsigned n, slot; uint8_t dep; uint32_t ie, be; uint64_t k[NVMTL_DC_KEYMAX]; } nvmtl_dc_probe;
+typedef struct { nvmtl_dcache *dc; uint64_t h, sig; unsigned n, slot; uint8_t dep, plain; uint32_t ie, be; uint64_t k[NVMTL_DC_KEYMAX]; } nvmtl_dc_probe;
 
 /* Returns a reusable set (and its dynamic offset for binding 640 in *dyn), or VK_NULL_HANDLE with pr filled in for
  * nvmtl_dc_insert. The caller has already updated nothing. */
@@ -200,22 +241,22 @@ static VkDescriptorSet nvmtl_dc_lookup(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32
 {
     /* Epochs are read before the key: a destroy racing the key build makes the new entry stale, never a stale one fresh.
        Without a key the set's handle classes are unknown, so it depends on both. */
-    pr->dc = NULL; pr->n = 0; pr->dep = NVMTL_DC_DEP_IMG | NVMTL_DC_DEP_BUF;
+    pr->dc = NULL; pr->n = 0; pr->plain = 0; pr->sig = 0; pr->dep = NVMTL_DC_DEP_IMG | NVMTL_DC_DEP_BUF;
     pr->ie = __atomic_load_n(&g_dc_epoch_img, __ATOMIC_ACQUIRE); pr->be = __atomic_load_n(&g_dc_epoch_buf, __ATOMIC_ACQUIRE);
     if (!on) return VK_NULL_HANDLE;
     const int ubo = nvmtl_table_ubo();
-    pr->n = nvmtl_dc_key(t, which, pm, hi, ubo, pr->k, &pr->dep);
+    pr->n = nvmtl_dc_key(t, which, pm, hi, ubo, pr->k, &pr->dep, &pr->sig);
     if (!pr->n) {
         pr->dep = NVMTL_DC_DEP_IMG | NVMTL_DC_DEP_BUF; __atomic_add_fetch(&g_dc_long, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
     nvmtl_dcache *dc = (nvmtl_dcache *)t->dc;
     if (!dc) {
         dc = (nvmtl_dcache *)malloc(sizeof *dc);
         if (!dc) return VK_NULL_HANDLE;
-        dc->n = dc->an = 0; memset(dc->e, 0, sizeof dc->e); t->dc = dc;
+        dc->n = dc->an = 0; memset(dc->e, 0, sizeof dc->e); dc->pins = NULL; dc->npin = dc->cappin = 0; t->dc = dc;
     }
     pr->dc = dc; pr->h = nvmtl_dc_hash(pr->k, pr->n);
     nvmtl_dc_ent *e = nvmtl_dc_find(dc, pr->h, pr->k, pr->n, &pr->slot);
-    if (!e) { __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
+    if (!e) { __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); pr->plain = 1; return VK_NULL_HANDLE; }
     if (nvmtl_dc_stale(e) || e->idx >= c->nsets || (VkDescriptorSet)c->sets[e->idx].set != e->set) {
         __atomic_add_fetch(&g_dc_stale, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
     uint32_t d = 0;
@@ -223,10 +264,10 @@ static VkDescriptorSet nvmtl_dc_lookup(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32
         /* The set's binding 640 points at its own table slot. The next slot must land in the same page, after it. */
         const unsigned at = c->address_count % NVMTL_TABLES_PER_PAGE;
         const nvmtl_address_page *pg = (const nvmtl_address_page *)c->address_pages;
-        if (at == 0 || !pg || (VkBuffer)pg->buffer.buf != e->pbuf || at * NVMTL_TABLE_BYTES <= e->poff) {
+        if (at == 0 || !pg || (VkBuffer)pg->buffer.buf != e->pbuf || at * NVMTL_TABLE_BYTES < e->poff) {
             __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
         VkDescriptorBufferInfo ai;
-        if (nvmtl_address_snapshot(c, which, &ai) || (VkBuffer)ai.buffer != e->pbuf || ai.offset <= e->poff) {
+        if (nvmtl_address_snapshot(c, which, &ai) || (VkBuffer)ai.buffer != e->pbuf || ai.offset < e->poff) {   /* the fresh slot is always past the set's own one */
             __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
         d = (uint32_t)(ai.offset - e->poff);
         const VkDeviceSize al = g_lim.minUniformBufferOffsetAlignment ? g_lim.minUniformBufferOffsetAlignment : 1;
@@ -241,7 +282,7 @@ static VkDescriptorSet nvmtl_dc_lookup(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32
     return e->set;
 }
 /* After a miss: remember set s (just written, at c->sets[c->nsets - 1]) under the probe's key. */
-static void nvmtl_dc_insert(nvk_cmdbuf *c, const nvmtl_dc_probe *pr, VkDescriptorSet s, uint32_t hi, int addr)
+static void nvmtl_dc_insert(nvk_cmdbuf *c, const nvmtl_dc_probe *pr, VkDescriptorSet s, uint32_t hi, int addr, int base0)
 {
     nvmtl_dcache *dc = pr->dc;
     if (!dc || !s || !c->nsets || (VkDescriptorSet)c->sets[c->nsets - 1].set != s) return;
@@ -258,7 +299,130 @@ static void nvmtl_dc_insert(nvk_cmdbuf *c, const nvmtl_dc_probe *pr, VkDescripto
     if (e->addr) {
         const nvmtl_address_page *pg = (const nvmtl_address_page *)c->address_pages;
         if (!pg || !c->address_count) { e->set = VK_NULL_HANDLE; e->idx = ~0u; return; }   /* cannot happen (md wrote a slot); never cache blind */
-        e->pbuf = (VkBuffer)pg->buffer.buf; e->poff = (uint32_t)(((c->address_count - 1) % NVMTL_TABLES_PER_PAGE) * NVMTL_TABLE_BYTES);
+        e->pbuf = (VkBuffer)pg->buffer.buf; e->poff = base0 ? 0 : (uint32_t)(((c->address_count - 1) % NVMTL_TABLES_PER_PAGE) * NVMTL_TABLE_BYTES);
     }
     __atomic_add_fetch(&g_dc_ins, 1, __ATOMIC_RELAXED);
+}
+
+/* ---- Device-level desc-cache (WS-CPU 8.9) -------------------------------------------------------------------------
+ * Why: the cache above lives in one command buffer, so every command buffer starts cold. In WindowServer (and in a
+ * CARenderer test in our own process) every plain miss was a key an earlier command buffer had already written and
+ * that was still valid: 5-7.5 misses per present = 5-7.5 vkAllocateDescriptorSets + vkUpdateDescriptorSets per
+ * present that a set kept across frames avoids. A Linux compositor on RADV keeps its sets across frames the same way
+ * (wlroots' Vulkan renderer writes one set per texture when the texture is made and only binds it per frame).
+ *
+ * How:
+ *  - Entries own their set (taken out of the command buffer's list, whose retire then skips it) and are keyed by the
+ *    same key plus, for sets that read binding 640, the address page buffer: those sets are written with binding 640
+ *    at base offset 0 (nvmtl_snapshot_set_c), so the dynamic offset picks any slot of that page. Pages are recycled
+ *    LIFO between command buffers, so a few pages carry the steady state.
+ *  - Validity: the sum of the per-handle bucket epochs (g_hep) of the key's handles and of the page buffer, not the
+ *    global epochs: a VkBuffer or view destroyed elsewhere no longer throws every entry away.
+ *  - Lifetime: every command buffer that uses an entry pins it (ref) until it retires; only an unpinned entry is
+ *    evicted (its set freed). The table is a fixed array with chained buckets under one mutex.
+ *  - Off: NVMTL_NO_XDESCCACHE=1 (environment, read at start), or with the desc-cache itself. */
+#define NVMTL_XDC_CAP 1024
+#define NVMTL_XDC_NB  2048
+typedef struct nvmtl_xdc_ent { uint64_t h, sig; uint64_t *k; uint32_t klen, hi, ref, tick; int next;
+                               VkDescriptorSet set; VkDescriptorPool pool; VkBuffer pbuf; uint8_t used, dep; } nvmtl_xdc_ent;
+static nvmtl_xdc_ent g_xdc[NVMTL_XDC_CAP]; static int g_xdc_head[NVMTL_XDC_NB]; static int g_xdc_free = -2;
+static unsigned g_xdc_n, g_xdc_hand; static uint32_t g_xdc_tick;
+static pthread_mutex_t g_xdc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_xdc_hit, g_xdc_miss, g_xdc_ins, g_xdc_evict, g_xdc_stale, g_xdc_full;
+static int nvmtl_xdc_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_NO_XDESCCACHE"); on = !(e && *e && *e != '0');
+        nvlog("vk: device-level desc-cache %s (NVMTL_NO_XDESCCACHE=%s)", on ? "ON - descriptor sets are kept across command buffers" : "OFF", e ? e : "unset"); }
+    return on && nvmtl_table_ubo();
+}
+static void nvmtl_xdc_init_locked(void)
+{
+    if (g_xdc_free != -2) return;
+    for (int i = 0; i < NVMTL_XDC_NB; i++) g_xdc_head[i] = -1;
+    for (int i = 0; i < NVMTL_XDC_CAP; i++) g_xdc[i].next = i + 1 < NVMTL_XDC_CAP ? i + 1 : -1;
+    g_xdc_free = 0;
+}
+static inline uint64_t nvmtl_xdc_hash(uint64_t h, VkBuffer pbuf) { return nvmtl_dc_mix(h, (uint64_t)(uintptr_t)pbuf); }
+static int nvmtl_xdc_pin(nvmtl_dcache *dc, nvmtl_xdc_ent *e)
+{
+    if (dc->npin == dc->cappin) {
+        const unsigned cap = dc->cappin ? dc->cappin * 2 : 32;
+        nvmtl_xdc_ent **g = (nvmtl_xdc_ent **)realloc(dc->pins, cap * sizeof *g);
+        if (!g) return -1;
+        dc->pins = g; dc->cappin = cap;
+    }
+    dc->pins[dc->npin++] = e; e->ref++;
+    return 0;
+}
+/* Unlinks and frees an unpinned entry (its set goes back to its pool). Called with g_xdc_lock held. */
+static void nvmtl_xdc_drop_locked(nvmtl_xdc_ent *e)
+{
+    const int i = (int)(e - g_xdc);
+    int *pp = &g_xdc_head[e->h & (NVMTL_XDC_NB - 1)];
+    while (*pp != -1 && *pp != i) pp = &g_xdc[*pp].next;
+    if (*pp == i) *pp = e->next;
+    pthread_mutex_lock(&g_desc_lock);
+    pvkFreeDescriptorSets(g_dev, e->pool, 1, &e->set);
+    pthread_mutex_unlock(&g_desc_lock);
+    free(e->k); e->k = NULL; e->used = 0; e->set = VK_NULL_HANDLE;
+    e->next = g_xdc_free; g_xdc_free = i; g_xdc_n--;
+}
+/* Looks the probe's key up for the page buffer pbuf (VK_NULL_HANDLE when the pipeline does not read binding 640).
+   A hit is pinned to this command buffer. */
+static VkDescriptorSet nvmtl_xdc_lookup(nvmtl_dc_probe *pr, VkBuffer pbuf, uint64_t sig, uint32_t *hi)
+{
+    if (!pr->dc || !pr->n) return VK_NULL_HANDLE;
+    const uint64_t h = nvmtl_xdc_hash(pr->h, pbuf);
+    VkDescriptorSet s = VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_xdc_lock);
+    nvmtl_xdc_init_locked();
+    for (int i = g_xdc_head[h & (NVMTL_XDC_NB - 1)], nx; i != -1; i = nx) {
+        nvmtl_xdc_ent *e = &g_xdc[i]; nx = e->next;
+        if (e->h != h || e->pbuf != pbuf || e->klen != pr->n || memcmp(e->k, pr->k, (size_t)pr->n * sizeof *pr->k)) continue;
+        if (e->sig != sig) {   /* one of its handles was destroyed since: drop it now if nobody holds it, look on */
+            g_xdc_stale++;
+            if (!e->ref) nvmtl_xdc_drop_locked(e);
+            continue;
+        }
+        if (nvmtl_xdc_pin(pr->dc, e)) break;
+        e->tick = ++g_xdc_tick; s = e->set; *hi = e->hi; g_xdc_hit++;
+        break;
+    }
+    if (!s) g_xdc_miss++;
+    pthread_mutex_unlock(&g_xdc_lock);
+    return s;
+}
+/* After a miss: hand set s (written for this probe, at c->sets[c->nsets - 1]) to the device-level cache. */
+static void nvmtl_xdc_insert(nvk_cmdbuf *c, const nvmtl_dc_probe *pr, VkDescriptorSet s, VkBuffer pbuf, uint64_t sig, uint32_t hi)
+{
+    if (!pr->dc || !pr->n || !c->nsets || (VkDescriptorSet)c->sets[c->nsets - 1].set != s || !c->sets[c->nsets - 1].pool) return;
+    uint64_t *k = (uint64_t *)malloc((size_t)pr->n * sizeof *k);
+    if (!k) return;
+    memcpy(k, pr->k, (size_t)pr->n * sizeof *k);
+    const uint64_t h = nvmtl_xdc_hash(pr->h, pbuf);
+    pthread_mutex_lock(&g_xdc_lock);
+    nvmtl_xdc_init_locked();
+    if (g_xdc_free == -1) {   /* full: a clock sweep evicts the first unpinned entry not used in the last 256 lookups */
+        for (unsigned step = 0; step < 2 * NVMTL_XDC_CAP && g_xdc_free == -1; step++) {
+            nvmtl_xdc_ent *e = &g_xdc[g_xdc_hand]; g_xdc_hand = (g_xdc_hand + 1) % NVMTL_XDC_CAP;
+            if (e->used && !e->ref && (step >= NVMTL_XDC_CAP || g_xdc_tick - e->tick > 256)) { nvmtl_xdc_drop_locked(e); g_xdc_evict++; }
+        }
+    }
+    if (g_xdc_free == -1 || nvmtl_xdc_pin(pr->dc, &g_xdc[g_xdc_free])) { g_xdc_full++; pthread_mutex_unlock(&g_xdc_lock); free(k); return; }
+    const int i = g_xdc_free; nvmtl_xdc_ent *e = &g_xdc[i]; g_xdc_free = e->next;
+    e->h = h; e->sig = sig; e->k = k; e->klen = pr->n; e->hi = hi; e->tick = ++g_xdc_tick; e->set = s;
+    e->pool = (VkDescriptorPool)c->sets[c->nsets - 1].pool; e->pbuf = pbuf; e->dep = pr->dep; e->used = 1;
+    e->next = g_xdc_head[h & (NVMTL_XDC_NB - 1)]; g_xdc_head[h & (NVMTL_XDC_NB - 1)] = i; g_xdc_n++; g_xdc_ins++;
+    c->sets[c->nsets - 1].pool = NULL;   /* the entry owns the set now: the command buffer's retire skips it */
+    pthread_mutex_unlock(&g_xdc_lock);
+}
+/* At command buffer retire, before its desc-cache is freed. */
+static void nvmtl_xdc_unpin(nvmtl_dcache *dc)
+{
+    if (!dc || !dc->npin) { if (dc) { free(dc->pins); dc->pins = NULL; dc->cappin = 0; } return; }
+    pthread_mutex_lock(&g_xdc_lock);
+    for (unsigned i = 0; i < dc->npin; i++) if (dc->pins[i]->ref) dc->pins[i]->ref--;
+    pthread_mutex_unlock(&g_xdc_lock);
+    free(dc->pins); dc->pins = NULL; dc->npin = dc->cappin = 0;
 }

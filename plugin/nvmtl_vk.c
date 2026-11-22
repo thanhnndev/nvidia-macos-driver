@@ -3022,12 +3022,51 @@ static nvmtl_btsh *nvmtl_btsh_take_locked(const void *key)
         if (g_btsh_ent[i].key == key) { nvmtl_btsh *s = g_btsh_ent[i].s; g_btsh_ent[i] = g_btsh_ent[--g_btsh_n]; return s; }
     return NULL;
 }
+/* WS-CPU 8.9: who makes the per-present VkBuffers and image views. NVMTL_CHURN_SITES=1 records the three callers above
+ * each create (backtrace) and the census prints the busiest sites; off, the hooks cost one load. Debug log only. */
+#include <execinfo.h>
+enum { NVMTL_CS_BUF, NVMTL_CS_VIEW, NVMTL_CS_N };
+#define NVMTL_CS_CAP 48
+typedef struct { void *f[3]; unsigned long long n, last; } nvmtl_churn_site;
+static nvmtl_churn_site g_cs[NVMTL_CS_N][NVMTL_CS_CAP]; static unsigned g_cs_n[NVMTL_CS_N];
+static pthread_mutex_t g_cs_lock = PTHREAD_MUTEX_INITIALIZER; static int g_cs_on = -1;
+static void nvmtl_churn_note(int kind)
+{
+    if (g_cs_on < 0) { const char *e = getenv("NVMTL_CHURN_SITES"); g_cs_on = e && *e == '1'; }
+    if (!g_cs_on) return;
+    void *bt[6]; const int n = backtrace(bt, 6);
+    void *f[3] = { n > 2 ? bt[2] : NULL, n > 3 ? bt[3] : NULL, n > 4 ? bt[4] : NULL };
+    pthread_mutex_lock(&g_cs_lock);
+    unsigned i = 0;
+    for (; i < g_cs_n[kind]; i++) if (!memcmp(g_cs[kind][i].f, f, sizeof f)) break;
+    if (i == g_cs_n[kind] && i < NVMTL_CS_CAP) { memcpy(g_cs[kind][i].f, f, sizeof f); g_cs_n[kind]++; }
+    if (i < NVMTL_CS_CAP) g_cs[kind][i].n++;
+    pthread_mutex_unlock(&g_cs_lock);
+}
+static void nvmtl_churn_sites_dump(double presents)
+{
+    if (g_cs_on != 1) return;
+    static const char *nm[NVMTL_CS_N] = { "VkBuffer", "image view" };
+    pthread_mutex_lock(&g_cs_lock);
+    for (int k = 0; k < NVMTL_CS_N; k++)
+        for (unsigned i = 0; i < g_cs_n[k]; i++) {
+            nvmtl_churn_site *c = &g_cs[k][i];
+            const unsigned long long d = c->n - c->last; c->last = c->n;
+            if (!d) continue;
+            char b[3][96];
+            for (int j = 0; j < 3; j++) { Dl_info di; b[j][0] = 0;
+                if (c->f[j] && dladdr(c->f[j], &di) && di.dli_sname) snprintf(b[j], sizeof b[j], "%s+%lu", di.dli_sname, (unsigned long)((char *)c->f[j] - (char *)di.dli_saddr));
+                else if (c->f[j]) snprintf(b[j], sizeof b[j], "%p", c->f[j]); }
+            nvlog_report("churn site %s: %.2f per present (%llu): %s <- %s <- %s", nm[k], d / presents, d, b[0], b[1], b[2]);
+        }
+    pthread_mutex_unlock(&g_cs_lock);
+}
 static PFN_vkCreateImageView g_btsh_real_cv; static PFN_vkDestroyImageView g_btsh_real_dv; static PFN_vkDestroyImage g_btsh_real_di;
 static PFN_vkCreateBuffer g_fc_real_cb; static PFN_vkDestroyBuffer g_fc_real_db;
 static VKAPI_ATTR VkResult VKAPI_CALL nvmtl_fc_create_buffer(VkDevice d, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *b)
 {
     VkResult r = g_fc_real_cb(d, ci, a, b);
-    if (r == VK_SUCCESS) nvmtl_vk_frame_census(NVC_BUF_NEW);
+    if (r == VK_SUCCESS) { nvmtl_vk_frame_census(NVC_BUF_NEW); nvmtl_churn_note(NVMTL_CS_BUF); }
     return r;
 }
 static VKAPI_ATTR void VKAPI_CALL nvmtl_fc_destroy_buffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks *a)
@@ -3038,7 +3077,7 @@ static VKAPI_ATTR void VKAPI_CALL nvmtl_fc_destroy_buffer(VkDevice d, VkBuffer b
 static VKAPI_ATTR VkResult VKAPI_CALL nvmtl_btsh_create_view(VkDevice d, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a, VkImageView *v)
 {
     VkResult r = g_btsh_real_cv(d, ci, a, v);
-    if (r == VK_SUCCESS) nvmtl_vk_frame_census(NVC_VIEW_NEW);
+    if (r == VK_SUCCESS) { nvmtl_vk_frame_census(NVC_VIEW_NEW); nvmtl_churn_note(NVMTL_CS_VIEW); }
     if (r == VK_SUCCESS && ci) nvmtl_audit_view_made((const void *)ci->image, (const void *)*v);
     if (r == VK_SUCCESS && ci && atomic_load(&g_btsh_live)) {
         pthread_mutex_lock(&g_btsh_lock);
@@ -3490,6 +3529,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
 static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
+static __thread const VkDescriptorBufferInfo *g_addr_pre; static __thread int g_addr_base0; static __thread uint32_t g_addr_dyn;
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym)
 {
@@ -3560,7 +3600,13 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
     VkBufferView tv[NVMTL_NBIND];
     VkDescriptorBufferInfo addressInfo;
     if (!g_mutable) tb = NULL;
-    if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) && nvmtl_address_snapshot(c, which, &addressInfo)) { c->skipped++; return VK_NULL_HANDLE; }
+    if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING)) {
+        /* nvmtl_snapshot_set_c may have taken this draw's table slot already (g_addr_pre), and may want binding 640
+           written at base offset 0 so the set fits any slot of the page (g_addr_base0; the slot goes in g_addr_dyn) */
+        if (g_addr_pre) { addressInfo = *g_addr_pre; g_addr_pre = NULL; }
+        else if (nvmtl_address_snapshot(c, which, &addressInfo)) { c->skipped++; return VK_NULL_HANDLE; }
+        if (g_addr_base0) { g_addr_dyn = (uint32_t)addressInfo.offset; addressInfo.offset = 0; }
+    }
     if (NVMTL_E78_HAS(mask, NVMTL_ADDRESS_BINDING) && nvmtl_bl_audit_on() && c->table)
         for (uint32_t i = 0; i < NVMTL_NBUF; i++) { const nvmtl_slot *sl = &((nvmtl_bindtable *)c->table)->s[which][i];
             if (sl->kind == NVMTL_SLOT_BUF && NVMTL_E78_HAS(mask, i)) nvmtl_audit_used(c, sl->h, sl->who, 500 + which * 1000 + i); }
@@ -3631,6 +3677,8 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
 /* WS-CPU 8.7 step 1 (2026-11-19): what a present costs in submits and object churn. CAWUS (commitAndWaitUntilSubmitted)
    is WindowServer's present path, so per-CAWUS ratios are per present. One line per 30 s through nvlog_report. */
 static _Atomic unsigned long long g_fc[NVC_N];
+/* WS-CPU 8.9: NVMTL_SNAP_TIMING=1 times every set snapshot (nvmtl_snapshot_set_c) */
+static int g_snap_timing = -1; static _Atomic unsigned long long g_snap_ns, g_snap_n;
 static _Atomic unsigned long long g_fc_t0;
 void nvmtl_vk_frame_census(int what)
 {
@@ -3641,7 +3689,10 @@ void nvmtl_vk_frame_census(int what)
     const unsigned long long now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     unsigned long long t0 = atomic_load(&g_fc_t0);
     if (!t0) { atomic_compare_exchange_strong(&g_fc_t0, &t0, now); return; }
-    if (now - t0 < 30000000000ull || !atomic_compare_exchange_strong(&g_fc_t0, &t0, now)) return;
+    static unsigned long long period;
+    if (!period) { const char *e = getenv("NVMTL_CENSUS_MS"); const long ms = e ? strtol(e, NULL, 10) : 0;
+                   period = (ms >= 1000 && ms <= 600000 ? (unsigned long long)ms : 30000ull) * 1000000ull; }
+    if (now - t0 < period || !atomic_compare_exchange_strong(&g_fc_t0, &t0, now)) return;
     static unsigned long long last[NVC_N], dclast[2];
     unsigned long long d[NVC_N];
     for (int i = 0; i < NVC_N; i++) { const unsigned long long v = atomic_load(&g_fc[i]); d[i] = v - last[i]; last[i] = v; }
@@ -3654,10 +3705,42 @@ void nvmtl_vk_frame_census(int what)
                  (double)(now - t0) / 1e9, d[NVC_COMMIT], d[NVC_CAWUS], d[NVC_WSCHED], d[NVC_WCOMP], d[NVC_SUBMIT],
                  d[NVC_COMMIT] / p, d[NVC_SUBMIT] / p, d[NVC_VIEW_NEW] / p, d[NVC_VIEW_DEL] / p, d[NVC_BUF_NEW] / p, d[NVC_BUF_DEL] / p,
                  dm / p, dh + dm ? 100.0 * (double)dm / (double)(dh + dm) : 0.0, dh + dm);
+    /* WS-CPU 8.9: the misses by class (nvmtl_dc_seen_classify) and the device-level cache */
+    static unsigned long long cl[12];
+    const unsigned long long cv[12] = { __atomic_load_n(&g_dc_c_new, __ATOMIC_RELAXED), __atomic_load_n(&g_dc_c_again, __ATOMIC_RELAXED),
+        __atomic_load_n(&g_dc_c_again_gimg, __ATOMIC_RELAXED), __atomic_load_n(&g_dc_c_again_gbuf, __ATOMIC_RELAXED),
+        __atomic_load_n(&g_dc_c_moved, __ATOMIC_RELAXED),
+        __atomic_load_n(&g_dc_stale, __ATOMIC_RELAXED), __atomic_load_n(&g_dc_page, __ATOMIC_RELAXED),
+        __atomic_load_n(&g_dc_long, __ATOMIC_RELAXED) + __atomic_load_n(&g_dc_full, __ATOMIC_RELAXED),
+        g_xdc_hit, g_xdc_stale, g_xdc_evict, g_xdc_full };
+    unsigned long long dc[12]; for (int i = 0; i < 12; i++) { dc[i] = cv[i] - cl[i]; cl[i] = cv[i]; }
+    nvlog_report("frame census misses per present: %.2f new key, %.2f written before and still valid (%.2f of them past a global image epoch, "
+                 "%.2f past a global buffer epoch), %.2f written before but a handle in it destroyed since, %.2f stale in this command buffer, "
+                 "%.2f address page, %.2f long/full; device-level cache: %.2f hits per present, %.2f stale, %.2f evicted, %.2f full, %u entries",
+                 dc[0] / p, dc[1] / p, dc[2] / p, dc[3] / p, dc[4] / p, dc[5] / p, dc[6] / p, dc[7] / p,
+                 dc[8] / p, dc[9] / p, dc[10] / p, dc[11] / p, g_xdc_n);
+    if (g_snap_timing == 1) {
+        static unsigned long long sl[2]; const unsigned long long sv[2] = { atomic_load(&g_snap_ns), atomic_load(&g_snap_n) };
+        const unsigned long long dns = sv[0] - sl[0], dn = sv[1] - sl[1]; sl[0] = sv[0]; sl[1] = sv[1];
+        nvlog_report("frame census set snapshots: %.1f us per present (%.2f per present, %.2f us each)", dns / 1e3 / p, dn / p, dn ? dns / 1e3 / dn : 0.0);
+    }
+    nvmtl_churn_sites_dump(p);
 }
 /* *dyn gets the dynamic offset of binding 640 that goes with the returned set (0 unless the desc-cache reused a set
    and moved its address table to a newer slot of the same page). */
+static VkDescriptorSet nvmtl_snapshot_set_c_body(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p, uint32_t *dyn);
+/* WS-CPU 8.9: NVMTL_SNAP_TIMING=1 times every set snapshot (draw/dispatch binding path); the census prints it per present. */
 static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p, uint32_t *dyn)
+{
+    if (g_snap_timing < 0) { const char *e = getenv("NVMTL_SNAP_TIMING"); g_snap_timing = e && *e == '1'; }
+    if (!g_snap_timing) return nvmtl_snapshot_set_c_body(c, which, p, dyn);
+    const unsigned long long t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    VkDescriptorSet s = nvmtl_snapshot_set_c_body(c, which, p, dyn);
+    atomic_fetch_add_explicit(&g_snap_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_snap_n, 1, memory_order_relaxed);
+    return s;
+}
+static VkDescriptorSet nvmtl_snapshot_set_c_body(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p, uint32_t *dyn)
 {
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     *dyn = 0;
@@ -3679,11 +3762,44 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     nvmtl_dc_probe pr;
     { VkDescriptorSet hit = nvmtl_dc_lookup(c, t, which, pm, hi > NVMTL_NSTEX ? NVMTL_NSTEX : hi, dcon, dyn, &pr);
       if (hit) { nvmtl_enc78_count(E78C_SETREUSE, 1); return hit; } }
+    /* WS-CPU 8.9: the device-level cache, for a key this command buffer has not written yet. A set that reads binding
+       640 is looked up for the page its table slot lands in, so the slot is taken first (and handed to set_md on a miss). */
+    const int xdc = dcon && pr.plain && pr.dc && nvmtl_xdc_on();
+    const int addr = NVMTL_E78_HAS(pm, NVMTL_ADDRESS_BINDING);
+    VkDescriptorBufferInfo ai = { VK_NULL_HANDLE, 0, 0 }; uint64_t xsig = pr.sig;
+    if (xdc) {
+        if (addr && nvmtl_address_snapshot(c, which, &ai)) { c->skipped++; return VK_NULL_HANDLE; }
+        if (addr) xsig += nvmtl_hep_get((const void *)ai.buffer);
+        uint32_t xhi = 0;
+        VkDescriptorSet xs = nvmtl_xdc_lookup(&pr, (VkBuffer)ai.buffer, xsig, &xhi);
+        if (xs && c->nsets == c->capsets) {
+            const unsigned cap = c->capsets ? c->capsets * 2 : 64;
+            nvk_setref *grown = (nvk_setref *)realloc(c->sets, cap * sizeof *grown);
+            if (grown) { c->sets = grown; c->capsets = cap; } else xs = VK_NULL_HANDLE;   /* still pinned: released at retire */
+        }
+        if (xs) {
+            c->sets[c->nsets++] = (nvk_setref){ NULL, xs };   /* not owned: the device-level entry frees it */
+            nvmtl_dc_insert(c, &pr, xs, xhi, addr, 1);
+            *dyn = addr ? (uint32_t)ai.offset : 0;
+            t->dyn[which] = *dyn;
+            t->last_dep[which] = pr.dep; t->last_ie[which] = pr.ie; t->last_be[which] = pr.be;
+            t->last[which] = xs; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = xhi; t->dirty[which] = 0;
+            memset(t->chg[which], 0, sizeof t->chg[which]);
+            memcpy(t->lastw[which], pm, sizeof t->lastw[which]);
+            nvmtl_enc78_count(E78C_SETREUSE, 1);
+            return xs;
+        }
+        nvmtl_dc_seen_classify(pr.h, xsig, pr.dep);
+    } else if (pr.plain) nvmtl_dc_seen_classify(pr.h, pr.sig, pr.dep);
+    /* A set for the device-level cache holds exactly what its key says (no bindings merged in from the last set, whose
+       handles the key and its signature would not cover), so it is written whole rather than copied from last[]. */
+    const int merge = live && !xdc;
     uint64_t m[4];
-    for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
-    if (live && t->last_hi[which] > hi) hi = t->last_hi[which];
+    for (int k = 0; k < 4; k++) m[k] = pm[k] | (merge ? t->lastw[which][k] : 0);
+    if (xdc && hi > NVMTL_NSTEX) hi = NVMTL_NSTEX;
+    if (merge && t->last_hi[which] > hi) hi = t->last_hi[which];
     VkDescriptorSet from = VK_NULL_HANDLE; uint64_t cm[4] = { 0, 0, 0, 0 };
-    if (live && nvmtl_dirty_only_on()) {
+    if (merge && nvmtl_dirty_only_on()) {
         from = t->last[which];
         for (int k = 0; k < 4; k++) cm[k] = t->lastw[which][k];
         for (uint32_t j = 0; j < NVMTL_NSTEX && NVMTL_STEX_BASE + j < 256; j++) {
@@ -3692,11 +3808,19 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         }
         for (int k = 0; k < 4; k++) cm[k] &= ~t->chg[which][k];
     }
+    g_addr_pre = (xdc && addr) ? &ai : NULL; g_addr_base0 = xdc; g_addr_dyn = 0;
     VkDescriptorSet s = nvmtl_snapshot_set_md(c, which, hi, m, NULL, from, from ? cm : NULL);
+    const uint32_t d0 = g_addr_dyn; g_addr_pre = NULL; g_addr_base0 = 0; g_addr_dyn = 0;
     if (!s) return s;
-    nvmtl_dc_insert(c, &pr, s, p->stex_hi[which] > NVMTL_NSTEX ? NVMTL_NSTEX : p->stex_hi[which], NVMTL_E78_HAS(pm, NVMTL_ADDRESS_BINDING));
-    t->dyn[which] = 0;
-    t->last_dep[which] = (uint8_t)(pr.dep | (live ? t->last_dep[which] : 0)); t->last_ie[which] = pr.ie; t->last_be[which] = pr.be;
+    const uint32_t ihi = p->stex_hi[which] > NVMTL_NSTEX ? NVMTL_NSTEX : p->stex_hi[which];
+    nvmtl_dc_insert(c, &pr, s, ihi, addr, xdc);
+    if (xdc) {
+        nvmtl_dc_seen_note(pr.h, xsig, pr.ie, pr.be);
+        nvmtl_xdc_insert(c, &pr, s, (VkBuffer)ai.buffer, xsig, ihi);
+    } else if (pr.plain) nvmtl_dc_seen_note(pr.h, pr.sig, pr.ie, pr.be);
+    *dyn = d0;
+    t->dyn[which] = d0;
+    t->last_dep[which] = (uint8_t)(pr.dep | (merge ? t->last_dep[which] : 0)); t->last_ie[which] = pr.ie; t->last_be[which] = pr.be;
     t->last[which] = s; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = hi; t->dirty[which] = 0;
     memset(t->chg[which], 0, sizeof t->chg[which]);
     memcpy(t->lastw[which], m, sizeof m);
@@ -6311,6 +6435,7 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
         pthread_mutex_lock(&g_desc_lock);
         for (unsigned i = 0; i < c->nsets;) {
             VkDescriptorPool p = (VkDescriptorPool)c->sets[i].pool; VkDescriptorSet run[256]; unsigned n = 0;
+            if (!p) { i++; continue; }   /* owned by the device-level desc-cache */
             while (i < c->nsets && c->sets[i].pool == (void *)p && n < 256) run[n++] = (VkDescriptorSet)c->sets[i++].set;
             pvkFreeDescriptorSets(g_dev, p, n, run);
         }
@@ -6318,7 +6443,8 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
     }
     free(c->sets); c->sets = NULL; c->nsets = c->capsets = 0; c->nobind = 0; c->skipped = 0;
     c->fetch_last_set = NULL;   // freed with the sets above
-    if (c->table) { free(((nvmtl_bindtable *)c->table)->dc); ((nvmtl_bindtable *)c->table)->dc = NULL; }
+    if (c->table) { nvmtl_xdc_unpin((nvmtl_dcache *)((nvmtl_bindtable *)c->table)->dc);
+                    free(((nvmtl_bindtable *)c->table)->dc); ((nvmtl_bindtable *)c->table)->dc = NULL; }
     free(c->table); c->table = NULL;
     nvmtl_address_page *page = c->address_pages;
     const int keep = nvmtl_keep_verdict(c->wseq);
