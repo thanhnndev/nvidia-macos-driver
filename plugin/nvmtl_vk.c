@@ -758,23 +758,33 @@ static int nvmtl_vk_initialize_body(void);
  * every launch. An inherited dir this process cannot use is also set aside here, so Mesa falls back to the user's
  * own (~/.cache/mesa_shader_cache) or the dir chosen below.
  */
-/* Writable for this process as Mesa will use it: checked with the effective uid (access() uses the real one, and
-   WindowServer runs with ruid 0, euid 88) and, for an existing dir, owned by that euid, since Mesa's disk cache turns
-   itself off for a dir it does not own (review of 5f302db). */
-static int nvmtl_dir_usable(const char *path, int create)
+/* Usable as Mesa will use it (mirrors disk_cache_euid_dir_ok, scripts/radv/radv-disk-cache-euid.patch): an absolute
+   path, lstat (no symlink), a directory owned by the effective uid with no group/other write bit, and writable by the
+   effective uid (access() uses the real one; WindowServer runs with ruid 0, euid 88). Returns NULL when usable, else
+   why not. create: make it (0700) when missing. Review of 5f302db / 5246c6f. */
+static const char *nvmtl_dir_unusable(const char *path, int create)
 {
     struct stat st;
-    if (stat(path, &st) != 0) return create && mkdir(path, 0700) == 0;
-    return S_ISDIR(st.st_mode) && st.st_uid == geteuid() && faccessat(AT_FDCWD, path, W_OK, AT_EACCESS) == 0;
+    if (!path || path[0] != '/') return "not an absolute path";
+    if (lstat(path, &st) != 0) {
+        if (!create) return "missing";
+        if (mkdir(path, 0700) != 0) return "cannot be created";
+        if (lstat(path, &st) != 0) return "missing after mkdir";
+    }
+    if (!S_ISDIR(st.st_mode)) return "not a directory (or a symlink)";
+    if (st.st_uid != geteuid()) return "owned by another user";
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) return "writable by group or others";
+    if (faccessat(AT_FDCWD, path, W_OK, AT_EACCESS) != 0) return "not writable";
+    return NULL;
 }
 static int nvmtl_vk_initialize(void)
 {
     if (g_state) return g_state == 1 ? 0 : -1;
     char *orig = getenv("MESA_SHADER_CACHE_DIR") ? strdup(getenv("MESA_SHADER_CACHE_DIR")) : NULL;
     if (orig && !getenv("NVMTL_NO_MESA_CACHE_DIR")) {
-        const int usable = nvmtl_dir_usable(orig, 1);
-        if (!usable) { unsetenv("MESA_SHADER_CACHE_DIR");
-            nvlog("vk: %s: inherited MESA_SHADER_CACHE_DIR %s is not writable here - set aside for this process", getprogname(), orig); }
+        const char *why = nvmtl_dir_unusable(orig, 1);
+        if (why) { unsetenv("MESA_SHADER_CACHE_DIR");
+            nvlog("vk: %s: inherited MESA_SHADER_CACHE_DIR %s is not usable by Mesa here (%s) - set aside for this process", getprogname(), orig, why); }
     }
     const int r = nvmtl_vk_initialize_body();
     if (orig) setenv("MESA_SHADER_CACHE_DIR", orig, 1); else unsetenv("MESA_SHADER_CACHE_DIR");
@@ -795,10 +805,10 @@ static int nvmtl_vk_initialize_body(void)
             char ucd[PATH_MAX], dir[PATH_MAX];
             const size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd);
             if (n > 0 && n <= sizeof ucd && snprintf(dir, sizeof dir, "%snvmtl-mesa", ucd) < (int)sizeof dir) {
-                mkdir(dir, 0700);
-                if (nvmtl_dir_usable(dir, 0)) { setenv("MESA_SHADER_CACHE_DIR", dir, 1);
+                const char *why = nvmtl_dir_unusable(dir, 1);
+                if (!why) { setenv("MESA_SHADER_CACHE_DIR", dir, 1);
                     nvlog("vk: %s has no writable HOME (%s) - Mesa shader disk cache at %s", getprogname(), home ?: "unset", dir); }
-                else nvlog("vk: %s: no writable Mesa cache dir (%s) - NAK recompiles every start", getprogname(), dir);
+                else nvlog("vk: %s: no usable Mesa cache dir (%s: %s) - shaders recompile every start", getprogname(), dir, why);
             }
         }
     }
@@ -3797,8 +3807,8 @@ static VkDescriptorSet nvmtl_snapshot_set_c_body(nvk_cmdbuf *c, uint32_t which, 
             nvmtl_enc78_count(E78C_SETREUSE, 1);
             return xs;
         }
-        nvmtl_dc_seen_classify(pr.h, xsig, pr.dep);
-    } else if (pr.plain) nvmtl_dc_seen_classify(pr.h, pr.sig, pr.dep);
+        if (nvmtl_dc_classify_on()) nvmtl_dc_seen_classify(pr.h, xsig, pr.dep);
+    } else if (pr.plain && nvmtl_dc_classify_on()) nvmtl_dc_seen_classify(pr.h, pr.sig, pr.dep);
     /* A set for the device-level cache holds exactly what its key says (no bindings merged in from the last set, whose
        handles the key and its signature would not cover), so it is written whole rather than copied from last[]. */
     const int merge = live && !xdc;
@@ -3823,9 +3833,9 @@ static VkDescriptorSet nvmtl_snapshot_set_c_body(nvk_cmdbuf *c, uint32_t which, 
     const uint32_t ihi = p->stex_hi[which] > NVMTL_NSTEX ? NVMTL_NSTEX : p->stex_hi[which];
     nvmtl_dc_insert(c, &pr, s, ihi, addr, xdc);
     if (xdc) {
-        nvmtl_dc_seen_note(pr.h, xsig, pr.ie, pr.be);
+        if (nvmtl_dc_classify_on()) nvmtl_dc_seen_note(pr.h, xsig, pr.ie, pr.be);
         nvmtl_xdc_insert(c, &pr, s, (VkBuffer)ai.buffer, xsig, ihi);
-    } else if (pr.plain) nvmtl_dc_seen_note(pr.h, pr.sig, pr.ie, pr.be);
+    } else if (pr.plain && nvmtl_dc_classify_on()) nvmtl_dc_seen_note(pr.h, pr.sig, pr.ie, pr.be);
     *dyn = d0;
     t->dyn[which] = d0;
     t->last_dep[which] = (uint8_t)(pr.dep | (merge ? t->last_dep[which] : 0)); t->last_ie[which] = pr.ie; t->last_be[which] = pr.be;
@@ -4204,7 +4214,13 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
         return hit[0] == (id)[NSNull null] ? nil : hit[0];
     }
     uint32_t got[4] = {0};
+    /* WS-CPU 8.9: NVMTL_PIPE_TIMING=1 logs every uncached address lowering (translator) with its size and time: the
+       warm pipeline cost (120-200 ms per Core Animation fragment specialization, lowered twice) in our own process. */
+    static int pt = -1; if (pt < 0) { const char *e = getenv("NVMTL_PIPE_TIMING"); pt = e && *e == '1'; }
+    const uint64_t pt0 = pt ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     NSData *d = nvmtl_address_shader_g_uncached(data, len, flags, got);
+    if (pt) nvlog_report("pipe timing: address lowering (translator, uncached) %zu -> %lu B, flags %u: %.2f ms", len, (unsigned long)d.length, flags,
+                         (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - pt0) / 1e6);
     if (info) memcpy(info, got, sizeof got);
     pthread_mutex_lock(&lk);
     if (!cache || cache.count >= 4096) cache = [NSMutableDictionary new];

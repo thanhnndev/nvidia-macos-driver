@@ -213,6 +213,15 @@ static int nvmtl_dc_stale(const nvmtl_dc_ent *e)
  * "again" also says how many of those the old global epochs would have thrown away (img/buf moved).
  * Diagnostic only: it decides nothing. */
 #define NVMTL_DC_SEEN 8192
+/* Off unless NVMTL_DC_CLASSIFY=1 or the device-level cache is on: the seen table (192 KB) is not touched otherwise
+   (review of 921113d). The census then prints zeros for the classes. */
+static int nvmtl_xdc_on(void);
+static int nvmtl_dc_classify_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_DC_CLASSIFY"); on = (e && *e == '1') || nvmtl_xdc_on(); }
+    return on;
+}
 typedef struct { uint64_t h, sig; uint32_t ie, be; } nvmtl_dc_seen_ent;
 static nvmtl_dc_seen_ent g_dc_seen[NVMTL_DC_SEEN];
 static uint64_t g_dc_c_new, g_dc_c_again, g_dc_c_moved, g_dc_c_again_gimg, g_dc_c_again_gbuf;

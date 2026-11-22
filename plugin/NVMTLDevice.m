@@ -1145,6 +1145,15 @@ static void nvmtl_sk_drop(NSMutableDictionary *keep, NVMTLSurfKey *k, unsigned w
 // guarded by @synchronized(device): two devices in one process (review of 7ceff16) would mutate them concurrently, so
 // they take this lock too, always inside the device lock (device -> g_sk_lock, never the other way).
 static pthread_mutex_t g_sk_lock = PTHREAD_MUTEX_INITIALIZER;
+// Inserting over an existing entry would release the old texture (its Vulkan image and IOSurface) right here, under
+// the device lock and g_sk_lock: the old entry goes to the bag first, released off this thread (review of 5246c6f).
+static void nvmtl_sk_put(NSMutableDictionary *keep, NVMTLSurfKey *key, NVMTLSurfKeep *e) {
+    NVMTLSurfKeep *old = keep[key];
+    if (old) { if (!nvmtl_sk_bag) nvmtl_sk_bag = [NSMutableArray new]; [nvmtl_sk_bag addObject:old]; }
+    else [nvmtl_sk_live addObject:@(key->_sid)];
+    keep[key] = e;
+}
+static void nvmtl_sk_release_bag(void);
 static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
     pthread_mutex_lock(&g_sk_lock);
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
@@ -1204,8 +1213,8 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     if (key && now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8) {
         nvmtl_sk.sweepSkips++;
         NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
-        if (!keep[key]) [nvmtl_sk_live addObject:@(key->_sid)];
-        keep[key] = e;
+        nvmtl_sk_put(keep, key, e);
+        nvmtl_sk_release_bag();
         nvmtl_sk_report(keep, now);
         return;
     }
@@ -1296,8 +1305,7 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     if (nvmtl_sk.drops - drops0 > nvmtl_sk.maxSweepDrops) nvmtl_sk.maxSweepDrops = nvmtl_sk.drops - drops0;
     if (key) {
         NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
-        if (!keep[key]) [nvmtl_sk_live addObject:@(key->_sid)];
-        keep[key] = e;
+        nvmtl_sk_put(keep, key, e);
     }
     nvmtl_sk_release_bag();
     const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
