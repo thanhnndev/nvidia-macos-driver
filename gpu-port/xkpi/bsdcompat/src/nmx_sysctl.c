@@ -306,8 +306,13 @@ static int run(struct sysctl_oid *o, struct rw_ctx *c, size_t newlen, size_t *ou
     req.newfunc = rw_in;
     req.newptr = c->val;
     req.newlen = newlen;
-    struct thread *etd = nmx_entry_begin();     /* a user thread runs driver code here (review of fdffd32) */
-    int err = o->oid_handler(o, o->oid_arg1, o->oid_arg2, &req);
+    struct thread *etd;     /* a user thread runs driver code here (review of fdffd32) */
+    int err = nmx_entry_try(&etd);
+    if (err != 0) {     /* not started or stopping: the handler is not run (review of 0266402) */
+        *outlen = 0;
+        return err;
+    }
+    err = o->oid_handler(o, o->oid_arg1, o->oid_arg2, &req);
     nmx_entry_end(etd);
     *outlen = req.oldidx;
     return err;

@@ -25,10 +25,11 @@ extern "C" long long nmx_fb_flip_call(const char *name, void *req);
 /* review of fdffd32: a user thread running driver code outside the device node is counted like a device-node entry, so
  * nmx_proc_reap keeps its Linux task while it is inside (nmx_kernel.c) */
 struct thread;
-extern "C" struct thread *nmx_entry_begin(void);    /* NULL before the port started (sysctls are registered earlier) */
+/* 0 = inside; ENXIO = the port is not started or is stopping: run no driver code (review of 0266402) */
+extern "C" int nmx_entry_try(struct thread **td);
 extern "C" void nmx_entry_end(struct thread *td);
-struct NmxEntry { struct thread *td; NmxEntry() : td(nmx_entry_begin()) {} ~NmxEntry() { nmx_entry_end(td); }
-                  NmxEntry(const NmxEntry &) = delete; };
+struct NmxEntry { struct thread *td = nullptr; int err; NmxEntry() : err(nmx_entry_try(&td)) {}
+                  ~NmxEntry() { if (!err) nmx_entry_end(td); } NmxEntry(const NmxEntry &) = delete; };
 /* frame-path trace (nmx_fb_bridge.c): the timer's phase against the real vblank */
 extern "C" void nmx_ft_vbl_timer(uint64_t frame_ns);
 /* out-31 row 2 (nmx_fb_bridge.c): CRTC vblank sink and the DRM vblank reference; debug.nmx_vbl_irq / nmxvblirq=0 */
@@ -562,7 +563,7 @@ public:
         /* ga403wm Step98/99: the NMXAccel page-flip API (nmx_fb_bridge.c) */
         if (fn && !fStopping) {
             long long fr;
-            { NmxEntry entry; fr = nmx_fb_flip_call(fn->getCStringNoCopy(), p1); }
+            { NmxEntry entry; if (entry.err) return kIOReturnNotReady; fr = nmx_fb_flip_call(fn->getCStringNoCopy(), p1); }
             if (fr >= 0)
                 return (IOReturn)fr;
         }
@@ -726,7 +727,7 @@ public:
         if (attribute == kIOWindowServerActiveAttribute) { trace("setAttribute wsrv", value); return kIOReturnSuccess; }
         if (attribute == kIOPowerAttribute) {
             /* display sleep turns the outputs off; wake lights them again with the same buffer */
-            if (fDev) { NmxEntry entry; nmx_fb_power(fDev, value != 0); }
+            if (fDev) { NmxEntry entry; if (!entry.err) nmx_fb_power(fDev, value != 0); }     /* stopping: outputs go with the driver */
             if (value) {
                 IOReturn r = IOFramebuffer::setAttribute(attribute, value);
                 handleEvent(kIOFBNotifyDidPowerOn);

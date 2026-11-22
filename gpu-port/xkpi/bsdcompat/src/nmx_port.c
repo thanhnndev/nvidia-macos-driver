@@ -17,6 +17,8 @@
 int nmx_kernel_init(void);
 void nmx_acpica_reread(void);
 void nmx_kernel_fini(void);
+void nmx_entry_open_now(void);
+void nmx_entry_close_and_drain(void);
 int nmx_malloc_init(void);
 void nmx_malloc_fini(void);
 int nmx_page_init(void);
@@ -45,11 +47,16 @@ int nmx_port_start(void)
     STEP(nmx_xnu_devfs_init());
     STEP(nmx_sysinit_run());
 #undef STEP
+    nmx_entry_open_now();     /* sysctl and framebuffer entries run driver code only from here on */
     return 0;
 }
 
 void nmx_port_stop(void)
 {
+    /* review of 0266402: entries close and drain before anything goes (a sysctl handler in flight would otherwise
+     * reach malloc after nmx_malloc_fini freed big_lock); the registry lock they count under is freed last */
+    if (stage >= 1)
+        nmx_entry_close_and_drain();
     if (stage >= 8)
         nmx_sysuninit_run();
     if (stage >= 7)

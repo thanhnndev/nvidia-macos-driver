@@ -174,16 +174,17 @@ static int nmx_grab_sysctl SYSCTL_HANDLER_ARGS
 /* review of fdffd32: a user thread running driver code outside the device node is counted like a device-node entry, so
  * nmx_proc_reap keeps its Linux task while it is inside (nmx_kernel.c) */
 struct thread;
-extern "C" struct thread *nmx_entry_begin(void);    /* NULL before the port started (sysctls are registered earlier) */
+/* 0 = inside; ENXIO = the port is not started or is stopping: run no driver code (review of 0266402) */
+extern "C" int nmx_entry_try(struct thread **td);
 extern "C" void nmx_entry_end(struct thread *td);
-struct NmxEntry { struct thread *td; NmxEntry() : td(nmx_entry_begin()) {} ~NmxEntry() { nmx_entry_end(td); }
-                  NmxEntry(const NmxEntry &) = delete; };
+struct NmxEntry { struct thread *td = nullptr; int err; NmxEntry() : err(nmx_entry_try(&td)) {}
+                  ~NmxEntry() { if (!err) nmx_entry_end(td); } NmxEntry(const NmxEntry &) = delete; };
 extern "C" int nmx_pin_by_proc_format(char *buf, size_t size);
 static int nmx_pin_by_proc_sysctl SYSCTL_HANDLER_ARGS
 {
     char buf[512];
     int n;
-    { NmxEntry entry; n = nmx_pin_by_proc_format(buf, sizeof buf); }
+    { NmxEntry entry; if (entry.err) return entry.err; n = nmx_pin_by_proc_format(buf, sizeof buf); }
     if (n < 0) n = 0;
     if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
     buf[n] = 0;
@@ -197,8 +198,9 @@ static int nmx_frametrace_sysctl SYSCTL_HANDLER_ARGS
     const size_t size = 96 * 1024;
     char *buf = (char *)IOMalloc(size);
     if (!buf) return ENOMEM;
-    int n;
-    { NmxEntry entry; n = nmx_ft_format(buf, size); }
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_ft_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
     if (n < 0) n = 0;
     int err = SYSCTL_OUT(req, buf, (size_t)n);
     IOFree(buf, size);
@@ -211,7 +213,7 @@ static int nmx_userwire_by_kind_sysctl SYSCTL_HANDLER_ARGS
 {
     char buf[1024];
     int n;
-    { NmxEntry entry; n = nmx_userwire_format(buf, sizeof buf); }
+    { NmxEntry entry; if (entry.err) return entry.err; n = nmx_userwire_format(buf, sizeof buf); }
     if (n < 0) n = 0;
     if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
     buf[n] = 0;
@@ -318,8 +320,9 @@ static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
     const size_t size = 16 * 1024;
     char *buf = (char *)IOMalloc(size);
     if (!buf) return ENOMEM;
-    int n;
-    { NmxEntry entry; n = nmx_gtt_format(buf, size); }
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_gtt_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
     if (n < 0) n = 0;
     int err = SYSCTL_OUT(req, buf, (size_t)n);
     IOFree(buf, size);
@@ -339,8 +342,9 @@ static int nmx_tt_census_sysctl SYSCTL_HANDLER_ARGS
         return SYSCTL_OUT(req, NULL, size);
     char *buf = (char *)IOMalloc(size);
     if (!buf) return ENOMEM;
-    int n;
-    { NmxEntry entry; n = nmx_tt_census_format(buf, size); }
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_tt_census_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
     if (n < 0) n = 0;
     if ((size_t)n > size) n = (int)size;
     int err = SYSCTL_OUT(req, buf, (size_t)n);

@@ -58,7 +58,8 @@ void nmx_thread_entry_enter(struct thread *td);
 void nmx_thread_entry_leave(struct thread *td);
 /* the same bracket for entries that are not device-node calls (sysctl handlers, framebuffer calls): curthread's record,
  * nothing in interrupt context */
-struct thread *nmx_entry_begin(void);     /* NULL in interrupt context or before the port started: pass it to end */
+/* 0: inside, pass *td to nmx_entry_end; ENXIO: the port is not started or is stopping, run no driver code */
+int nmx_entry_try(struct thread **td);
 void nmx_entry_end(struct thread *td);
 /* runs fn(arg) under the registry lock if td still belongs to p (not reparented by nmx_proc_reap); -1 if it does not */
 int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg);

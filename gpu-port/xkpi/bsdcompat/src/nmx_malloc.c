@@ -40,7 +40,18 @@ struct big_rec {
     struct big_rec *next;
 };
 static struct big_rec *big_table[BIG_BUCKETS];
+/* Invariant: big_lock (a spin lock that does NOT disable interrupts) is never taken in primary interrupt context. No
+ * malloc/free of a block >= PAGE_SIZE runs there (LinuxKPI's GFP_ATOMIC allocations in IRQ handlers are small, and
+ * amdgpu's IRQ work runs in threads); one that did could spin forever on a lock its own CPU holds. Checked on
+ * every take: a named panic instead of a silent spin (review of 0266402). */
 static lck_spin_t *big_lock;
+extern boolean_t ml_at_interrupt_context(void);
+static inline void big_lock_take(void)
+{
+    if (__builtin_expect(ml_at_interrupt_context(), 0))
+        panic("NullMoth xkpi: big_lock taken in interrupt context (malloc/free of a page-sized block)");
+    lck_spin_lock(big_lock);
+}
 
 /*
  * Single-page blocks freed are kept (up to NMX_PAGE_KEEP) and handed out again, with their record, instead of an
@@ -87,7 +98,7 @@ void *malloc(size_t size, struct malloc_type *type, int flags)
         size_t rounded = round_page(size);
         if (rounded == PAGE_SIZE) {
             struct big_rec *kept = NULL;
-            lck_spin_lock(big_lock);
+            big_lock_take();
             if (page_keep_n) {
                 kept = page_keep[--page_keep_n];
                 page_keep_hits++;
@@ -120,7 +131,7 @@ void *malloc(size_t size, struct malloc_type *type, int flags)
         rec->type = type;
         rec->contig = 0;
         unsigned b = big_bucket(p);
-        lck_spin_lock(big_lock);
+        big_lock_take();
         rec->next = big_table[b];
         big_table[b] = rec;
         lck_spin_unlock(big_lock);
@@ -148,7 +159,7 @@ void *malloc(size_t size, struct malloc_type *type, int flags)
 static struct big_rec *big_take(void *addr)
 {
     unsigned b = big_bucket(addr);
-    lck_spin_lock(big_lock);
+    big_lock_take();
     for (struct big_rec **pp = &big_table[b]; *pp; pp = &(*pp)->next) {
         if ((*pp)->addr == addr) {
             struct big_rec *r = *pp;
@@ -165,7 +176,7 @@ static size_t big_size(const void *addr)
 {
     size_t size = 0;
     unsigned b = big_bucket(addr);
-    lck_spin_lock(big_lock);
+    big_lock_take();
     for (struct big_rec *r = big_table[b]; r; r = r->next)
         if (r->addr == addr) { size = r->size; break; }
     lck_spin_unlock(big_lock);
@@ -182,7 +193,7 @@ void free(void *addr, struct malloc_type *type)
             account(r->type, -(int64_t)r->size);
             if (!r->contig && r->size == PAGE_SIZE) {
                 int kept = 0;
-                lck_spin_lock(big_lock);
+                big_lock_take();
                 if (page_keep_n < NMX_PAGE_KEEP) {
                     page_keep[page_keep_n++] = r;
                     kept = 1;
@@ -224,7 +235,7 @@ int nmx_malloc_note_contig(void *addr, size_t size, struct malloc_type *type)
     rec->type = type;
     rec->contig = 1;
     unsigned b = big_bucket(addr);
-    lck_spin_lock(big_lock);
+    big_lock_take();
     rec->next = big_table[b];
     big_table[b] = rec;
     lck_spin_unlock(big_lock);

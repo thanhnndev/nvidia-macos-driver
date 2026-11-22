@@ -38,6 +38,8 @@ static char theproc[64];
 static void *current_proc(void) { return theproc; }
 static int proc_pid(void *p) { return 42; }
 static void proc_name(int pid, char *b, int n) { strncpy(b, "test", n); }
+typedef void *proc_t;
+static int proc_exiting(proc_t p) { return 0; }   // nmx_curproc_lock: an exiting process goes to kernproc at once (review of 0266402)
 static struct proc nmx_kernproc_rec_ = { 0 };
 #define pid_t int
 #define bzero(p,n) memset(p,0,n)
