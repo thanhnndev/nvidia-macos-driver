@@ -1163,6 +1163,8 @@ static size_t nvmtl_sk_bytes(NVMTLTexture *b) { return b->_surf ? IOSurfaceGetAl
 // every idle entry the GPU has not touched for that long, so the extra room only holds surfaces in use.
 // 2026-11-08 YouTube spindump: 46 % of the WS main thread was re-imports of entries idle 4-9 s at the drop (mostly
 // 2880x1800 layers) that came back right after; NVMTL_KEEP_MS is now 30 s, NVMTL_KEEP_IDLE_MAX / _MB still bound it.
+static void nvmtl_surface_keep_timer(id dev);
+// key == nil: a sweep only (the idle timer below), nothing inserted and no miss counted.
 static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1, sweepMs = -1, keepSmallMs = -1, smallBytes = -1; static uint64_t keepIdleBytes, lastSweep; static int dropDead = -1;
     if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 30000;
@@ -1183,10 +1185,11 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     if (!nvmtl_sk_live) { nvmtl_sk_live = [NSCountedSet new]; nvmtl_sk_gone = [NSMutableDictionary new]; }
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), now = t0 / 1000000ull;
-    nvmtl_sk_miss(keep, key);
+    nvmtl_surface_keep_timer(dev);
+    if (key) nvmtl_sk_miss(keep, key);
     // The sweep walks every entry (849 us average at 600 entries, YouTube 2026-11-08). Once per NVMTL_KEEP_SWEEP_MS
     // (100 ms) is enough for 30 s idle times; a table well over the cap sweeps at once.
-    if (now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8) {
+    if (key && now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8) {
         nvmtl_sk.sweepSkips++;
         NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
         if (!keep[key]) [nvmtl_sk_live addObject:@(key->_sid)];
@@ -1279,13 +1282,44 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     }
     nvmtl_sk.idleBytes = idleBytes;
     if (nvmtl_sk.drops - drops0 > nvmtl_sk.maxSweepDrops) nvmtl_sk.maxSweepDrops = nvmtl_sk.drops - drops0;
-    NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
-    if (!keep[key]) [nvmtl_sk_live addObject:@(key->_sid)];
-    keep[key] = e;
+    if (key) {
+        NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
+        if (!keep[key]) [nvmtl_sk_live addObject:@(key->_sid)];
+        keep[key] = e;
+    }
     nvmtl_sk_release_bag();
     const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
     nvmtl_sk.sweeps++; nvmtl_sk.sweepNsSum += dt; if (dt > nvmtl_sk.sweepNsMax) nvmtl_sk.sweepNsMax = dt;
     nvmtl_sk_report(keep, now);
+}
+// 2026-11-22: the sweep above ran only when a new wrapper was inserted (a keep miss). With the display asleep or a static
+// desktop nothing is inserted, so entries past NVMTL_KEEP_MS were never dropped: WindowServer kept 79 entries for
+// 10+ minutes after the display slept (the surfaces' memory stays allocated while a backing holds it, and their GPU
+// shadows stay in GTT: 810 MB gtt_resident with the screen off). A timer now sweeps every NVMTL_KEEP_TIMER_MS (5000,
+// 0 = off) while the table has entries, under the same @synchronized(device) as the insert path; drops are released
+// off this queue as before. Started by the first insert; it stops itself when the table is empty and the next insert
+// starts it again.
+static void nvmtl_surface_keep_timer(id dev) {
+    static dispatch_source_t timer; static long periodMs = -1;
+    if (periodMs < 0) { const char *e = getenv("NVMTL_KEEP_TIMER_MS"); periodMs = e ? atol(e) : 5000; }
+    if (periodMs <= 0 || timer) return;
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.surface-keep.sweep", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    __weak id wdev = dev;
+    dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(s, dispatch_time(DISPATCH_TIME_NOW, (int64_t)periodMs * NSEC_PER_MSEC), (uint64_t)periodMs * NSEC_PER_MSEC,
+                              (uint64_t)periodMs * NSEC_PER_MSEC / 2);   // wide leeway: coalesced with other wakeups
+    dispatch_source_set_event_handler(s, ^{
+        id d = wdev;
+        if (!d) { dispatch_source_cancel(s); return; }   // the device is gone (timer stays non-nil: nothing restarts it)
+        @synchronized (d) {   // the insert path tests and sets the timer under this lock too
+            NSMutableDictionary *keep = objc_getAssociatedObject(d, &nvmtl_surface_keep_key);
+            if (keep.count) nvmtl_surface_keep(d, nil, nil);
+            if (!keep.count) { dispatch_source_cancel(s); timer = nil; }
+        }
+    });
+    timer = s;
+    dispatch_resume(s);
 }
 // Whether a shader can write this surface texture: a storage image, or one nvmtl_storage_view_for (NVMTLObjects.m) can
 // write through an optimal-tiled storage twin. Same eligibility as that function, so Core Image sees what will work.
