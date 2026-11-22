@@ -1165,10 +1165,12 @@ static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
 }
 static void nvmtl_sk_release_bag(void) {
     if (!nvmtl_sk_bag.count) return;
-    NSArray *bag = nvmtl_sk_bag; nvmtl_sk_bag = nil;
+    /* The bag moves into the block's __block storage (the only strong reference once this frame returns) and the block
+       drops it itself on q: the release, and the textures' deallocs, run there, never on the caller (review of 27611e6). */
+    __block NSArray *bag = nvmtl_sk_bag; nvmtl_sk_bag = nil;
     static dispatch_queue_t q; static dispatch_once_t once;
     dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.surface-keep.release", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
-    dispatch_async(q, ^{ (void)bag.count; });   // the last reference goes with this block, on q
+    dispatch_async(q, ^{ bag = nil; });
 }
 static size_t nvmtl_sk_bytes(NVMTLTexture *b) { return b->_surf ? IOSurfaceGetAllocSize(b->_surf) : 0; }
 // Idle (unheld, host-imported) entries: at least NVMTL_KEEP_IDLE (48), then up to NVMTL_KEEP_IDLE_MB (1024 MB) of

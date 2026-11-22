@@ -762,14 +762,23 @@ static int nvmtl_vk_initialize_body(void);
    path, lstat (no symlink), a directory owned by the effective uid with no group/other write bit, and writable by the
    effective uid (access() uses the real one; WindowServer runs with ruid 0, euid 88). Returns NULL when usable, else
    why not. create: make it (0700) when missing. Review of 5f302db / 5246c6f. */
+/* Mesa applies the strict rule only in a set-id process (__normal_user(): euid != ruid or egid != rgid; WindowServer).
+   Everywhere else it only needs a writable dir (it creates it with mkdir -p), so the strict checks run only there
+   (review of 27611e6). A dir another process created between our lstat and mkdir (EEXIST) is checked as found. */
 static const char *nvmtl_dir_unusable(const char *path, int create)
 {
     struct stat st;
+    const int strict = geteuid() != getuid() || getegid() != getgid();
     if (!path || path[0] != '/') return "not an absolute path";
     if (lstat(path, &st) != 0) {
         if (!create) return "missing";
-        if (mkdir(path, 0700) != 0) return "cannot be created";
+        if (mkdir(path, 0700) != 0 && errno != EEXIST) return "cannot be created";
         if (lstat(path, &st) != 0) return "missing after mkdir";
+    }
+    if (!strict) {   /* a symlink to a dir is fine here, as for Mesa */
+        if (S_ISLNK(st.st_mode) && stat(path, &st) != 0) return "dangling symlink";
+        if (!S_ISDIR(st.st_mode)) return "not a directory";
+        return faccessat(AT_FDCWD, path, W_OK, AT_EACCESS) != 0 ? "not writable" : NULL;
     }
     if (!S_ISDIR(st.st_mode)) return "not a directory (or a symlink)";
     if (st.st_uid != geteuid()) return "owned by another user";
@@ -4200,6 +4209,71 @@ static int nvmtl_spirv_ssbo_table(const void *spv, size_t n)
 }
 #define NVMTL_LOWER_ALL 16u   /* translator flag: lower every buffer, also the ones kept on descriptors */
 static _Atomic unsigned long long g_g1_refused;
+/* WS-CPU 9.2: disk cache of the address lowering (translator nvmtl_lower_buffer_addresses_ex + our physical-bounds /
+   helper / read-only passes). WindowServer lowered each Core Animation specialization at every start (120-200 ms each,
+   twice for an align-guarded one: flags 0, then flags 1), after the fc cache had already served the SPIR-V from disk.
+   Entries live in the spvcache folder (same owner, same trimmer) as <sha256>.low1.<translator tag>.c3.spv. The key
+   is SHA-256 over: the input SPIR-V, the effective flags, the table mode (UBO/SSBO), the align guard, the plugin's own
+   image UUID and the NVMTL_* knobs that change the emitted code (list below; the translator reads several).
+   File: "NVLW" | u32 version 1 | u32 status (1 = module, 0 = refused/nil) | u32 info[4] | SPIR-V.
+   NVMTL_LOWER_DISKCACHE=0 turns it off. A torn or foreign file is a miss (and is rewritten). */
+static _Atomic unsigned long g_low_hit, g_low_miss, g_low_stored, g_low_bad;
+static NSString *nvmtl_lower_disk_path(const void *data, size_t len, uint32_t flags) {
+    static int on = -1; static unsigned char envh[CC_SHA256_DIGEST_LENGTH]; static char self[1200];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_LOWER_DISKCACHE"); on = !(e && e[0] == '0');
+        extern char **environ; CC_SHA256_CTX c; CC_SHA256_Init(&c);
+        NSMutableArray *kv = [NSMutableArray array];
+        /* The knobs that change what the translator or our passes emit (the translator's getenv list: NVMTL_NO_*,
+           NVMTL_MATRIX8*, NVMTL_WG_*, NVMTL_I64*, NVMTL_ARGBUF*, NVMTL_XLATE*, NVMTL_B78*; ours: NVMTL_TABLE_*). Not
+           every NVMTL_*: log paths, census and trace switches differ per process and would split the cache. */
+        static const char *const pre[] = { "NVMTL_NO_", "NVMTL_MATRIX8", "NVMTL_WG_", "NVMTL_I64", "NVMTL_ARGBUF", "NVMTL_XLATE",
+                                           "NVMTL_B78", "NVMTL_TABLE_" };
+        for (char **p = environ; p && *p; p++)
+            for (size_t i = 0; i < sizeof pre / sizeof *pre; i++) if (!strncmp(*p, pre[i], strlen(pre[i]))) { [kv addObject:@(*p)]; break; }
+        [kv sortUsingSelector:@selector(compare:)];
+        for (NSString *x in kv) { const char *u = x.UTF8String; CC_SHA256_Update(&c, u, (CC_LONG)strlen(u) + 1); }
+        CC_SHA256_Final(envh, &c);
+        nvmtl_image_ident((const void *)&nvmtl_lower_disk_path, self, sizeof self);
+        nvlog("lower cache: %s (NVMTL_LOWER_DISKCACHE=%s, %lu code-changing NVMTL_* knobs in the key)", on ? "disk ON" : "disk OFF",
+              e ? e : "unset", (unsigned long)kv.count);
+    });
+    if (!on || !nvmtl_xlate_ready() || !xlate_lower || !data || !len) return nil;
+    const uint32_t mode[4] = { 1u /* key version */, flags, (uint32_t)nvmtl_table_ubo(), (uint32_t)nvmtl_align_guard_on() | (xlate_lower_ex ? 2u : 0u) };
+    unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX c; CC_SHA256_Init(&c);
+    CC_SHA256_Update(&c, mode, sizeof mode);
+    CC_SHA256_Update(&c, envh, sizeof envh);
+    CC_SHA256_Update(&c, self, (CC_LONG)strlen(self));
+    const uint64_t n64 = len; CC_SHA256_Update(&c, &n64, sizeof n64);
+    for (size_t off = 0; off < len; off += 1u << 30) CC_SHA256_Update(&c, (const char *)data + off, (CC_LONG)MIN((size_t)1u << 30, len - off));
+    CC_SHA256_Final(h, &c);
+    return nvmtl_spvcache_path_digest(h, @"low1");
+}
+static NSData *nvmtl_lower_disk_read(NSString *path, uint32_t info[4], int *had) {
+    *had = 0;
+    NSData *f = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (!f) { atomic_fetch_add(&g_low_miss, 1); return nil; }
+    const uint32_t *w = (const uint32_t *)f.bytes; const size_t hdr = 7 * sizeof(uint32_t);
+    const int ok = f.length >= hdr && !memcmp(w, "NVLW", 4) && w[1] == 1 && w[2] <= 1 && (f.length - hdr) % 4 == 0
+        && (w[2] == 0 ? f.length == hdr : (f.length - hdr >= 20 && w[7] == 0x07230203u));
+    if (!ok) { atomic_fetch_add(&g_low_bad, 1); atomic_fetch_add(&g_low_miss, 1); return nil; }
+    memcpy(info, w + 3, 4 * sizeof *info);
+    *had = 1;
+    const unsigned long k = atomic_fetch_add(&g_low_hit, 1) + 1;
+    nvmtl_cache_touch(path.fileSystemRepresentation);
+    if (!(k & (k - 1))) nvlog("lower cache: %lu disk hits, %lu misses, %lu stored, %lu bad", k, (unsigned long)g_low_miss,
+                              (unsigned long)g_low_stored, (unsigned long)g_low_bad);
+    return w[2] ? [NSData dataWithBytes:(const char *)f.bytes + hdr length:f.length - hdr] : nil;
+}
+static void nvmtl_lower_disk_write(NSString *path, NSData *d, const uint32_t info[4]) {
+    const uint32_t hdr[7] = { 0, 1, d ? 1u : 0u, info[0], info[1], info[2], info[3] };
+    NSMutableData *f = [NSMutableData dataWithBytes:hdr length:sizeof hdr];
+    memcpy(f.mutableBytes, "NVLW", 4);
+    if (d) [f appendData:d];
+    if ([f writeToFile:path atomically:YES]) atomic_fetch_add(&g_low_stored, 1);
+    else { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 4) nvlog("lower cache: STORE FAILED %s", path.lastPathComponent.UTF8String); }
+}
 static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info);
 static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info);
 static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t flags, uint32_t *info) {
@@ -4214,6 +4288,18 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
         return hit[0] == (id)[NSNull null] ? nil : hit[0];
     }
     uint32_t got[4] = {0};
+    NSString *dpath = nvmtl_lower_disk_path(data, len, flags);
+    if (dpath) {
+        int had = 0; NSData *d = nvmtl_lower_disk_read(dpath, got, &had);
+        if (had) {
+            if (info) memcpy(info, got, sizeof got);
+            pthread_mutex_lock(&lk);
+            if (!cache || cache.count >= 4096) cache = [NSMutableDictionary new];
+            cache[key] = @[d ?: (id)[NSNull null], [NSData dataWithBytes:got length:sizeof got]];
+            pthread_mutex_unlock(&lk);
+            return d;
+        }
+    }
     /* WS-CPU 8.9: NVMTL_PIPE_TIMING=1 logs every uncached address lowering (translator) with its size and time: the
        warm pipeline cost (120-200 ms per Core Animation fragment specialization, lowered twice) in our own process. */
     static int pt = -1; if (pt < 0) { const char *e = getenv("NVMTL_PIPE_TIMING"); pt = e && *e == '1'; }
@@ -4222,6 +4308,7 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
     if (pt) nvlog_report("pipe timing: address lowering (translator, uncached) %zu -> %lu B, flags %u: %.2f ms", len, (unsigned long)d.length, flags,
                          (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - pt0) / 1e6);
     if (info) memcpy(info, got, sizeof got);
+    if (dpath) nvmtl_lower_disk_write(dpath, d, got);
     pthread_mutex_lock(&lk);
     if (!cache || cache.count >= 4096) cache = [NSMutableDictionary new];
     cache[key] = @[d ?: (id)[NSNull null], [NSData dataWithBytes:got length:sizeof got]];
