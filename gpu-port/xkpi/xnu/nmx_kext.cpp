@@ -354,6 +354,12 @@ SYSCTL_PROC(_debug, OID_AUTO, nmx_gtt, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOC
  * temperatures), the GFXOFF bookkeeping and the SMU workload profile; nmx_pp_features: the SMU feature list
  * (pp_features). One SMU query per read, none for the size probe; nothing periodic. */
 extern "C" int nmx_power_format(char *buf, size_t size, int features);
+/* The port's own GPU power changes (NMXGPU::setPowerState -> nmx_port_power: amdgpu suspend/resume) hold g_pwr_lock;
+ * a reader only try-locks it, so it never delays or blocks a power change behind an SMU message, and it never queries
+ * the SMU while the GPU is down (g_gpu_powered 0) or between the two halves of a transition. macOS readers keep
+ * running across setPowerState; Linux relies on frozen user space instead. */
+static IOLock *g_pwr_lock;
+static volatile int g_gpu_powered = 1;
 static int nmx_power_sysctl SYSCTL_HANDLER_ARGS
 {
     const size_t size = 8 * 1024;
@@ -361,8 +367,15 @@ static int nmx_power_sysctl SYSCTL_HANDLER_ARGS
         return SYSCTL_OUT(req, NULL, size);
     char *buf = (char *)IOMalloc(size);
     if (!buf) return ENOMEM;
-    int n = -1, eerr;
-    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_power_format(buf, size, arg2); }
+    int n = -1, eerr = 0;
+    if (g_pwr_lock == nullptr || !IOLockTryLock(g_pwr_lock)) {
+        n = snprintf(buf, size, "skipped: GPU power change in progress\n");
+    } else {
+        if (!g_gpu_powered)
+            n = snprintf(buf, size, "skipped: GPU powered down (NMXGPU power state 0)\n");
+        else { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_power_format(buf, size, arg2); }
+        IOLockUnlock(g_pwr_lock);
+    }
     if (eerr) { IOFree(buf, size); return eerr; }
     if (n < 0) n = 0;
     if ((size_t)n > size) n = (int)size;
@@ -1038,7 +1051,11 @@ IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
     if (dev_ != nullptr) {
         uint64_t t0 = mach_absolute_time(), t1, ns;
         IOLog("NullMoth GPU: setPowerState(%lu) begin\n", state);
+        if (g_pwr_lock) IOLockLock(g_pwr_lock);     // waits out a power readout in flight (one SMU table read)
+        g_gpu_powered = 0;
         int err = nmx_port_power(dev_, state != 0);
+        g_gpu_powered = state != 0 && err == 0;
+        if (g_pwr_lock) IOLockUnlock(g_pwr_lock);
         t1 = mach_absolute_time();
         absolutetime_to_nanoseconds(t1 - t0, &ns);
         IOLog("NullMoth GPU: %s returned %d in %llu ms\n", state ? "resume" : "suspend", err, ns / 1000000);
@@ -1063,7 +1080,8 @@ kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data);
 kern_return_t nmx_kmod_start(kmod_info_t *ki, void *data)
 {
     g_lock = IOLockAlloc();
-    return g_lock ? KERN_SUCCESS : KERN_FAILURE;
+    g_pwr_lock = IOLockAlloc();
+    return g_lock && g_pwr_lock ? KERN_SUCCESS : KERN_FAILURE;
 }
 
 kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data)
@@ -1082,6 +1100,7 @@ kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data)
     nmx_sysctl_remove();     /* also when no device ever started the port (start() installs them first) */
     IOLockUnlock(g_lock);
     IOLockFree(g_lock);
+    if (g_pwr_lock) { IOLockFree(g_pwr_lock); g_pwr_lock = nullptr; }
     g_lock = nullptr;
     return KERN_SUCCESS;
 }
