@@ -219,6 +219,14 @@ static long nvmtl_gpu_wait_budget_ms(void)
 static size_t g_alloc_bytes;
 static uint64_t g_buf_made, g_buf_gone, g_img_made, g_img_gone;
 static uint64_t g_pool_blocks, g_pool_live, g_pool_bytes;
+/* 2026-11-23 memory census by kind: what "our allocations" (g_alloc_bytes) is made of. Standalone buffers by kind
+   (decided at free time from the nvk_buffer flags), heaps (placement heaps incl. the buffer pool's blocks), and the
+   pool blocks' sizes next to the live ranges in them (the difference is held only because a block is not empty). */
+enum { MK_BUF_DEV, MK_BUF_HOST, MK_BUF_BAR1, MK_BUF_SPARSE, MK_BUF_IMPORT, MK_HEAP, MK_POOL_SYS, MK_POOL_VRAM, MK_N };
+static _Atomic int64_t g_mk[MK_N], g_mk_n[MK_N];
+static inline int mk_buf_kind(const nvk_buffer *b) { return b->imported ? MK_BUF_IMPORT : b->bar1 ? MK_BUF_BAR1 : b->sparse ? MK_BUF_SPARSE : b->map ? MK_BUF_HOST : MK_BUF_DEV; }
+void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes);
+static inline void mk_add(int k, int64_t bytes, int n) { atomic_fetch_add(&g_mk[k], bytes); atomic_fetch_add(&g_mk_n[k], n); }
 static uint64_t g_img_align, g_sys_align;
 void (*nvmtl_purge_report_hook)(const char *why);
 static uint64_t g_budget_delta;
@@ -1297,6 +1305,7 @@ static void bpark_free(nvk_buffer *b)
     pvkDestroyBuffer(g_dev, (VkBuffer)b->buf, NULL);
     if (b->map && pvkUnmapMemory) pvkUnmapMemory(g_dev, (VkDeviceMemory)b->mem);
     if (b->bar1) g_bar1_bytes -= b->alloc;
+    mk_add(mk_buf_kind(b), -(int64_t)b->alloc, -1);
     pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL); g_alloc_bytes -= b->alloc;
     memset(b, 0, sizeof *b);
 }
@@ -1400,7 +1409,7 @@ static int nvmtl_vk_buffer_create_sparse(size_t size, nvk_buffer *out)
         return -1;
     }
     out->buf = b; out->mem = m; out->size = size; out->alloc = mr.size; out->sparse = 1; out->sysmem = sys;
-    g_alloc_bytes += mr.size; g_buf_made++; g_res3_made++;
+    g_alloc_bytes += mr.size; g_buf_made++; g_res3_made++; mk_add(MK_BUF_SPARSE, (int64_t)mr.size, 1);
     if (!sys) nvmtl_vk_budget_charge(mr.size);
     else { g_res3_madesys++; g_buf_vram_refused++;
            nvlog("vk: private buffer of %zu bytes REFUSED VRAM (our soft gate) -> system memory under a stable address (res3): %llu MB free, "
@@ -1456,7 +1465,7 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
         VkResult r2 = r1 == VK_SUCCESS ? pvkMapMemory(g_dev, bm, 0, VK_WHOLE_SIZE, 0, &bp) : r1;
         VkResult r3 = r2 == VK_SUCCESS ? pvkBindBufferMemory(g_dev, out->buf, bm, 0) : r2;
         if (r3 == VK_SUCCESS) {
-            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; out->htype = bt + 1; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++;
+            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; out->htype = bt + 1; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++; mk_add(MK_BUF_BAR1, (int64_t)mr.size, 1);
             { static int said; if (!said++) nvlog("vk: shared buffer of %zu bytes placed in VRAM through BAR1 (type %d)", size, bt); }
             return 0; }
         if (bp) pvkUnmapMemory(g_dev, bm);
@@ -1493,7 +1502,7 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
         nvlog("vk: vkMapMemory -> %d with %llu buffers live (%llu made, %llu gone), %zu bytes allocated, memory type %d", mr_,
               (unsigned long long)(g_buf_made - g_buf_gone), (unsigned long long)g_buf_made, (unsigned long long)g_buf_gone, g_alloc_bytes, mt);
         return -1; } }
-    g_alloc_bytes += mr.size;
+    g_alloc_bytes += mr.size; mk_add(mk_buf_kind(out), (int64_t)mr.size, 1);
     g_buf_made++;
     if ((g_buf_made & 0xFFF) == 0) nvlog("buffer census: %llu made, %llu gone, %llu live, %zu bytes allocated; pool %llu blocks, %llu pooled live, %llu bytes in ranges",
         (unsigned long long)g_buf_made, (unsigned long long)g_buf_gone, (unsigned long long)(g_buf_made - g_buf_gone), g_alloc_bytes,
@@ -1567,7 +1576,7 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
         out->buf = NULL; out->mem = NULL; return -1; }
     out->map = ptr; out->alloc = size; out->imported = 1; out->htype = mt + 1;
-    g_alloc_bytes += size; g_buf_made++;
+    g_alloc_bytes += size; g_buf_made++; mk_add(MK_BUF_IMPORT, (int64_t)size, 1);
     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
     return 0;
 }
@@ -3072,6 +3081,7 @@ static nvmtl_btsh *nvmtl_btsh_take_locked(const void *key)
 /* WS-CPU 8.9: who makes the per-present VkBuffers and image views. NVMTL_CHURN_SITES=1 records the three callers above
  * each create (backtrace) and the census prints the busiest sites; off, the hooks cost one load. Debug log only. */
 #include <execinfo.h>
+#include <CommonCrypto/CommonDigest.h>
 enum { NVMTL_CS_BUF, NVMTL_CS_VIEW, NVMTL_CS_N };
 #define NVMTL_CS_CAP 48
 typedef struct { void *f[3]; unsigned long long n, last; } nvmtl_churn_site;
@@ -3794,6 +3804,17 @@ void nvmtl_vk_frame_census(int what)
                  "in %u (watched IOSurface planes %llu MB), not in our allocations",
                  (unsigned long long)(g_alloc_bytes >> 20), (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
                  atomic_load(&g_btsh_bytes) >> 20, (unsigned)atomic_load(&g_btsh_live), atomic_load(&g_btsh_wbytes) >> 20);
+    {   int64_t m[MK_N], n[MK_N]; for (int i = 0; i < MK_N; i++) { m[i] = atomic_load(&g_mk[i]) >> 20; n[i] = atomic_load(&g_mk_n[i]); }
+        uint64_t lc = 0, lb = 0; nvmtl_lower_memo_stats(&lc, &lb);
+        nvlog_report("frame census memory by kind (MB/count): images device %llu system %llu; buffers device %lld/%lld, host %lld/%lld, "
+                     "BAR1 %lld/%lld, sparse %lld/%lld, imported caller pages %lld/%lld; heaps %lld/%lld, of them buffer-pool blocks "
+                     "system %lld/%lld + VRAM %lld/%lld holding %llu MB of live ranges in %llu buffers; parked buffers %llu MB in %u; "
+                     "lowering memo %llu entries %llu MB (CPU heap)",
+                     (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
+                     m[MK_BUF_DEV], n[MK_BUF_DEV], m[MK_BUF_HOST], n[MK_BUF_HOST], m[MK_BUF_BAR1], n[MK_BUF_BAR1], m[MK_BUF_SPARSE], n[MK_BUF_SPARSE],
+                     m[MK_BUF_IMPORT], n[MK_BUF_IMPORT], m[MK_HEAP], n[MK_HEAP], m[MK_POOL_SYS], n[MK_POOL_SYS], m[MK_POOL_VRAM], n[MK_POOL_VRAM],
+                     (unsigned long long)(g_pool_bytes >> 20), (unsigned long long)g_pool_live,
+                     (unsigned long long)(g_bpark_bytes >> 20), (unsigned)g_bpark_n, (unsigned long long)lc, (unsigned long long)(lb >> 20)); }
     nvmtl_churn_sites_dump(p);
 }
 /* *dyn gets the dynamic offset of binding 640 that goes with the returned set (0 unless the desc-cache reused a set
@@ -4378,10 +4399,30 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
     t_pl_lower_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 - (t_lower_verify_ns - v0);
     return d;
 }
+static NSMutableDictionary *g_lower_memo; static pthread_mutex_t g_lower_memo_lk = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_lower_memo_bytes;   /* keys (flags + input SPIR-V) + lowered modules, under g_lower_memo_lk */
+void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes) {
+    pthread_mutex_lock(&g_lower_memo_lk); *count = g_lower_memo.count; *bytes = g_lower_memo_bytes; pthread_mutex_unlock(&g_lower_memo_lk);
+}
+/* Bounded by bytes, not only by count: 4096 entries of ~700 KB lowered modules could reach GBs and the memo was never
+   trimmed. Past NVMTL_LOWER_MEMO_MB (default 32) it starts over; a miss then is a low2 disk hit (a file read), not a
+   translator run. */
+static void nvmtl_lower_memo_put_locked(NSData *key, NSData *d, NSData *info) {
+    static uint64_t cap; if (!cap) { const char *e = getenv("NVMTL_LOWER_MEMO_MB"); const long mb = e ? strtol(e, NULL, 10) : 32; cap = (uint64_t)(mb > 0 ? mb : 32) << 20; }
+    if (!g_lower_memo || g_lower_memo.count >= 4096 || g_lower_memo_bytes + d.length > cap) {
+        static unsigned resets; if (g_lower_memo.count && resets++ < 8) nvlog("lowering memo: started over at %lu entries, %llu MB (cap %llu MB)",
+                                                                               (unsigned long)g_lower_memo.count, (unsigned long long)(g_lower_memo_bytes >> 20), (unsigned long long)(cap >> 20));
+        g_lower_memo = [NSMutableDictionary new]; g_lower_memo_bytes = 0; }
+    if (!g_lower_memo[key]) g_lower_memo_bytes += key.length + d.length + info.length;
+    g_lower_memo[key] = @[d ?: (id)[NSNull null], info];
+}
 static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_t flags, uint32_t *info) {
-    static NSMutableDictionary *cache; static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
-    NSMutableData *key = [NSMutableData dataWithBytes:&flags length:sizeof flags];
-    [key appendBytes:data length:len];
+#define cache g_lower_memo
+#define lk g_lower_memo_lk
+    /* key: flags + length + SHA-256 of the input (was flags + a full copy of the input, ~700 KB per CA fragment module) */
+    uint8_t kb[4 + 8 + CC_SHA256_DIGEST_LENGTH]; const uint64_t ln = len; memcpy(kb, &flags, 4); memcpy(kb + 4, &ln, 8);
+    CC_SHA256(data, (CC_LONG)len, kb + 12);
+    NSData *key = [NSData dataWithBytes:kb length:sizeof kb];
     pthread_mutex_lock(&lk);
     NSArray *hit = cache[key];
     pthread_mutex_unlock(&lk);
@@ -4397,8 +4438,7 @@ static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_
         if (had) {
             if (info) memcpy(info, got, sizeof got);
             pthread_mutex_lock(&lk);
-            if (!cache || cache.count >= 4096) cache = [NSMutableDictionary new];
-            cache[key] = @[d ?: (id)[NSNull null], [NSData dataWithBytes:got length:sizeof got]];
+            nvmtl_lower_memo_put_locked(key, d, [NSData dataWithBytes:got length:sizeof got]);
             pthread_mutex_unlock(&lk);
             return d;
         }
@@ -4416,10 +4456,11 @@ static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_
     if (dpath && det) nvmtl_lower_disk_write(dpath, d, got);
     if (!d && !det) return nil;   /* a transient nil (allocation failure) is not remembered in memory either */
     pthread_mutex_lock(&lk);
-    if (!cache || cache.count >= 4096) cache = [NSMutableDictionary new];
-    cache[key] = @[d ?: (id)[NSNull null], [NSData dataWithBytes:got length:sizeof got]];
+    nvmtl_lower_memo_put_locked(key, d, [NSData dataWithBytes:got length:sizeof got]);
     pthread_mutex_unlock(&lk);
     return d;
+#undef cache
+#undef lk
 }
 /* LOWER CACHE: what this returns (the G1 refusal) and its *det are what low2 stores. Bump NVMTL_LOWER_PASSES_VERSION
    (nvmtl_vk.c) whenever its output for a given input can change. */
@@ -7124,7 +7165,7 @@ static void nvmtl_vk_buffer_destroy_body(nvk_buffer *b)
     if (b->pool) pool_buffer_release(b);
     if (!b->placed && !b->imported && b->mem && b->map && pvkUnmapMemory) { pvkUnmapMemory(g_dev, (VkDeviceMemory)b->mem); b->map = NULL; }
     if (b->bar1) g_bar1_bytes -= b->alloc;
-    if (!b->placed && b->mem) { pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL); g_alloc_bytes -= b->alloc; }
+    if (!b->placed && b->mem) { mk_add(mk_buf_kind(b), -(int64_t)b->alloc, -1); pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL); g_alloc_bytes -= b->alloc; }
     memset(b, 0, sizeof *b);
 }
 
@@ -7418,6 +7459,7 @@ int nvmtl_vk_buffer_migrate(nvk_buffer *b, int to_sysmem)
         return -1;
     }
     pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL);
+    mk_add(mk_buf_kind(b), (int64_t)mr.size - (int64_t)b->alloc, 0);
     g_alloc_bytes -= b->alloc; g_alloc_bytes += mr.size;
     if (to_sysmem) { g_res3_off++; g_res3_off_b += b->alloc; }
     else { nvmtl_vk_budget_charge(mr.size); g_res3_on++; g_res3_on_b += mr.size; }
@@ -8640,14 +8682,14 @@ static int nvmtl_vk_heap_create_body(size_t size, int host_visible, nvk_heap *ou
         VkResult mapped = pvkMapMemory(g_dev, mem, 0, VK_WHOLE_SIZE, 0, &out->map);
         if (mapped != VK_SUCCESS) { pvkFreeMemory(g_dev, mem, NULL); memset(out, 0, sizeof *out); return -1; }
     }
-    g_alloc_bytes += size;
+    g_alloc_bytes += size; mk_add(MK_HEAP, (int64_t)size, 1);
     return 0;
 }
 void nvmtl_vk_heap_destroy(nvk_heap *h)
 {
     if (g_state != 1 || !h || !h->mem) return;
     if (h->map && pvkUnmapMemory) { pvkUnmapMemory(g_dev, (VkDeviceMemory)h->mem); h->map = NULL; }
-    pvkFreeMemory(g_dev, (VkDeviceMemory)h->mem, NULL); g_alloc_bytes -= h->size;
+    pvkFreeMemory(g_dev, (VkDeviceMemory)h->mem, NULL); g_alloc_bytes -= h->size; mk_add(MK_HEAP, -(int64_t)h->size, -1);
     memset(h, 0, sizeof *h);
 }
 static int placed_ok(const VkMemoryRequirements *mr, const nvk_heap *heap, size_t offset, const char *what)
@@ -8975,7 +9017,7 @@ static int vpool_heap_create(size_t size, nvk_heap *out)
         nvlog("buffer pool: VRAM block REFUSED (alloc %d, map %d) at %zu BAR bytes - small Shared buffers take system RAM for this process", r1, r2, g_bar1_bytes);
         return -1; }
     out->mem = bm; out->map = bp; out->size = size; out->memtype = (uint32_t)bt; out->host_visible = 1;
-    g_alloc_bytes += size; g_bar1_bytes += size;
+    g_alloc_bytes += size; g_bar1_bytes += size; mk_add(MK_HEAP, (int64_t)size, 1);
     return 0;
 }
 static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
@@ -8993,7 +9035,7 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
         if (!vram) { for (pool_block *p = *head; p && bsz < NVMTL_POOL_BLOCK; p = p->next) bsz *= 2;
                      while (bsz < len) bsz *= 2; }
         if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(bsz, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
-        nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++;
+        nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++; mk_add(vram ? MK_POOL_VRAM : MK_POOL_SYS, (int64_t)nb->heap.size, 1);
         nvlog("buffer pool: block #%llu mapped (%zu MiB, %s; %llu VRAM blocks, memory type %u); %llu pooled buffers live in %llu bytes of ranges",
               (unsigned long long)g_pool_blocks, nb->heap.size >> 20, pool_place_why(vram), (unsigned long long)g_vpool_blocks,
               nb->heap.memtype, (unsigned long long)g_pool_live, (unsigned long long)g_pool_bytes);
@@ -9026,6 +9068,7 @@ static void pool_buffer_release(nvk_buffer *b)
         if (empties > NVMTL_POOL_KEEP) {
             pool_block **pp = head; while (*pp && *pp != blk) pp = &(*pp)->next;
             if (*pp) { *pp = blk->next; const size_t hs = blk->heap.size; const int v = blk->vram;
+                mk_add(v ? MK_POOL_VRAM : MK_POOL_SYS, -(int64_t)hs, -1);
                 nvmtl_vk_heap_destroy(&blk->heap); free(blk->fr); free(blk); g_pool_blocks--;
                 if (v) { g_vpool_blocks--; g_bar1_bytes -= hs; } }
         }
