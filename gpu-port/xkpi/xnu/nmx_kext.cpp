@@ -294,6 +294,22 @@ extern "C" volatile SInt64 gNmxFaultKick, gNmxFaultKickIgnored, gNmxFaultKickFai
 NMX_CNT(nmx_fault_kick, gNmxFaultKick, "row 12: GPU page faults whose head job got an immediate soft recovery (not at the 3 s timeout)");
 NMX_CNT(nmx_fault_kick_ignored, gNmxFaultKickIgnored, "row 12: fault kicks skipped (ambiguous, rate limited) or that found another job at the ring head (left running)");
 NMX_CNT(nmx_fault_kick_fail, gNmxFaultKickFail, "row 12: kicked jobs whose soft recovery failed (put back, the 3 s timer decides)");
+/* shutdown stall 2026-11-18 17:47 (ttm-pool-trim-batch.patch): the TTM page pool, in pages unless named otherwise */
+extern "C" volatile SInt64 gNmxTtmPoolGive, gNmxTtmPoolTake, gNmxTtmPoolMissPages, gNmxTtmPoolMiss, gNmxTtmPoolPages,
+    gNmxTtmPoolCap, gNmxTtmFreeCalls, gNmxTtmFreePages, gNmxTtmTrimCalls, gNmxTtmTrimPages, gNmxTtmShrinkCalls,
+    gNmxTtmFreeNs;
+NMX_CNT(nmx_ttm_pool_pages, gNmxTtmPoolPages, "TTM pool: write-combined/uncached pages held in the pools now");
+NMX_CNT(nmx_ttm_pool_cap, gNmxTtmPoolCap, "TTM pool: cap ttm_pool_free trims to (Step141: 32768 = 128 MB)");
+NMX_CNT(nmx_ttm_pool_give, gNmxTtmPoolGive, "TTM pool: freed pages given to a pool");
+NMX_CNT(nmx_ttm_pool_take, gNmxTtmPoolTake, "TTM pool: allocated pages taken from a pool (zeroed, caching already set)");
+NMX_CNT(nmx_ttm_pool_miss, gNmxTtmPoolMiss, "TTM pool: allocations of a pooled caching that found the pool empty (made fresh pages)");
+NMX_CNT(nmx_ttm_pool_miss_pages, gNmxTtmPoolMissPages, "TTM pool: pages those allocations made fresh");
+NMX_CNT(nmx_ttm_free_calls, gNmxTtmFreeCalls, "TTM pool: ttm_pool_free calls (BO backing freed)");
+NMX_CNT(nmx_ttm_free_pages, gNmxTtmFreePages, "TTM pool: pages those calls returned");
+NMX_CNT(nmx_ttm_free_ns, gNmxTtmFreeNs, "TTM pool: ns spent in ttm_pool_free, trim included");
+NMX_CNT(nmx_ttm_trim_calls, gNmxTtmTrimCalls, "TTM pool: ttm_pool_free calls that found the pool over its cap and trimmed it");
+NMX_CNT(nmx_ttm_trim_pages, gNmxTtmTrimPages, "TTM pool: pages those trims freed to the system");
+NMX_CNT(nmx_ttm_shrink_calls, gNmxTtmShrinkCalls, "TTM pool: ttm_pool_shrink calls (one pool type, a batch of pages each)");
 extern "C" int nmx_fault_kick_on;
 SYSCTL_INT(_debug, OID_AUTO, nmx_fault_kick_on, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_fault_kick_on, 0,
            "row 12: 1 = soft-recover a faulting ring head job at fault time; 0 (default) = the 3 s timeout only");
@@ -451,6 +467,18 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_fault_kick,
     &sysctl__debug_nmx_fault_kick_ignored,
     &sysctl__debug_nmx_fault_kick_fail,
+    &sysctl__debug_nmx_ttm_pool_pages,
+    &sysctl__debug_nmx_ttm_pool_cap,
+    &sysctl__debug_nmx_ttm_pool_give,
+    &sysctl__debug_nmx_ttm_pool_take,
+    &sysctl__debug_nmx_ttm_pool_miss,
+    &sysctl__debug_nmx_ttm_pool_miss_pages,
+    &sysctl__debug_nmx_ttm_free_calls,
+    &sysctl__debug_nmx_ttm_free_pages,
+    &sysctl__debug_nmx_ttm_free_ns,
+    &sysctl__debug_nmx_ttm_trim_calls,
+    &sysctl__debug_nmx_ttm_trim_pages,
+    &sysctl__debug_nmx_ttm_shrink_calls,
     &sysctl__debug_nmx_fault_kick_on,
     &sysctl__debug_nmx_userptr_park_ms,
     &sysctl__debug_nmx_ft,

@@ -34,6 +34,7 @@ amdgpu-romap-gmc11.patch
 amdgpu-vcn405-readback.patch
 amdgpu-nmx-surface-hint.patch
 ttm-pool-cap.patch
+ttm-pool-trim-batch.patch
 amdgpu-userptr-park.patch
 amdgpu-dm-frametrace.patch
 amdgpu-nmx-surface-fence.patch

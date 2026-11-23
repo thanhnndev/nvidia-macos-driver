@@ -1,0 +1,199 @@
+--- a/drivers/gpu/drm/ttm/ttm_pool.c
++++ b/drivers/gpu/drm/ttm/ttm_pool.c
+@@ -79,6 +79,16 @@
+ static struct shrinker *mm_shrinker;
+ static DECLARE_RWSEM(pool_shrink_rwsem);
+ 
++/* macOS port (ga403wm, shutdown stall 2026-11-18 17:47): counters for debug.nmx_ttm_* (xnu/nmx_kext.cpp), in pages
++ * unless named otherwise. Pool: pages given / taken by allocations / an allocation of a pooled type found it empty
++ * (pages then made fresh) / pages in the pools now / the cap. Free: ttm_pool_free calls, the pages they returned, the
++ * calls that had to trim the pool to the cap, the pages trimmed, the shrink calls that ran, and the time spent in
++ * ttm_pool_free (ns, trim included). */
++volatile long long gNmxTtmPoolGive, gNmxTtmPoolTake, gNmxTtmPoolMissPages, gNmxTtmPoolMiss, gNmxTtmPoolPages,
++	gNmxTtmPoolCap, gNmxTtmFreeCalls, gNmxTtmFreePages, gNmxTtmTrimCalls, gNmxTtmTrimPages, gNmxTtmShrinkCalls,
++	gNmxTtmFreeNs;
++#define NMX_TTM_ADD(var, n) __atomic_add_fetch(&(var), (long long)(n), __ATOMIC_RELAXED)
++
+ /* Allocate pages of size 1 << order with the given gfp_flags */
+ static struct page *ttm_pool_alloc_page(struct ttm_pool *pool, gfp_t gfp_flags,
+ 					unsigned int order)
+@@ -275,6 +285,8 @@
+ #endif
+ 	spin_unlock(&pt->lock);
+ 	atomic_long_add(1 << pt->order, &allocated_pages);
++	NMX_TTM_ADD(gNmxTtmPoolGive, 1 << pt->order);
++	NMX_TTM_ADD(gNmxTtmPoolPages, 1 << pt->order);
+ }
+ 
+ /* Take pages from a specific pool_type, return NULL when nothing available */
+@@ -290,6 +302,7 @@
+ #endif
+ 	if (p) {
+ 		atomic_long_sub(1 << pt->order, &allocated_pages);
++		NMX_TTM_ADD(gNmxTtmPoolPages, -(1 << pt->order));
+ #if defined(__linux__) || defined(PAGE_IS_LKPI_PAGE)
+ 		list_del(&p->lru);
+ #elif defined(__FreeBSD__)
+@@ -367,27 +380,75 @@
+ 	return NULL;
+ }
+ 
+-/* Free pages using the global shrinker list */
+-static unsigned int ttm_pool_shrink(void)
++/*
++ * Free pages using the global shrinker list.
++ *
++ * macOS port (ga403wm, shutdown stall 2026-11-18 17:47): up to num_to_free pages of the next pool type per call, as
++ * mainline does (ttm_pool_shrink(nid, num_to_free): list_lru_walk_node onto a dispose list, then
++ * ttm_pool_dispose_list frees them outside the LRU lock). This drm-kmod took one page per call, so ttm_pool_free
++ * trimmed a pool at its cap one page at a time: the rwsem, shrinker_lock and pt->lock were taken for every 4 KB page
++ * (Step89 makes every page order 0), ~70 of 80 samples of two exiting processes were lock traffic, ~6.6 us per page.
++ * Same lock scope as mainline: pt->lock covers only moving the pages to a local list, ttm_pool_free_page (caching
++ * back to write-back, then the free) runs with no lock held. Differs from mainline in the list type (this drm-kmod has
++ * pt->lock + a list, no list_lru, no NUMA node).
++ */
++static unsigned long ttm_pool_shrink(unsigned long num_to_free)
+ {
+ 	struct ttm_pool_type *pt;
+-	unsigned int num_pages;
++	unsigned long num_pages = 0, n = 0;
+ 	struct page *p;
++#if defined(__linux__) || defined(PAGE_IS_LKPI_PAGE)
++	LIST_HEAD(dispose);
++#elif defined(__FreeBSD__)
++	struct pglist dispose;
+ 
++	TAILQ_INIT(&dispose);
++#endif
++
++	if (!num_to_free)
++		num_to_free = 1;
++
+ 	down_read(&pool_shrink_rwsem);
+ 	spin_lock(&shrinker_lock);
+ 	pt = list_first_entry(&shrinker_list, typeof(*pt), shrinker_list);
+ 	list_move_tail(&pt->shrinker_list, &shrinker_list);
+ 	spin_unlock(&shrinker_lock);
+ 
+-	p = ttm_pool_type_take(pt);
+-	if (p) {
++	spin_lock(&pt->lock);
++	while (num_pages < num_to_free) {
++#if defined(__linux__) || defined(PAGE_IS_LKPI_PAGE)
++		p = list_first_entry_or_null(&pt->pages, typeof(*p), lru);
++		if (!p)
++			break;
++		list_move_tail(&p->lru, &dispose);
++#elif defined(__FreeBSD__)
++		p = TAILQ_FIRST(&pt->pages);
++		if (!p)
++			break;
++		TAILQ_REMOVE(&pt->pages, p, plinks.q);
++		TAILQ_INSERT_TAIL(&dispose, p, plinks.q);
++#endif
++		num_pages += 1 << pt->order;
++		n++;
++	}
++	spin_unlock(&pt->lock);
++	if (num_pages) {
++		atomic_long_sub(num_pages, &allocated_pages);
++		NMX_TTM_ADD(gNmxTtmPoolPages, -(long long)num_pages);
++	}
++
++	while (n--) {
++#if defined(__linux__) || defined(PAGE_IS_LKPI_PAGE)
++		p = list_first_entry(&dispose, typeof(*p), lru);
++		list_del(&p->lru);
++#elif defined(__FreeBSD__)
++		p = TAILQ_FIRST(&dispose);
++		TAILQ_REMOVE(&dispose, p, plinks.q);
++#endif
+ 		ttm_pool_free_page(pt->pool, pt->caching, pt->order, p);
+-		num_pages = 1 << pt->order;
+-	} else {
+-		num_pages = 0;
+ 	}
+ 	up_read(&pool_shrink_rwsem);
++	NMX_TTM_ADD(gNmxTtmShrinkCalls, 1);
+ 
+ 	return num_pages;
+ }
+@@ -530,6 +591,8 @@
+ 	/* macOS port (ga403wm Step89): every order > 0 is a physically contiguous allocation through
+ 	 * IOBufferMemoryDescriptor (cpm_allocate), which scans under xnu's free-page lock and blocked
+ 	 * WindowServer's GEM_CREATE. Order 0 comes from xkpi's 2 MB chunk free list. */
++	unsigned long nmx_miss_pages = 0;	/* macOS port: pages of a pooled type made fresh (debug.nmx_ttm_*) */
++
+ 	for (order = 0;
+ 	     num_pages;
+ 	     order = min_t(unsigned int, order, __fls(num_pages))) {
+@@ -561,6 +624,7 @@
+ 				if (r)
+ 					goto error_free_page;
+ 
++				NMX_TTM_ADD(gNmxTtmPoolTake, 1 << order);
+ 				caching = pages;
+ 				if (num_pages < (1 << order))
+ 					break;
+@@ -589,6 +653,8 @@
+ #endif
+ 			if (r)
+ 				goto error_free_page;
++			if (pt)
++				nmx_miss_pages += 1 << order;
+ 			if (PageHighMem(p))
+ 				caching = pages;
+ 		}
+@@ -607,6 +673,10 @@
+ 	if (r)
+ 		goto error_free_all;
+ 
++	if (nmx_miss_pages) {
++		NMX_TTM_ADD(gNmxTtmPoolMiss, 1);
++		NMX_TTM_ADD(gNmxTtmPoolMissPages, nmx_miss_pages);
++	}
+ 	return 0;
+ 
+ error_free_page:
+@@ -632,10 +702,22 @@
+  */
+ void ttm_pool_free(struct ttm_pool *pool, struct ttm_tt *tt)
+ {
++	u64 t0 = ktime_get_ns();
++	long over, trimmed = 0;
++
+ 	ttm_pool_free_range(pool, tt, tt->caching, 0, tt->num_pages);
+ 
+-	while (atomic_long_read(&allocated_pages) > page_pool_size)
+-		ttm_pool_shrink();
++	/* mainline: while over the limit, ttm_pool_shrink(nid, allocated - limit) */
++	while ((over = atomic_long_read(&allocated_pages) - (long)page_pool_size) > 0)
++		trimmed += ttm_pool_shrink(over);
++
++	NMX_TTM_ADD(gNmxTtmFreeCalls, 1);
++	NMX_TTM_ADD(gNmxTtmFreePages, tt->num_pages);
++	if (trimmed) {
++		NMX_TTM_ADD(gNmxTtmTrimCalls, 1);
++		NMX_TTM_ADD(gNmxTtmTrimPages, trimmed);
++	}
++	NMX_TTM_ADD(gNmxTtmFreeNs, ktime_get_ns() - t0);
+ }
+ EXPORT_SYMBOL(ttm_pool_free);
+ 
+@@ -727,7 +809,7 @@
+ 	unsigned long num_freed = 0;
+ 
+ 	do
+-		num_freed += ttm_pool_shrink();
++		num_freed += ttm_pool_shrink(sc->nr_to_scan);
+ 	while (!num_freed && atomic_long_read(&allocated_pages));
+ 
+ 	return num_freed;
+@@ -889,6 +971,7 @@
+ 
+ 	if (!page_pool_size)
+ 		page_pool_size = num_pages;
++	gNmxTtmPoolCap = page_pool_size;
+ 
+ 	spin_lock_init(&shrinker_lock);
+ 	INIT_LIST_HEAD(&shrinker_list);
