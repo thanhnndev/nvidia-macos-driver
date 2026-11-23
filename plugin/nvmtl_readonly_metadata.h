@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+/* LOWER CACHE: this pass shapes what the lowering cache (low2) stores. Bump NVMTL_LOWER_PASSES_VERSION (nvmtl_vk.c) whenever
+   its output for a given input can change, or every process keeps loading the old result from disk. */
 static NSData *nvmtl_preserve_readonly_metadata(NSData *input) {
     const uint32_t *w=input.bytes; size_t n=input.length/4;
     if(input.length%4||n<5||w[0]!=0x07230203||!w[3]||w[3]>4194304)return input;

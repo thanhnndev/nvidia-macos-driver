@@ -473,13 +473,20 @@ static VkResult nvmtl_opaque_CreateCommandPool(VkDevice dev, const VkCommandPool
     if (result == VK_SUCCESS) *out = handle;
     return result;
 }
+/* 2026-11-23 login-cost question: where a pipeline's create time goes. Per thread, summed into the 30 s "pipelines:"
+   report by nvmtl_pstat_record (called on the creating thread): the address lowering (low2 disk hit, memo hit or
+   translator) and the driver's own vkCreate*Pipelines (RADV: compile or its disk cache). The rest of "creating" is our
+   other work (shader modules, reflection of the SPIR-V, layouts). */
+static __thread uint64_t t_pl_lower_ns, t_pl_vk_ns, t_pl_lower_miss;
 static VkResult nvmtl_opaque_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
     VkPipeline handle = VK_NULL_HANDLE;
     VkGraphicsPipelineCreateInfo pinfo;
     if (g_pstat) { pinfo = *info; pinfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; info = &pinfo; }
+    const uint64_t vt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     VkResult result = pvkCreateGraphicsPipelines(dev, cache, count, info, allocator, &handle);
+    t_pl_vk_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - vt0;
     if (result == VK_SUCCESS) *out = handle;
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
@@ -517,7 +524,9 @@ static VkResult nvmtl_opaque_CreateComputePipelines(VkDevice dev, VkPipelineCach
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
     VkPipeline handle = VK_NULL_HANDLE;
+    const uint64_t vt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     VkResult result = pvkCreateComputePipelines(dev, cache, count, info, allocator, &handle);
+    t_pl_vk_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - vt0;
     if (result == VK_SUCCESS) *out = handle;
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
@@ -4224,6 +4233,8 @@ static int nvmtl_align_guard_on(void) {
     return on;
 }
 static _Atomic unsigned long long g_ag_render_safe, g_ag_untraceable, g_ag_guarded, g_ag_switched;
+/* LOWER CACHE: this pass shapes what the lowering cache (low2) stores. Bump NVMTL_LOWER_PASSES_VERSION (nvmtl_vk.c) whenever
+   its output for a given input can change, or every process keeps loading the old result from disk. */
 static int nvmtl_spirv_ssbo_table(const void *spv, size_t n)
 {
     const uint32_t *w = (const uint32_t *)spv; size_t nw = n / 4;
@@ -4250,11 +4261,20 @@ static _Atomic unsigned long long g_g1_refused;
    meta = u32 status (1 = module, 0 = the deterministic G1 refusal) | u32 info[4]; payload = the SPIR-V (empty for 0).
    Only answers that repeat are stored: a module, or the G1 refusal. A nil from an allocation failure, and the as-is
    module of a translator refusal, are not (one transient failure must not become a permanent one in every process).
-   NVMTL_LOWER_DISKCACHE=0 turns it off; so does an image without a UUID (the key would not change with the plugin).
-   A torn, flipped or foreign file is a miss (and is rewritten). */
+   NVMTL_LOWER_DISKCACHE=0 turns it off.
+   Key: NVMTL_LOWER_PASSES_VERSION, the lowering flags and table mode, the code-changing knobs and the module; the file name
+   carries the translator's cache tag (a new translator is a new name). Until 2026-11-23 the key held this plugin image's
+   LC_UUID, so every plugin build missed every entry on its first start (16-19 s in WindowServer at each login after a
+   package); our own passes are versioned by hand instead. */
+/* Bump when the output of our side of the lowering can change for the same input: nvmtl_preserve_readonly_metadata,
+   nvmtl_relax_physical_bounds, nvmtl_independent_helpers, the G1 refusal (nvmtl_spirv_ssbo_table), or the binding
+   constants they and the translator call use (the address table at binding 640, its UBO/SSBO form). Each of those
+   passes carries a LOWER CACHE comment. 1 = 2026-11-23. */
+#define NVMTL_LOWER_PASSES_VERSION 1u
+/* A torn, flipped or foreign low2 file is a miss (and is rewritten). */
 static _Atomic unsigned long g_low_hit, g_low_miss, g_low_stored, g_low_bad;
 static NSString *nvmtl_lower_disk_path(const void *data, size_t len, uint32_t flags) {
-    static int on = -1; static unsigned char envh[CC_SHA256_DIGEST_LENGTH]; static char self[1200];
+    static int on = -1; static unsigned char envh[CC_SHA256_DIGEST_LENGTH];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *e = getenv("NVMTL_LOWER_DISKCACHE"); on = !(e && e[0] == '0');
@@ -4270,18 +4290,14 @@ static NSString *nvmtl_lower_disk_path(const void *data, size_t len, uint32_t fl
         [kv sortUsingSelector:@selector(compare:)];
         for (NSString *x in kv) { const char *u = x.UTF8String; CC_SHA256_Update(&c, u, (CC_LONG)strlen(u) + 1); }
         CC_SHA256_Final(envh, &c);
-        nvmtl_image_ident((const void *)&nvmtl_lower_disk_path, self, sizeof self);
-        const int noid = self[0] == '?' || !strncmp(self, "no-uuid", 7) || !strncmp(self, "not-64-bit", 10);
-        if (noid) on = 0;
-        nvlog("lower cache: %s (NVMTL_LOWER_DISKCACHE=%s, %lu code-changing NVMTL_* knobs in the key%s)", on ? "disk ON" : "disk OFF",
-              e ? e : "unset", (unsigned long)kv.count, noid ? "; OFF: no image UUID to key on" : "");
+        nvlog("lower cache: %s (NVMTL_LOWER_DISKCACHE=%s, %lu code-changing NVMTL_* knobs in the key, our passes version %u)", on ? "disk ON" : "disk OFF",
+              e ? e : "unset", (unsigned long)kv.count, NVMTL_LOWER_PASSES_VERSION);
     });
     if (!on || !nvmtl_xlate_ready() || !xlate_lower || !data || !len) return nil;
-    const uint32_t mode[4] = { 2u /* key version */, flags, (uint32_t)nvmtl_table_ubo(), (uint32_t)nvmtl_align_guard_on() | (xlate_lower_ex ? 2u : 0u) };
+    const uint32_t mode[5] = { 3u /* key layout version (3: passes version instead of the image UUID) */, NVMTL_LOWER_PASSES_VERSION, flags, (uint32_t)nvmtl_table_ubo(), (uint32_t)nvmtl_align_guard_on() | (xlate_lower_ex ? 2u : 0u) };
     unsigned char h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX c; CC_SHA256_Init(&c);
     CC_SHA256_Update(&c, mode, sizeof mode);
     CC_SHA256_Update(&c, envh, sizeof envh);
-    CC_SHA256_Update(&c, self, (CC_LONG)strlen(self));
     const uint64_t n64 = len; CC_SHA256_Update(&c, &n64, sizeof n64);
     for (size_t off = 0; off < len; off += 1u << 30) CC_SHA256_Update(&c, (const char *)data + off, (CC_LONG)MIN((size_t)1u << 30, len - off));
     CC_SHA256_Final(h, &c);
@@ -4319,7 +4335,14 @@ static void nvmtl_lower_disk_write(NSString *path, NSData *d, const uint32_t inf
 }
 static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det);
 static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det);
+static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_t flags, uint32_t *info);
 static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t flags, uint32_t *info) {
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    NSData *d = nvmtl_address_shader_g_body(data, len, flags, info);
+    t_pl_lower_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    return d;
+}
+static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_t flags, uint32_t *info) {
     static NSMutableDictionary *cache; static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
     NSMutableData *key = [NSMutableData dataWithBytes:&flags length:sizeof flags];
     [key appendBytes:data length:len];
@@ -4348,6 +4371,7 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
     static int pt = -1; if (pt < 0) { const char *e = getenv("NVMTL_PIPE_TIMING"); pt = e && *e == '1'; }
     const uint64_t pt0 = pt ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     int det = 0;   /* 1: this answer repeats (translator module, or the G1 refusal) and may be kept */
+    t_pl_lower_miss++;
     NSData *d = nvmtl_address_shader_g_uncached(data, len, flags, got, &det);
     if (pt) nvlog_report("pipe timing: address lowering (translator, uncached) %zu -> %lu B, flags %u: %.2f ms", len, (unsigned long)d.length, flags,
                          (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - pt0) / 1e6);
@@ -4961,7 +4985,7 @@ static pthread_mutex_t g_plstat_mu = PTHREAD_MUTEX_INITIALIZER;
 #define NVMTL_PSTAT_KEYS 8192
 static uint64_t g_plstat_seen[NVMTL_PSTAT_KEYS];   /* open-addressed set of keys built in this process (0 = empty) */
 static unsigned g_plstat_seenN;
-static struct { uint64_t render, compute, repeats, fresh, ns, maxNs, spvBytes, maxVn, maxFn, cached, lastMs, failed; } g_plstat;
+static struct { uint64_t render, compute, repeats, fresh, ns, maxNs, spvBytes, maxVn, maxFn, cached, lastMs, failed, lowerNs, vkNs, lowerMiss; } g_plstat;
 static VkPipelineCache g_pcache;
 static int g_pcache_on;
 static uint64_t g_pcache_checkMs;
@@ -5006,6 +5030,8 @@ static void nvmtl_pstat_record(int compute, uint64_t key, uint64_t ns, size_t vn
     if (failed) g_plstat.failed++;
     if (cached) g_plstat.cached++;
     g_plstat.ns += ns; g_plstat.spvBytes += vn + fn;
+    g_plstat.lowerNs += t_pl_lower_ns; g_plstat.vkNs += t_pl_vk_ns; g_plstat.lowerMiss += t_pl_lower_miss;
+    t_pl_lower_ns = t_pl_vk_ns = t_pl_lower_miss = 0;
     if (ns > g_plstat.maxNs) { g_plstat.maxNs = ns; g_plstat.maxVn = vn; g_plstat.maxFn = fn; }
     if (!key) key = 1;
     int repeat = 0;
@@ -5018,12 +5044,19 @@ static void nvmtl_pstat_record(int compute, uint64_t key, uint64_t ns, size_t vn
     if (repeat) g_plstat.repeats++; else g_plstat.fresh++;
     const uint64_t now = nvmtl_pstat_now_ms();
     if (!g_plstat.lastMs) g_plstat.lastMs = now;
-    if (now - g_plstat.lastMs >= 30000) {
-        extern _Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns;
+    static long long rep_ms = -1; if (rep_ms < 0) { const char *e = getenv("NVMTL_PIPE_REPORT_MS"); rep_ms = e && atoll(e) >= 500 ? atoll(e) : 30000; }
+    if (now - g_plstat.lastMs >= (uint64_t)rep_ms) {
+        extern _Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns,
+                                          nvmtl_fc_stat_disk_hits, nvmtl_fc_stat_disk_hit_ns;
         const unsigned long long fh = atomic_exchange(&nvmtl_fc_stat_hits, 0), fm = atomic_exchange(&nvmtl_fc_stat_misses, 0),
-                                 fns = atomic_exchange(&nvmtl_fc_stat_miss_ns, 0), fmax = atomic_exchange(&nvmtl_fc_stat_miss_max_ns, 0);
-        nvlog_report("pipelines: specializations (AIR->SPIR-V with constants): %llu cache hits, %llu misses translated in %.1f ms (slowest %.1f ms)",
-              fh, fm, fns / 1e6, fmax / 1e6);
+                                 fns = atomic_exchange(&nvmtl_fc_stat_miss_ns, 0), fmax = atomic_exchange(&nvmtl_fc_stat_miss_max_ns, 0),
+                                 fdh = atomic_exchange(&nvmtl_fc_stat_disk_hits, 0), fdns = atomic_exchange(&nvmtl_fc_stat_disk_hit_ns, 0);
+        nvlog_report("pipelines: specializations (AIR->SPIR-V with constants): %llu cache hits (%llu read from disk in %.1f ms), %llu misses translated in %.1f ms (slowest %.1f ms)",
+              fh, fdh, fdns / 1e6, fm, fns / 1e6, fmax / 1e6);
+        nvlog_report("pipelines: of the %.1f ms creating: address lowering %.1f ms (%llu translated, the rest from the lowering cache), "
+              "driver vkCreate*Pipelines %.1f ms, our other work %.1f ms",
+              g_plstat.ns / 1e6, g_plstat.lowerNs / 1e6, (unsigned long long)g_plstat.lowerMiss, g_plstat.vkNs / 1e6,
+              g_plstat.ns > g_plstat.lowerNs + g_plstat.vkNs ? (g_plstat.ns - g_plstat.lowerNs - g_plstat.vkNs) / 1e6 : 0.0);
         nvlog_report("pipelines: %llu s: render %llu, compute %llu (new key %llu, repeat of a key built earlier in this process %llu, failed %llu), "
               "%.1f ms creating, slowest %.1f ms (%llu+%llu B SPIR-V), %llu KB SPIR-V in, VkPipelineCache %s (%llu passed it), %u keys seen",
               (unsigned long long)((now - g_plstat.lastMs) / 1000), (unsigned long long)g_plstat.render, (unsigned long long)g_plstat.compute,

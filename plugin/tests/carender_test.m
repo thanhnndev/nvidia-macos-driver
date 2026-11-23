@@ -80,15 +80,19 @@ int main(int argc, char **argv) { @autoreleasepool {
     // handed over by mach port, one "decoded" (rows written, seed moved) per frame; every CARENDER_SWITCH frames
     // (frames / 3) a new pool replaces it while the client keeps the old one alive (a seek or resolution change)
     const int vpool = getenv("CARENDER_POOL") ? atoi(getenv("CARENDER_POOL")) : 12, vswitch = getenv("CARENDER_SWITCH") ? atoi(getenv("CARENDER_SWITCH")) : frames / 3;
+    // CARENDER_VW / _VH: frame size (3840x2160); CARENDER_FPS: pace the frames (0 = as fast as they go), so a pool larger
+    // than fps x NVMTL_KEEP_SHADOW_MS reuses each frame later than the shadow timeout (the thrash case)
+    const int vw = getenv("CARENDER_VW") ? atoi(getenv("CARENDER_VW")) : 3840, vh = getenv("CARENDER_VH") ? atoi(getenv("CARENDER_VH")) : 2160;
+    const double vfps = getenv("CARENDER_FPS") ? atof(getenv("CARENDER_FPS")) : 0;
     NSMutableArray *vold = [NSMutableArray array]; CVPixelBufferRef *v4 = calloc(vpool, sizeof *v4); mach_port_t *v4port = calloc(vpool, sizeof *v4port);
     void (^mkpool)(int) = ^(int gen) {
         for (int i = 0; i < vpool; i++) {
             if (v4[i]) { [vold addObject:(__bridge id)v4[i]]; CVPixelBufferRelease(v4[i]); }   // old pool: still held by the client
             NSDictionary *a = @{(id)kCVPixelBufferIOSurfacePropertiesKey:@{}};
-            v4[i] = NULL; CVPixelBufferCreate(NULL, 3840, 2160, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, (__bridge CFDictionaryRef)a, &v4[i]);
+            v4[i] = NULL; CVPixelBufferCreate(NULL, vw, vh, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, (__bridge CFDictionaryRef)a, &v4[i]);
             v4port[i] = v4[i] ? IOSurfaceCreateMachPort(CVPixelBufferGetIOSurface(v4[i])) : MACH_PORT_NULL;
             if (gen == 0 && i == 0 && v4[0]) { IOSurfaceRef sf = CVPixelBufferGetIOSurface(v4[0]); const uint8_t *b0 = IOSurfaceGetBaseAddress(sf);
-                printf("video 4: pool of %d x420 3840x2160, plane offsets +%ld +%ld, pitch %zu %zu, switch every %d frames\n", vpool,
+                printf("video 4: pool of %d x420 %dx%d at %.0f fps, plane offsets +%ld +%ld, pitch %zu %zu, switch every %d frames\n", vpool, vw, vh, vfps,
                        (long)((const uint8_t *)IOSurfaceGetBaseAddressOfPlane(sf, 0) - b0), (long)((const uint8_t *)IOSurfaceGetBaseAddressOfPlane(sf, 1) - b0),
                        IOSurfaceGetBytesPerRowOfPlane(sf, 0), IOSurfaceGetBytesPerRowOfPlane(sf, 1), vswitch); }
         } };
@@ -110,6 +114,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         if (vl && video == 1) vl.contents = (__bridge id)CVPixelBufferGetIOSurface(vb[f & 3]);
         if (vl && video == 2) { IOSurfaceRef sr = IOSurfaceLookupFromMachPort(vport[f & 7]); vl.contents = (__bridge id)sr; if (sr) CFRelease(sr); }
         if (vl && video == 4) {
+            if (vfps > 0) { static double next; const double nowt = CACurrentMediaTime(); if (!next) next = nowt;
+                            next += 1.0 / vfps; if (next > nowt) usleep((useconds_t)((next - nowt) * 1e6)); }
             if (vswitch > 0 && f && f % vswitch == 0) mkpool(f / vswitch);
             CVPixelBufferRef pb = v4[f % vpool];
             CVPixelBufferLockBaseAddress(pb, 0);   // the decoder's write: moves the seed, so the plane rows go in again

@@ -410,6 +410,21 @@ static NVMTLSurfKey *nvmtl_surf_key(uint32_t sid, uint32_t plane, uint64_t w, ui
 @end
 @implementation NVMTLSurfKeep
 @end
+// Per keep table: the unused-plane-shadow rule's own clock and its adaptive timeout (see the sweep). effMs starts at
+// NVMTL_KEEP_SHADOW_MS; a window in which dropped frames came back (a pool whose reuse period is longer than the
+// timeout: each return is a full re-import and a new shadow) raises it past the measured period; it halves back toward
+// the base only after a window in which nothing came back and no entry sat between the base and the raised timeout (so a
+// slow pool the raise protects does not lose it every other window).
+@interface NVMTLShadowState : NSObject { @public uint64_t lastSweep, winStart, winDrops, winBack, winNeed, winHeld; long effMs; }
+@end
+@implementation NVMTLShadowState
+@end
+static char nvmtl_shadow_state_key;
+static NVMTLShadowState *nvmtl_shadow_state(NSDictionary *keep, long baseMs) {
+    NVMTLShadowState *st = objc_getAssociatedObject(keep, &nvmtl_shadow_state_key);
+    if (!st) { st = [NVMTLShadowState new]; st->effMs = baseMs; objc_setAssociatedObject(keep, &nvmtl_shadow_state_key, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    return st;
+}
 
 @implementation NVMTLDevice
 + (void)load {
@@ -1076,14 +1091,15 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
           "main thread), idle %llu MB at the last sweep, slowest sweep dropped %llu; expired came back < 250 ms %llu, < 1 s %llu, "
           "< 3 s %llu, later %llu; held entries refreshed %llu (by a live wrapper %llu, by IOSurfaceIsInUse %llu); idle-cap drops came back < 250 ms %llu, "
           "< 1 s %llu, < 3 s %llu, later %llu; sweeps skipped (rate limit) %llu; dead entries dropped at once %llu (%llu MB); "
-          "unused plane shadows dropped %llu (%llu MB), came back < 1 s %llu, < 3 s %llu, < 10 s %llu, later %llu",
+          "unused plane shadows dropped %llu (%llu MB), came back < 1 s %llu, < 3 s %llu, < 10 s %llu, later %llu; their timeout %ld ms",
           (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.hits, nvmtl_sk.misses, nvmtl_sk.fresh,
           nvmtl_sk.otherKey, nvmtl_sk.gone[NVMTL_GONE_UNHELD], nvmtl_sk.gone[NVMTL_GONE_EXPIRED], nvmtl_sk.gone[NVMTL_GONE_CAP], nvmtl_sk.gone[NVMTL_GONE_DEAD],
           (unsigned long)keep.count, nvmtl_sk.sweeps ? nvmtl_sk.sweepNsSum / nvmtl_sk.sweeps / 1000 : 0,
           nvmtl_sk.sweepNsMax / 1000, nvmtl_sk.drops, nvmtl_sk.idleBytes >> 20, nvmtl_sk.maxSweepDrops,
           nvmtl_sk.expBack[0], nvmtl_sk.expBack[1], nvmtl_sk.expBack[2], nvmtl_sk.expBack[3], nvmtl_sk.heldRefresh, nvmtl_sk.viewRefresh, nvmtl_sk.useRefresh,
           nvmtl_sk.capBack[0], nvmtl_sk.capBack[1], nvmtl_sk.capBack[2], nvmtl_sk.capBack[3], nvmtl_sk.sweepSkips, nvmtl_sk.deadDrops, nvmtl_sk.deadBytes >> 20,
-          nvmtl_sk.shadowDrops, nvmtl_sk.shadowBytes >> 20, nvmtl_sk.shadowBack[0], nvmtl_sk.shadowBack[1], nvmtl_sk.shadowBack[2], nvmtl_sk.shadowBack[3]);
+          nvmtl_sk.shadowDrops, nvmtl_sk.shadowBytes >> 20, nvmtl_sk.shadowBack[0], nvmtl_sk.shadowBack[1], nvmtl_sk.shadowBack[2], nvmtl_sk.shadowBack[3],
+          ((NVMTLShadowState *)objc_getAssociatedObject(keep, &nvmtl_shadow_state_key)) ? ((NVMTLShadowState *)objc_getAssociatedObject(keep, &nvmtl_shadow_state_key))->effMs : 0L);
     const uint64_t logged = nvmtl_sk.logged;
     memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
 }
@@ -1107,7 +1123,13 @@ static void nvmtl_sk_miss(NSDictionary *keep, NVMTLSurfKey *key) {
                                      : g == NVMTL_GONE_SHADOW ? "dropped: unused plane shadow" : "dropped: idle cap";
             const uint64_t at = [nvmtl_sk_dropAt[sid] unsignedLongLongValue], now = nvmtl_keep_now_ms();
             const uint64_t back = at ? now - (at >> 20) : 0, idleAtDrop = at & 0xfffff;
-            if (g == NVMTL_GONE_SHADOW) nvmtl_sk.shadowBack[back < 1000 ? 0 : back < 3000 ? 1 : back < 10000 ? 2 : 3]++;
+            if (g == NVMTL_GONE_SHADOW) {
+                nvmtl_sk.shadowBack[back < 1000 ? 0 : back < 3000 ? 1 : back < 10000 ? 2 : 3]++;
+                // A frame back within 10 s of its drop: the pool cycles slower than the timeout. Its reuse period is about
+                // the timeout it was dropped at plus this gap; the sweep's window check raises the timeout past it.
+                NVMTLShadowState *st = objc_getAssociatedObject(keep, &nvmtl_shadow_state_key);
+                if (st && back < 10000) { st->winBack++; const uint64_t need = ((uint64_t)st->effMs + back) * 5 / 4 + 1000; if (need > st->winNeed) st->winNeed = need; }
+            }
             if (g == NVMTL_GONE_EXPIRED) {
                 nvmtl_sk.expBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
                 if (nvmtl_sk.expLogged++ < 6)   // per 30 s report: which surfaces come back after expiring
@@ -1193,7 +1215,7 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     pthread_mutex_unlock(&g_sk_lock);
 }
 static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
-    static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1, sweepMs = -1, keepSmallMs = -1, smallBytes = -1, keepShadowMs = 0; static uint64_t keepIdleBytes, lastSweep, lastShadowSweep; static int dropDead = -1;
+    static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1, sweepMs = -1, keepSmallMs = -1, smallBytes = -1, keepShadowMs = 0; static uint64_t keepIdleBytes, lastSweep; static int dropDead = -1; static long keepShadowMaxMs = 0;
     if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 30000;
                       e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48;
                       e = getenv("NVMTL_KEEP_IDLE_MAX"); keepIdleMax = e ? atol(e) : 2048; if (keepIdleMax < keepIdle) keepIdleMax = keepIdle;
@@ -1205,8 +1227,10 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
                       // Dead entries (see the sweep) go at once outside WindowServer; NVMTL_KEEP_DEAD=0/1 overrides.
                       e = getenv("NVMTL_KEEP_DEAD"); dropDead = e ? e[0] == '1' : strcmp(getprogname(), "WindowServer") != 0;
                       e = getenv("NVMTL_KEEP_SHADOW_MS"); keepShadowMs = e ? atol(e) : 3000;
+                      e = getenv("NVMTL_KEEP_SHADOW_MAX_MS"); keepShadowMaxMs = e ? atol(e) : keepViewMs; if (keepShadowMaxMs < keepShadowMs) keepShadowMaxMs = keepShadowMs;
                       nvlog("surface keep: a read-only plane's GPU shadow (plane start or pitch off 256 B: a full copy of the plane) is dropped "
-                            "%ld ms after its last use by a command buffer, held or not (NVMTL_KEEP_SHADOW_MS, 0 = never)", keepShadowMs);
+                            "%ld ms after its last use by a command buffer, held or not (NVMTL_KEEP_SHADOW_MS, 0 = never); raised up to %ld ms while dropped "
+                            "frames come back (NVMTL_KEEP_SHADOW_MAX_MS)", keepShadowMs, keepShadowMaxMs);
                       nvlog("surface keep: dead entries %s (NVMTL_KEEP_DEAD)", dropDead ? "dropped at once" : "kept to the idle rules");
                       nvlog("surface keep: idle entries kept for %ld ms, at least %ld, then up to %llu MB, at most %ld "
                             "(NVMTL_KEEP_MS / NVMTL_KEEP_IDLE / NVMTL_KEEP_IDLE_MB / NVMTL_KEEP_IDLE_MAX); drops released off the main thread",
@@ -1235,9 +1259,27 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     // held 70 such frames in WindowServer (1.74 GB, the whole of its 1.76 GB of idle GPU memory) while the decoder cycled
     // far fewer. A frame that comes back after the drop is imported again, and its rows are copied in as they would be
     // anyway after a new decode (the seed moved). Only entries nothing else holds a texture of (retain count 1), checked
-    // once a second (one table lookup each).
-    const int shadowSweep = keepShadowMs > 0 && now - lastShadowSweep >= 1000;
-    if (shadowSweep) lastShadowSweep = now;
+    // once a second per table (a linear scan of the plugin's shadow list for each such entry: a few hundred entries).
+    // Thrash bound: a pool whose reuse period is longer than the timeout would drop and re-import every frame (a 4K
+    // pool of 72+ at 24 fps: ~600 MB/s of wired allocation churn). Every 10 s: if dropped frames came back within 10 s
+    // (at least 4 and a quarter of the drops), the timeout goes past the period they showed (and at least doubles), up
+    // to NVMTL_KEEP_SHADOW_MAX_MS; a window with none, and with no entry idle between the base and the raised timeout,
+    // halves it back toward NVMTL_KEEP_SHADOW_MS.
+    NVMTLShadowState *sst = keepShadowMs > 0 ? nvmtl_shadow_state(keep, keepShadowMs) : nil;
+    const int shadowSweep = sst && now - sst->lastSweep >= 1000;
+    if (shadowSweep) {
+        sst->lastSweep = now;
+        if (!sst->winStart) sst->winStart = now;
+        if (now - sst->winStart >= 10000) {
+            const long old = sst->effMs;
+            if (sst->winBack >= 4 && sst->winBack * 4 >= sst->winDrops) sst->effMs = MIN(keepShadowMaxMs, MAX(old * 2, (long)sst->winNeed));
+            else if (!sst->winBack && !sst->winHeld && old > keepShadowMs) sst->effMs = MAX(keepShadowMs, old / 2);
+            if (sst->effMs != old) nvlog("surface keep: unused-plane-shadow timeout %ld -> %ld ms (last 10 s: %llu dropped, %llu back within 10 s, "
+                                         "longest reuse seen %llu ms, %llu kept only by the raise)", old, sst->effMs, sst->winDrops, sst->winBack, sst->winNeed, sst->winHeld);
+            sst->winStart = now; sst->winDrops = sst->winBack = sst->winNeed = sst->winHeld = 0;
+        }
+    }
+    const long shadowMs = sst ? sst->effMs : 0;
     // Each kept backing holds one retain on its surface (nvmtlNewSurfaceTexture). A surface can have several entries: one
     // per plane (two-plane video, 420v/x420: plane 0 and plane 1 are separate keys) or one per key variant (other-key
     // misses). Counted against "retain count > 1", those entries saw each other's retains as an outside holder and
@@ -1253,7 +1295,8 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         (void)stop; __unsafe_unretained NVMTLTexture *b = e->_tex;   // no extra retain: the retain count below must see only real holders
         if (shadowSweep && b->_hostRO && CFGetRetainCount((__bridge CFTypeRef)b) == 1) {
             uint64_t sb = 0; const long long ims = nvmtl_vk_image_btsh_watched_idle_ms(&b->_i, &sb);
-            if (ims >= keepShadowMs) { nvmtl_sk.shadowDrops++; nvmtl_sk.shadowBytes += sb; [unshadow addObject:k]; return; }
+            if (ims >= shadowMs) { nvmtl_sk.shadowDrops++; nvmtl_sk.shadowBytes += sb; sst->winDrops++; [unshadow addObject:k]; return; }
+            if (ims >= keepShadowMs) sst->winHeld++;   // idle past the base timeout, kept by a raised one
         }
         // Held elsewhere (WindowServer layer contents): in use now, so its idle time starts when it is released. Without
         // this, a surface on screen for > NVMTL_KEEP_MS without a new wrap expired at the first sweep after its release.

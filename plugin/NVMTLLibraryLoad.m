@@ -1179,7 +1179,8 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
 
 // WS-CPU fix 1: specialization counters for the 30 s "pipelines:" report (nvmtl_vk.c). The per-miss "fc cache: miss" line
 // is rate-limited by nvlog after 8, and one miss of WindowServer's fixed_frag_lpf_cpf cost 2.7-3.6 s (2026-11-19 12:36).
-_Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns;
+_Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns,
+                          nvmtl_fc_stat_disk_hits, nvmtl_fc_stat_disk_hit_ns;   // disk hits: read + unseal of the file
 NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *name, NSDictionary *constants,
                                        const uint32_t *idx, const uint32_t *sizes,
                                        const uint8_t *const *payloads, size_t n, NSString **err)
@@ -1209,6 +1210,7 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
         file = nil;
         if (hit) {
             gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation);
+            nvmtl_fc_stat_disk_hits++; nvmtl_fc_stat_disk_hit_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
             [nvmtl_memo() setObject:hit forKey:path cost:hit.length];
             nvlog("fc cache: HIT %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
                   (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,

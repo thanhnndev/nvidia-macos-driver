@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <stddef.h>
 
+/* LOWER CACHE: this pass shapes what the lowering cache (low2) stores. Bump NVMTL_LOWER_PASSES_VERSION (nvmtl_vk.c) whenever
+   its output for a given input can change, or every process keeps loading the old result from disk. */
 static int nvmtl_relax_physical_bounds(uint32_t *w, size_t count) {
     if (!w || count < 5 || w[0] != 0x07230203u || !w[3] || w[3] > 0x1000000u) return -1;
     unsigned char *physical = calloc(w[3], 1);
