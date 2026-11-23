@@ -3072,17 +3072,19 @@ static nvmtl_btsh *nvmtl_btsh_take_locked(const void *key)
 /* WS-CPU 8.9: who makes the per-present VkBuffers and image views. NVMTL_CHURN_SITES=1 records the three callers above
  * each create (backtrace) and the census prints the busiest sites; off, the hooks cost one load. Debug log only. */
 #include <execinfo.h>
-enum { NVMTL_CS_BUF, NVMTL_CS_VIEW, NVMTL_CS_N };
+/* NVMTL_CS_COMMIT (WS-CPU 9.4): plain -commit calls that are not the commit inside commitAndWaitUntilSubmitted, i.e.
+ * the command buffers WindowServer commits on top of one per present; recorded from the caller of -commit. */
+enum { NVMTL_CS_BUF, NVMTL_CS_VIEW, NVMTL_CS_COMMIT, NVMTL_CS_N };
 #define NVMTL_CS_CAP 48
 typedef struct { void *f[3]; unsigned long long n, last; } nvmtl_churn_site;
 static nvmtl_churn_site g_cs[NVMTL_CS_N][NVMTL_CS_CAP]; static unsigned g_cs_n[NVMTL_CS_N];
 static pthread_mutex_t g_cs_lock = PTHREAD_MUTEX_INITIALIZER; static int g_cs_on = -1;
-static void nvmtl_churn_note(int kind)
+static __attribute__((noinline)) void nvmtl_churn_note_skip(int kind, int skip)
 {
     if (g_cs_on < 0) { const char *e = getenv("NVMTL_CHURN_SITES"); g_cs_on = e && *e == '1'; }
     if (!g_cs_on) return;
-    void *bt[6]; const int n = backtrace(bt, 6);
-    void *f[3] = { n > 2 ? bt[2] : NULL, n > 3 ? bt[3] : NULL, n > 4 ? bt[4] : NULL };
+    void *bt[9]; const int n = backtrace(bt, 9), b0 = 2 + skip;
+    void *f[3] = { n > b0 ? bt[b0] : NULL, n > b0 + 1 ? bt[b0 + 1] : NULL, n > b0 + 2 ? bt[b0 + 2] : NULL };
     pthread_mutex_lock(&g_cs_lock);
     unsigned i = 0;
     for (; i < g_cs_n[kind]; i++) if (!memcmp(g_cs[kind][i].f, f, sizeof f)) break;
@@ -3090,10 +3092,13 @@ static void nvmtl_churn_note(int kind)
     if (i < NVMTL_CS_CAP) g_cs[kind][i].n++;
     pthread_mutex_unlock(&g_cs_lock);
 }
+static __attribute__((noinline)) void nvmtl_churn_note(int kind) { nvmtl_churn_note_skip(kind, 1); }
+/* called from -[NVMTLCommandBuffer commit] for a plain commit: bt[0] note_skip, bt[1] this, bt[2] -commit, bt[3] its caller */
+__attribute__((noinline)) void nvmtl_vk_commit_site(void) { nvmtl_churn_note_skip(NVMTL_CS_COMMIT, 1); }
 static void nvmtl_churn_sites_dump(double presents)
 {
     if (g_cs_on != 1) return;
-    static const char *nm[NVMTL_CS_N] = { "VkBuffer", "image view" };
+    static const char *nm[NVMTL_CS_N] = { "VkBuffer", "image view", "plain commit" };
     pthread_mutex_lock(&g_cs_lock);
     for (int k = 0; k < NVMTL_CS_N; k++)
         for (unsigned i = 0; i < g_cs_n[k]; i++) {
@@ -3102,7 +3107,8 @@ static void nvmtl_churn_sites_dump(double presents)
             if (!d) continue;
             char b[3][96];
             for (int j = 0; j < 3; j++) { Dl_info di; b[j][0] = 0;
-                if (c->f[j] && dladdr(c->f[j], &di) && di.dli_sname) snprintf(b[j], sizeof b[j], "%s+%lu", di.dli_sname, (unsigned long)((char *)c->f[j] - (char *)di.dli_saddr));
+                if (c->f[j] && dladdr(c->f[j], &di) && di.dli_sname) { const char *im = di.dli_fname ? strrchr(di.dli_fname, '/') : NULL;
+                    snprintf(b[j], sizeof b[j], "%s`%s+%lu", im ? im + 1 : "?", di.dli_sname, (unsigned long)((char *)c->f[j] - (char *)di.dli_saddr)); }
                 else if (c->f[j]) snprintf(b[j], sizeof b[j], "%p", c->f[j]); }
             nvlog_report("churn site %s: %.2f per present (%llu): %s <- %s <- %s", nm[k], d / presents, d, b[0], b[1], b[2]);
         }

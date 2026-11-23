@@ -4940,15 +4940,16 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 // normal submission-only contract.
 // On the 890M NMXAccel orders the swap after the GPU work instead (NVMTLEventSync.m, NMXFencePending/Done): a command
 // buffer whose written surfaces all carry a fence only waits until it is submitted.
+static __thread int t_in_cawus;
 - (BOOL)commitAndWaitUntilSubmitted {
     nvmtl_vk_frame_census(NVC_CAWUS);
     static int ws = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
-    [self commit];
+    t_in_cawus = 1; [self commit]; t_in_cawus = 0;
     if (ws && !_nmxFenced) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
-- (void)commit { nvmtl_vk_frame_census(NVC_COMMIT); [self nvmtlSubmitWithEvents]; }
+- (void)commit { nvmtl_vk_frame_census(NVC_COMMIT); if (!t_in_cawus) nvmtl_vk_commit_site(); [self nvmtlSubmitWithEvents]; }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
 }
