@@ -48,8 +48,8 @@
 + * is a stub returning -EINVAL). One SMU metrics table transfer per read (smu_cmn_get_metrics_table, bypassing the
 + * driver's cache), nothing periodic. features != 0: the SMU feature list instead of the metrics (smu_cmn_get_pp_feature_mask).
 + *
-+ * GFXOFF: SMU 14.0.0's ppt has no gfx_off status/residency/entrycount (the calls return -EOPNOTSUPP and are printed as
-+ * such). What the driver knows is printed instead: PP_GFXOFF_MASK in pp_feature, gfx_off_req_count (0 = GFXOFF
++ * GFXOFF: SMU 14.0.0's ppt has no gfx_off status/residency/entrycount (the smu_get_*_gfxoff calls return -EINVAL, printed as
++ * r-22). What the driver knows is printed instead: PP_GFXOFF_MASK in pp_feature, gfx_off_req_count (0 = GFXOFF
 + * allowed; every amdgpu_gfx_off_ctrl(false) holder adds 1) and gfx_off_state (the SMU was told AllowGfxOff). Whether
 + * the island actually powers down shows as gfx_power and gfxclk falling to the floor between frames.
 + */
