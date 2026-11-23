@@ -1,0 +1,121 @@
+--- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
++++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
+@@ -4891,3 +4891,118 @@
+ 	amdgpu_dpm_stb_debug_fs_init(adev);
+ #endif
+ }
++
++/*
++ * ga403wm power-under-load (debug.nmx_gpu_metrics, read-only). What Linux shows in gpu_metrics, amdgpu_pm_info and
++ * pp_features, without sysfs: the port's sysfs bridge cannot reach these attributes (LinuxKPI pm_runtime_get_if_active
++ * is a stub returning -EINVAL). One SMU metrics table transfer per read (smu_cmn_get_metrics_table, bypassing the
++ * driver's cache), nothing periodic. features != 0: the SMU feature list instead of the metrics (smu_cmn_get_pp_feature_mask).
++ *
++ * GFXOFF: SMU 14.0.0's ppt has no gfx_off status/residency/entrycount (the calls return -EOPNOTSUPP and are printed as
++ * such). What the driver knows is printed instead: PP_GFXOFF_MASK in pp_feature, gfx_off_req_count (0 = GFXOFF
++ * allowed; every amdgpu_gfx_off_ctrl(false) holder adds 1) and gfx_off_state (the SMU was told AllowGfxOff). Whether
++ * the island actually powers down shows as gfx_power and gfxclk falling to the floor between frames.
++ */
++#include "amdgpu_smu.h"
++int nmx_amdgpu_power_format(struct drm_device *ddev, char *buf, size_t size, int features);
++int nmx_amdgpu_power_format(struct drm_device *ddev, char *buf, size_t size, int features)
++{
++	struct amdgpu_device *adev = drm_to_adev(ddev);
++	struct gpu_metrics_v3_0 *m;
++	void *gm = NULL;
++	size_t o = 0;
++	ssize_t len;
++	u32 req, st = 0, res = 0;
++	u64 entries = 0;
++	bool state;
++	int r_st, r_res, r_ent, i;
++
++#define O_P(...) do { if (o < size) o += (size_t)scnprintf(buf + o, size - o, __VA_ARGS__); } while (0)
++	O_P("dpm_enabled %d sw_smu %d pp_feature 0x%x pp_feature_mask_param 0x%x pg_flags 0x%x cg_flags 0x%llx\n",
++	    adev->pm.dpm_enabled, is_support_sw_smu(adev), adev->pm.pp_feature, amdgpu_pp_feature_mask,
++	    adev->pg_flags, (unsigned long long)adev->cg_flags);
++	if (adev->in_suspend || adev->in_s0ix) {
++		O_P("suspended (in_suspend %d in_s0ix %d): no SMU query\n", adev->in_suspend, adev->in_s0ix);
++		goto out;
++	}
++
++	mutex_lock(&adev->gfx.gfx_off_mutex);
++	req = adev->gfx.gfx_off_req_count;
++	state = adev->gfx.gfx_off_state;
++	mutex_unlock(&adev->gfx.gfx_off_mutex);
++	r_st = amdgpu_get_gfx_off_status(adev, &st);
++	r_res = amdgpu_get_gfx_off_residency(adev, &res);
++	r_ent = amdgpu_get_gfx_off_entrycount(adev, &entries);
++	O_P("gfxoff allowed_by_mask %d req_count %u state %d status %u(r%d) residency %u(r%d) entrycount %llu(r%d)\n",
++	    !!(adev->pm.pp_feature & PP_GFXOFF_MASK), req, state, st, r_st, res, r_res,
++	    (unsigned long long)entries, r_ent);
++	if (is_support_sw_smu(adev)) {
++		struct smu_context *smu = adev->powerplay.pp_handle;
++
++		O_P("smu workload_mask 0x%x power_profile_mode %u video_refs %u 3d_refs %u\n", smu->workload_mask,
++		    smu->power_profile_mode, smu->workload_refcount[PP_SMC_POWER_PROFILE_VIDEO],
++		    smu->workload_refcount[PP_SMC_POWER_PROFILE_FULLSCREEN3D]);
++	}
++	if (features)
++		goto feat;		/* debug.nmx_pp_features: the feature list only, no metrics transfer */
++
++	len = amdgpu_dpm_get_gpu_metrics(adev, &gm);
++	m = gm;
++	if (len < (ssize_t)sizeof(*m) || m == NULL || m->common_header.format_revision != 3 ||
++	    m->common_header.content_revision != 0) {
++		O_P("gpu_metrics unavailable (len %zd rev %u.%u)\n", len, m ? m->common_header.format_revision : 0,
++		    m ? m->common_header.content_revision : 0);
++		goto feat;
++	}
++	/* units: mW, MHz, %, MB/s, centi-degC; 65535 = not filled by this PMFW */
++	O_P("power_mw socket %u apu %u gfx %u all_core %u ipu %u dgpu %u sys %u soc_rest %d\n",
++	    m->average_socket_power, m->average_apu_power, m->average_gfx_power, m->average_all_core_power,
++	    m->average_ipu_power, m->average_dgpu_power, m->average_sys_power,
++	    (int)m->average_socket_power - (int)m->average_all_core_power - (int)m->average_gfx_power -
++	    (int)(m->average_ipu_power == 0xffff ? 0 : m->average_ipu_power));
++	O_P("core_power_mw");
++	for (i = 0; i < 16; i++)
++		O_P(" %u", m->average_core_power[i]);
++	O_P("\nclk_mhz gfx %u soc %u fclk %u uclk %u vclk %u vpe %u ipu %u mpipu %u gfx_max %u core_max %u\n",
++	    m->average_gfxclk_frequency, m->average_socclk_frequency, m->average_fclk_frequency,
++	    m->average_uclk_frequency, m->average_vclk_frequency, m->average_vpeclk_frequency,
++	    m->average_ipuclk_frequency, m->average_mpipu_frequency, m->current_gfx_maxfreq, m->current_core_maxfreq);
++	O_P("core_clk_mhz");
++	for (i = 0; i < 16; i++)
++		O_P(" %u", m->current_coreclk[i]);
++	O_P("\nactivity_pct gfx %u vcn %u dram_mbs read %u write %u\n", m->average_gfx_activity,
++	    m->average_vcn_activity, m->average_dram_reads, m->average_dram_writes);
++	O_P("core_c0_pct");
++	for (i = 0; i < 16; i++)
++		O_P(" %u", m->average_core_c0_activity[i]);
++	O_P("\nipu_pct");
++	for (i = 0; i < 8; i++)
++		O_P(" %u", m->average_ipu_activity[i]);
++	O_P("\ntemp_cC gfx %u soc %u skin %u core", m->temperature_gfx, m->temperature_soc, m->temperature_skin);
++	for (i = 0; i < 16; i++)
++		O_P(" %u", m->temperature_core[i]);
++	O_P("\nthrottle prochot %u spl %u fppt %u sppt %u thm_core %u thm_gfx %u thm_soc %u filter_us %u ns %llu\n",
++	    m->throttle_residency_prochot, m->throttle_residency_spl, m->throttle_residency_fppt,
++	    m->throttle_residency_sppt, m->throttle_residency_thm_core, m->throttle_residency_thm_gfx,
++	    m->throttle_residency_thm_soc, m->time_filter_alphavalue, (unsigned long long)m->system_clock_counter);
++feat:
++	if (features) {
++		/* smu_cmn_get_pp_feature_mask prints with sysfs_emit_at: a page-aligned PAGE_SIZE buffer */
++		char *pg = (char *)__get_free_page(GFP_KERNEL);
++
++		if (pg != NULL) {
++			int n = amdgpu_dpm_get_ppfeature_status(adev, pg);
++
++			if (n > 0 && n < PAGE_SIZE) {
++				pg[n] = '\0';
++				O_P("pp_features\n%s", pg);
++			} else {
++				O_P("pp_features unavailable (%d)\n", n);
++			}
++			free_page((unsigned long)pg);
++		}
++	}
++out:
++#undef O_P
++	return (int)(o < size ? o : size);
++}

@@ -1620,6 +1620,17 @@ static int out31_format(char *buf, size_t size)
     return (int)(o < size ? o : size);
 }
 
+/* power under load (docs/POWER-UNDER-LOAD.md step 1): debug.nmx_gpu_metrics / debug.nmx_pp_features, read-only.
+ * The formatter lives in amdgpu_pm.c (patch amdgpu-nmx-power-readout); like nmx_gtt it never brings the flip API up. */
+int nmx_amdgpu_power_format(struct drm_device *ddev, char *buf, size_t size, int features);
+
+int nmx_power_format(char *buf, size_t size, int features)
+{
+    if (fbs[0].fb == NULL)
+        return snprintf(buf, size, "not ready\n");
+    return nmx_amdgpu_power_format(fbs[0].fb->client.dev, buf, size, features);
+}
+
 /* ---- out-31 item 3: GTT accounting (debug.nmx_gtt) -----------------------------------------------------------------
  *
  * Linux has this as fdinfo (amdgpu_show_fdinfo -> amdgpu_vm_get_memory) plus the TTM managers' usage in debugfs

@@ -39,6 +39,7 @@ amdgpu-userptr-park.patch
 amdgpu-dm-frametrace.patch
 amdgpu-nmx-surface-fence.patch
 amdgpu-dm-nmx-flipdone.patch
+amdgpu-nmx-power-readout.patch
 amdgpu-vm-task-tgid.patch
 amdgpu-vm-fault-name.patch
 amdgpu-vm-fini-wait-diag.patch

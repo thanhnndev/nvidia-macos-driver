@@ -350,6 +350,31 @@ static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmx_gtt, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0, nmx_gtt_sysctl,
             "A", "out-31: GTT and VRAM used/size, and per open DRM file: pid, name, resident bytes per placement, evicted, BOs");
+/* power under load step 1: amdgpu's gpu_metrics (SMU 14.0.0 metrics table: socket/gfx/core power, clocks, activity,
+ * temperatures), the GFXOFF bookkeeping and the SMU workload profile; nmx_pp_features: the SMU feature list
+ * (pp_features). One SMU query per read, none for the size probe; nothing periodic. */
+extern "C" int nmx_power_format(char *buf, size_t size, int features);
+static int nmx_power_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 8 * 1024;
+    if (req->oldptr == USER_ADDR_NULL)
+        return SYSCTL_OUT(req, NULL, size);
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_power_format(buf, size, arg2); }
+    if (eerr) { IOFree(buf, size); return eerr; }
+    if (n < 0) n = 0;
+    if ((size_t)n > size) n = (int)size;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_gpu_metrics, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_power_sysctl, "A",
+            "power: gpu_metrics v3.0 (mW, MHz, %, centi-C), GFXOFF req_count/state, SMU workload; one SMU table read");
+SYSCTL_PROC(_debug, OID_AUTO, nmx_pp_features, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 1,
+            nmx_power_sysctl, "A", "power: SMU features enabled (amdgpu pp_features), GFXOFF bookkeeping");
 extern "C" int nmx_tt_census_format(char *buf, size_t size);
 /* Review of c001bc7: (b) a size probe (oldptr NULL; sysctl(8) probes first) returns the fixed size without walking the
  * BOs, so one read walks once; (c) no nested sysctlbyname from inside a sysctl handler (the reader reads
@@ -491,6 +516,8 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_flip_notified,
     &sysctl__debug_nmx_vbl_delivered,
     &sysctl__debug_nmx_gtt,
+    &sysctl__debug_nmx_gpu_metrics,
+    &sysctl__debug_nmx_pp_features,
     &sysctl__debug_nmx_tt_census,
     &sysctl__debug_nmx_userrec_live,
     &sysctl__debug_nmx_userrec_made,
