@@ -1,6 +1,43 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -781,6 +781,11 @@
+  * 3. other client can cancel their request of disable gfx off feature
+  * 4. other client should not send request to enable gfx off feature before disable gfx off feature.
+  */
++
++/* ga403wm power readout (debug.nmx_gpu_metrics): how often the driver asks for GFXOFF and how often it pulls the GFX
++ * island back up itself. allow = the last holder let go (the 100 ms delayed AllowGfxOff is queued); exit = a holder
++ * took it while the SMU had GFXOFF allowed (DisallowGfxOff sent: a forced power-up). hold = every new holder. */
++u64 nmx_gfxoff_allow, nmx_gfxoff_exit, nmx_gfxoff_hold;
+ 
+ void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable)
+ {
+@@ -803,6 +808,7 @@
+ 
+ 		if (adev->gfx.gfx_off_req_count == 0 &&
+ 		    !adev->gfx.gfx_off_state) {
++			nmx_gfxoff_allow++;
+ 			/* If going to s2idle, no need to wait */
+ 			if (adev->in_s0ix) {
+ 				if (!amdgpu_dpm_set_powergating_by_smu(adev,
+@@ -814,12 +820,14 @@
+ 			}
+ 		}
+ 	} else {
++		nmx_gfxoff_hold++;
+ 		if (adev->gfx.gfx_off_req_count == 0) {
+ 			cancel_delayed_work_sync(&adev->gfx.gfx_off_delay_work);
+ 
+ 			if (adev->gfx.gfx_off_state &&
+ 			    !amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, false, 0)) {
+ 				adev->gfx.gfx_off_state = false;
++				nmx_gfxoff_exit++;
+ 
+ 				if (adev->gfx.funcs->init_spm_golden) {
+ 					dev_dbg(adev->dev,
 --- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
 +++ b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
-@@ -4891,3 +4891,118 @@
+@@ -4891,3 +4891,122 @@
  	amdgpu_dpm_stb_debug_fs_init(adev);
  #endif
  }
@@ -17,6 +54,7 @@
 + * the island actually powers down shows as gfx_power and gfxclk falling to the floor between frames.
 + */
 +#include "amdgpu_smu.h"
++extern u64 nmx_gfxoff_allow, nmx_gfxoff_exit, nmx_gfxoff_hold;
 +int nmx_amdgpu_power_format(struct drm_device *ddev, char *buf, size_t size, int features);
 +int nmx_amdgpu_power_format(struct drm_device *ddev, char *buf, size_t size, int features)
 +{
@@ -49,6 +87,9 @@
 +	O_P("gfxoff allowed_by_mask %d req_count %u state %d status %u(r%d) residency %u(r%d) entrycount %llu(r%d)\n",
 +	    !!(adev->pm.pp_feature & PP_GFXOFF_MASK), req, state, st, r_st, res, r_res,
 +	    (unsigned long long)entries, r_ent);
++	O_P("gfxoff_ctrl allow %llu exit %llu hold %llu (amdgpu_gfx_off_ctrl: allow queued / forced power-up / holders)\n",
++	    (unsigned long long)nmx_gfxoff_allow, (unsigned long long)nmx_gfxoff_exit,
++	    (unsigned long long)nmx_gfxoff_hold);
 +	if (is_support_sw_smu(adev)) {
 +		struct smu_context *smu = adev->powerplay.pp_handle;
 +
