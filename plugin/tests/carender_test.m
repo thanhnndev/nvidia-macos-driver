@@ -88,7 +88,10 @@ int main(int argc, char **argv) { @autoreleasepool {
     void (^mkpool)(int) = ^(int gen) {
         for (int i = 0; i < vpool; i++) {
             if (v4[i]) { [vold addObject:(__bridge id)v4[i]]; CVPixelBufferRelease(v4[i]); }   // old pool: still held by the client
-            NSDictionary *a = @{(id)kCVPixelBufferIOSurfacePropertiesKey:@{}};
+            // CARENDER_PLANE_ALIGN=256: the layout VCNDec 0.2.1 asks for (planes at 256 B aligned offsets, aliased by the plugin)
+            const int palign = getenv("CARENDER_PLANE_ALIGN") ? atoi(getenv("CARENDER_PLANE_ALIGN")) : 0;
+            NSDictionary *a = palign ? @{(id)kCVPixelBufferIOSurfacePropertiesKey:@{}, (id)kCVPixelBufferPlaneAlignmentKey:@(palign)}
+                                     : @{(id)kCVPixelBufferIOSurfacePropertiesKey:@{}};
             v4[i] = NULL; CVPixelBufferCreate(NULL, vw, vh, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, (__bridge CFDictionaryRef)a, &v4[i]);
             v4port[i] = v4[i] ? IOSurfaceCreateMachPort(CVPixelBufferGetIOSurface(v4[i])) : MACH_PORT_NULL;
             if (gen == 0 && i == 0 && v4[0]) { IOSurfaceRef sf = CVPixelBufferGetIOSurface(v4[0]); const uint8_t *b0 = IOSurfaceGetBaseAddress(sf);
