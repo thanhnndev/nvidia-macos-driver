@@ -1829,12 +1829,15 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
        that renders with CA, WindowServer's MALLOC_LARGE. A file on a read-only mount cannot change while mapped, so map
        it: clean file-backed pages the kernel can drop, not footprint. The test is the mount, not the path: statfs follows
        symlinks, ".." and firmlinks to the real volume (/System/Volumes/Data, /System/Library/Caches and AssetsV2 are
-       writable). Anything else keeps the plain read: a file rewritten in place under a mapping is SIGBUS when _raw is
+       writable), and only the booted sealed system snapshot qualifies: local, read-only, root file system, APFS
+       (QuartzCore's file: apfs on / from disk1s4s1, rdonly local rootfs). A read-only DMG, network share or translocated
+       app is read-only too but can vanish under a mapping (eject, drop): those keep the plain read. Anything else keeps the plain read: a file rewritten in place under a mapping is SIGBUS when _raw is
        read later (extern names, MTLB dynamic info, the Sass digest). NVMTL_LIB_NOMAP=1: always the plain read. */
     NSData *d = nil;
     struct statfs sf;
-    if (fp && st0 == 0 && S_ISREG(s0.st_mode) && !getenv("NVMTL_LIB_NOMAP") && statfs(fp.fileSystemRepresentation, &sf) == 0 && (sf.f_flags & MNT_RDONLY)) {
-        d = [NSData dataWithContentsOfFile:fp options:NSDataReadingMappedAlways error:NULL];
+    if (fp && st0 == 0 && S_ISREG(s0.st_mode) && !getenv("NVMTL_LIB_NOMAP") && statfs(fp.fileSystemRepresentation, &sf) == 0 &&
+        (sf.f_flags & (MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS)) == (MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS) && !strcmp(sf.f_fstypename, "apfs")) {
+        d = [NSData dataWithContentsOfFile:fp options:NSDataReadingMappedIfSafe error:NULL];
         static int said; if (d && said++ < 4) nvlog("newLibraryWithURL: %s mapped (%lu bytes, not copied)", fp.lastPathComponent.UTF8String, (unsigned long)d.length);
     }
     if (!d) d = [NSData dataWithContentsOfURL:url];

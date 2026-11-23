@@ -4414,16 +4414,16 @@ void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes, uint64_t *hit, uin
    evicted, so a stored G1 refusal is not counted again. The census line gives hits, misses and evictions. */
 static void nvmtl_lower_memo_put_locked(NSData *key, NSData *d, NSData *info) {
     static uint64_t cap;
-    if (!cap) { const char *e = getenv("NVMTL_LOWER_MEMO_MB"); long mb = e ? strtol(e, NULL, 10) : 64; if (mb < 1 || mb > 4096) mb = 64; cap = (uint64_t)mb << 20; }
+    if (!cap) { const char *e = getenv("NVMTL_LOWER_MEMO_MB"); long mb = e ? strtol(e, NULL, 10) : 64; if (!e) mb = 64; else if (mb < 1) mb = 1; else if (mb > 4096) mb = 4096; cap = (uint64_t)mb << 20; }
     if (!g_lower_memo) { g_lower_memo = [NSMutableDictionary new]; g_lower_memo_order = [NSMutableArray new]; }
     if (g_lower_memo[key]) return;
     const uint64_t sz = key.length + d.length + info.length;
-    while (d && g_lower_memo_order.count && g_lower_memo_bytes + sz > cap) {
+    while (g_lower_memo_order.count && ((d && g_lower_memo_bytes + sz > cap) || g_lower_memo.count >= 4096)) {
         NSData *ok = g_lower_memo_order[0]; NSArray *ov = g_lower_memo[ok];
         if (ov) g_lower_memo_bytes -= ok.length + [ov[0] length] + [ov[1] length];
         [g_lower_memo removeObjectForKey:ok]; [g_lower_memo_order removeObjectAtIndex:0]; g_lower_memo_evict++;
     }
-    if (g_lower_memo.count >= 4096) return;   /* full of refusals and small modules: do not grow further */
+    if (g_lower_memo.count >= 4096) return;   /* 4096 refusals and nothing left to evict: do not grow further */
     g_lower_memo[key] = @[d ?: (id)[NSNull null], info]; g_lower_memo_bytes += sz;
     if (d) [g_lower_memo_order addObject:key];
 }
