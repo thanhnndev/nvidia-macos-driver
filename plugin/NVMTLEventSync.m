@@ -164,13 +164,15 @@ static void nvmtl_nmx_fence_publish(NVMTLCommandBuffer *cb, BOOL submitted) {
                             : @{ @"NMXFenceSubmitted": m[1] };
             IOSurfaceSetValues((__bridge IOSurfaceRef)m[0], (__bridge CFDictionaryRef)v);
         }
-        if (pend) atomic_fetch_add(submitted ? &gNmxPendMerged : &gNmxPendAlone, 1);
         cb->_nmxPendSent = YES;
         if (submitted) cb->_nmxSubSent = YES;
-        const unsigned long long k = gNmxPendMerged + gNmxPendAlone;
-        if (k == 1 || !(k & (k - 1)) || !(k & 0xFFFF))
-            nvlog("commit: fence marks: %llu with NMXFenceSubmitted in one call, %llu Pending alone (part not yet submitted)",
-                  (unsigned long long)gNmxPendMerged, (unsigned long long)gNmxPendAlone);
+        if (pend) {     /* a Submitted-only publish does not move the counts: no repeated census line (review of 97e286e) */
+            atomic_fetch_add(submitted ? &gNmxPendMerged : &gNmxPendAlone, 1);
+            const unsigned long long k = gNmxPendMerged + gNmxPendAlone;
+            if (k == 1 || !(k & (k - 1)) || !(k & 0xFFFF))
+                nvlog("commit: fence marks: %llu with NMXFenceSubmitted in one call, %llu Pending alone (part not yet submitted)",
+                      (unsigned long long)gNmxPendMerged, (unsigned long long)gNmxPendAlone);
+        }
     }
 }
 // out-31 (FRAME-PATH row 1): NMXGPU records each CS job's fence against the IOSurfaces it writes, and NMXAccel lets the

@@ -4258,7 +4258,7 @@ static NSString *nvmtl_lower_disk_path(const void *data, size_t len, uint32_t fl
 }
 static NSData *nvmtl_lower_disk_read(NSString *path, uint32_t info[4], int *had) {
     *had = 0;
-    NSData *f = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    NSData *f = [NSData dataWithContentsOfFile:path options:0 error:nil];   /* plain read: no SIGBUS in the hash (fc2 note) */
     if (!f) { atomic_fetch_add(&g_low_miss, 1); return nil; }
     uint32_t meta[5]; NSData *d = nil;
     const int ok = nvmtl_unseal(f, "NVLW", 2, meta, sizeof meta, &d) && meta[0] <= 1 && (meta[0] ? nvmtl_is_spirv(d) : !d);
@@ -4270,6 +4270,10 @@ static NSData *nvmtl_lower_disk_read(NSString *path, uint32_t info[4], int *had)
     }
     memcpy(info, meta + 1, 4 * sizeof *info);
     *had = 1;
+    if (meta[0] == 0) {     /* a stored G1 refusal counts and logs as the uncached one did (review of 97e286e) */
+        const unsigned long long r = atomic_fetch_add(&g_g1_refused, 1) + 1;
+        if (r <= 16 || !(r & (r - 1))) nvlog("G1: a module still declares a STORAGE-buffer table at 640 while the table is Uniform - REFUSED (%llu so far, from the lowering cache; NVMTL_TABLE_SSBO=1 restores it)", r);
+    }
     const unsigned long k = atomic_fetch_add(&g_low_hit, 1) + 1;
     nvmtl_cache_touch(path.fileSystemRepresentation);
     if (!(k & (k - 1))) nvlog("lower cache: %lu disk hits, %lu misses, %lu stored, %lu bad", k, (unsigned long)g_low_miss,

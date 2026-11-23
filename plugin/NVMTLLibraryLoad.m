@@ -1197,7 +1197,9 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     const BOOL fcCacheOn = path && !getenv("NVMTL_FCCACHE_OFF");   // no folder, no key: NSCache throws on a nil key
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:path] : nil;
     if (hit) { gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation); return hit; }   // keep the trimmer's age order
-    NSData *file = fcCacheOn ? [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil] : nil;
+    /* a plain read, not a mapping (review of 97e286e): an unreadable block or an outside truncation would SIGBUS inside the
+       hash, every start, since the file stays; a read error is nil = miss */
+    NSData *file = fcCacheOn ? [NSData dataWithContentsOfFile:path options:0 error:nil] : nil;
     if (file) {
         if (!nvmtl_unseal(file, "NVFC", 2, NULL, 0, &hit) || !nvmtl_is_spirv(hit)) {
             hit = nil; static _Atomic unsigned bad;
