@@ -338,6 +338,8 @@ int  nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, 
                                         const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
 /* a read-only shadowed alias of an IOSurface plane: copy its rows only when the surface's seed moved (1: watched) */
 int  nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf);
+long long nvmtl_vk_image_btsh_watched_idle_ms(const nvk_image *img, uint64_t *bytes);
+void nvmtl_vk_btsh_bytes(unsigned long long *all, unsigned long long *watched, unsigned *live);
 int  nvmtl_vk_btsh_seed_on(void);
 uint32_t nvmtl_vk_surface_seed_bump(void *surf);
 uint32_t nvmtl_vk_surface_seed_bump_now(void *surf);

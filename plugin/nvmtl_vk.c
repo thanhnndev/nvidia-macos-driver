@@ -2997,12 +2997,19 @@ typedef struct nvmtl_btsh {
        written only by nvmtl_btsh_pre under nvmtl_submit_mutex, so the copy that set them is queued before every command
        buffer that skips. */
     IOSurfaceRef surf; uint32_t seed; int seeded; uint64_t copied_ns;
+    uint64_t bytes;   /* its own memory (mr.size): not in g_alloc_bytes, so counted in g_btsh_bytes (2026-11-23 memory census) */
+    _Atomic uint64_t used_ns;   /* last command buffer that carried it (nvmtl_btsh_pre), or the watch start: the surface keep's shadow rule */
 } nvmtl_btsh;
 typedef struct { const void *key; nvmtl_btsh *s; } nvmtl_btsh_ent;
 static pthread_mutex_t g_btsh_lock = PTHREAD_MUTEX_INITIALIZER;
 static nvmtl_btsh_ent *g_btsh_ent; static unsigned g_btsh_n, g_btsh_cap;
 static _Atomic unsigned g_btsh_live;
 static _Atomic unsigned long long g_btsh_made, g_btsh_in, g_btsh_out, g_btsh_cbs, g_btsh_one, g_btsh_seedskip, g_btsh_watched, g_btsh_watch_miss;
+/* live shadow memory, all and the watched IOSurface-plane part of it (WindowServer 2026-11-23: 1.76 GB of idle GTT BOs
+   against 656 MB in "all our allocations", which never counted these) */
+static _Atomic unsigned long long g_btsh_bytes, g_btsh_wbytes;
+void nvmtl_vk_btsh_bytes(unsigned long long *all, unsigned long long *watched, unsigned *live)
+{ if (all) *all = atomic_load(&g_btsh_bytes); if (watched) *watched = atomic_load(&g_btsh_wbytes); if (live) *live = atomic_load(&g_btsh_live); }
 static int nvmtl_btsh_onecopy_on(void)
 {
     static int on = -1;
@@ -3021,8 +3028,9 @@ static void nvmtl_btsh_release(nvmtl_btsh *s)
 {
     if (!s || atomic_fetch_sub(&s->ref, 1) != 1) return;
     if (s->cimg) pvkDestroyImage(g_dev, s->cimg, NULL);
-    if (s->surf) CFRelease(s->surf);
+    if (s->surf) { CFRelease(s->surf); atomic_fetch_sub(&g_btsh_wbytes, s->bytes); }
     if (s->sh) pvkDestroyBuffer(g_dev, s->sh, NULL);
+    if (s->mem) atomic_fetch_sub(&g_btsh_bytes, s->bytes);
     if (s->mem) { pvkFreeMemory(g_dev, s->mem, NULL); if (!s->sysmem) g_budget_stale = 1; }
     free(s); atomic_fetch_sub(&g_btsh_live, 1);
 }
@@ -3230,10 +3238,27 @@ int nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf)
     int ok = 0;
     pthread_mutex_lock(&g_btsh_lock);
     nvmtl_btsh *s = nvmtl_btsh_find_locked((const void *)img->img);
-    if (s && !s->writable && !s->surf) { s->surf = (IOSurfaceRef)CFRetain((IOSurfaceRef)surf); ok = 1; }
+    if (s && !s->writable && !s->surf) { s->surf = (IOSurfaceRef)CFRetain((IOSurfaceRef)surf); atomic_fetch_add(&g_btsh_wbytes, s->bytes);
+        atomic_store(&s->used_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); ok = 1; }
     pthread_mutex_unlock(&g_btsh_lock);
     atomic_fetch_add(ok ? &g_btsh_watched : &g_btsh_watch_miss, 1);   // 2026-11-22 x420 check: is the gate engaged at all
     return ok;
+}
+/* Milliseconds since a command buffer last used the watched read-only IOSurface-plane shadow of img (and its bytes),
+   or -1 when img has none. The surface keep drops such an entry once nothing used it for NVMTL_KEEP_SHADOW_MS. */
+long long nvmtl_vk_image_btsh_watched_idle_ms(const nvk_image *img, uint64_t *bytes)
+{
+    if (!img || !img->img || !atomic_load(&g_btsh_live)) return -1;
+    long long ms = -1;
+    pthread_mutex_lock(&g_btsh_lock);
+    const nvmtl_btsh *s = nvmtl_btsh_find_locked((const void *)img->img);
+    if (s && s->surf) {
+        const uint64_t u = atomic_load(&s->used_ns), now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        ms = now > u ? (long long)((now - u) / 1000000ull) : 0;
+        if (bytes) *bytes = s->bytes;
+    }
+    pthread_mutex_unlock(&g_btsh_lock);
+    return ms;
 }
 static void nvmtl_btsh_retire(nvk_cmdbuf *c)
 {
@@ -3751,6 +3776,12 @@ void nvmtl_vk_frame_census(int what)
         const unsigned long long dns = sv[0] - sl[0], dn = sv[1] - sl[1]; sl[0] = sv[0]; sl[1] = sv[1];
         nvlog_report("frame census set snapshots: %.1f us per present (%.2f per present, %.2f us each)", dns / 1e3 / p, dn / p, dn ? dns / 1e3 / dn : 0.0);
     }
+    /* 2026-11-23 working-load memory question: what this process's own GPU memory is, by what made it, so it can be put
+       next to the kernel's per-process count (debug.nmx_tt_census: resident, idle) */
+    nvlog_report("frame census memory: our allocations %llu MB (images: device %llu MB, system %llu MB); buffer-texture shadows %llu MB "
+                 "in %u (watched IOSurface planes %llu MB), not in our allocations",
+                 (unsigned long long)(g_alloc_bytes >> 20), (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
+                 atomic_load(&g_btsh_bytes) >> 20, (unsigned)atomic_load(&g_btsh_live), atomic_load(&g_btsh_wbytes) >> 20);
     nvmtl_churn_sites_dump(p);
 }
 /* *dyn gets the dynamic offset of binding 640 that goes with the returned set (0 unless the desc-cache reused a set
@@ -6706,6 +6737,7 @@ static void nvmtl_btsh_pre(nvmtl_prologue *p, nvk_cmdbuf *c)
         nvmtl_btsh *s = (nvmtl_btsh *)c->btsh[i];
         int go = 1;
         if (s->surf) {
+            atomic_store(&s->used_ns, tnow);
             const uint32_t now = IOSurfaceGetSeed(s->surf);
             go = !s->seeded || s->seed != now || tnow - s->copied_ns >= nvmtl_btsh_seed_max_ns();
             s->seed = now; s->seeded = 1;
@@ -8698,7 +8730,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         VkResult ar = nvmtl_alloc_opaque_image_mem(&mr, &mem, &sysmem, "buffer texture shadow");
         if (ar != VK_SUCCESS) { nvlog("buffer texture: shadow memory (%llu B) -> %d", (unsigned long long)mr.size, (int)ar);
             atomic_fetch_add(&s->ref, 1); nvmtl_btsh_release(s); return -1; }
-        s->mem = (VkDeviceMemory)mem; s->sysmem = sysmem; atomic_fetch_add(&s->ref, 1);
+        s->mem = (VkDeviceMemory)mem; s->sysmem = sysmem; s->bytes = mr.size; atomic_fetch_add(&g_btsh_bytes, mr.size); atomic_fetch_add(&s->ref, 1);
         VkBufferCreateInfo sbi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)ipitch * (h - 1) + s->rowbytes,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
         VkResult br = pvkCreateBuffer(g_dev, &sbi, NULL, &s->sh);
