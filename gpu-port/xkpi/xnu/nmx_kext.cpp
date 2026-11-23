@@ -398,93 +398,113 @@ extern "C" int nmx_umap_cache = 0;
 SYSCTL_INT(_debug, OID_AUTO, nmx_umap_cache, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_umap_cache, 0,
            "user BO mapping cache: 0 driver default (default), 1 uncached, 2 write-combined");
 
+/* Every debug.nmx_* oid, registered by nmx_sysctl_install and unregistered by nmx_sysctl_remove (review of 7219f55:
+ * the two malloc_irq oids were declared but never registered, and no oid was unregistered at unload, which leaves
+ * them pointing into the unloaded kext). A new SYSCTL_* / NMX_CNT goes in this table. */
+static struct sysctl_oid *const nmx_oids[] = {
+    &sysctl__debug_nmx_trace,
+    &sysctl__debug_nmx_grab,
+    &sysctl__debug_nmx_jobs,
+    &sysctl__debug_nmx_jobs_flushed,
+    &sysctl__debug_nmx_jobs_no_flush,
+    &sysctl__debug_nmx_timeouts,
+    &sysctl__debug_nmx_grab_flushed,
+    &sysctl__debug_nmx_grab_skipped,
+    &sysctl__debug_nmx_grab_stray,
+    &sysctl__debug_nmx_pin_write_fail,
+    &sysctl__debug_nmx_pin_write_retry_ok,
+    &sysctl__debug_nmx_pin_ro_retry,
+    &sysctl__debug_nmx_pin_last_rc,
+    &sysctl__debug_nmx_pin_last_rc2,
+    &sysctl__debug_nmx_pin_other_fail,
+    &sysctl__debug_nmx_pin_other_rc,
+    &sysctl__debug_nmx_pin_other_name,
+    &sysctl__debug_nmx_pin_by_proc,
+    &sysctl__debug_nmx_pages_live,
+    &sysctl__debug_nmx_page_chunks,
+    &sysctl__debug_nmx_page_free,
+    &sysctl__debug_nmx_page_chunks_freed,
+    &sysctl__debug_nmx_page_chunks_filled,
+    &sysctl__debug_nmx_page_chunks_inline,
+    &sysctl__debug_nmx_page_single_runs,
+    &sysctl__debug_nmx_page_alloc_waits,
+    &sysctl__debug_nmx_page_alloc_fails,
+    &sysctl__debug_nmx_page_hwm,
+    &sysctl__debug_nmx_userwire_count,
+    &sysctl__debug_nmx_userwire_pages,
+    &sysctl__debug_nmx_userwire_by_kind,
+    &sysctl__debug_nmx_frametrace,
+    &sysctl__debug_nmx_surfwire_count,
+    &sysctl__debug_nmx_surfwire_pages,
+    &sysctl__debug_nmx_userwire_parked,
+    &sysctl__debug_nmx_userwire_parked_pages,
+    &sysctl__debug_nmx_userwire_parks,
+    &sysctl__debug_nmx_userwire_unparks,
+    &sysctl__debug_nmx_userwire_unpark_fail,
+    &sysctl__debug_nmx_upin_restore_fail,
+    &sysctl__debug_nmx_upin_destroy_rec,
+    &sysctl__debug_nmx_park_skip_busy,
+    &sysctl__debug_nmx_park_fail,
+    &sysctl__debug_nmx_park_skip_vm,
+    &sysctl__debug_nmx_park_abort,
+    &sysctl__debug_nmx_park_pt_update,
+    &sysctl__debug_nmx_fault_kick,
+    &sysctl__debug_nmx_fault_kick_ignored,
+    &sysctl__debug_nmx_fault_kick_fail,
+    &sysctl__debug_nmx_fault_kick_on,
+    &sysctl__debug_nmx_userptr_park_ms,
+    &sysctl__debug_nmx_ft,
+    &sysctl__debug_nmx_flip_kfence,
+    &sysctl__debug_nmx_flip_irq,
+    &sysctl__debug_nmx_vbl_irq,
+    &sysctl__debug_nmx_flip_fenced,
+    &sysctl__debug_nmx_flip_nofence,
+    &sysctl__debug_nmx_surf_fence_set,
+    &sysctl__debug_nmx_flip_notified,
+    &sysctl__debug_nmx_vbl_delivered,
+    &sysctl__debug_nmx_gtt,
+    &sysctl__debug_nmx_tt_census,
+    &sysctl__debug_nmx_userrec_live,
+    &sysctl__debug_nmx_userrec_made,
+    &sysctl__debug_nmx_userrec_freed,
+    &sysctl__debug_nmx_userrec_kept,
+    &sysctl__debug_nmx_surf_hint,
+    &sysctl__debug_nmx_surf_wire,
+    &sysctl__debug_nmx_surf_miss,
+    &sysctl__debug_nmx_surf_bad_page,
+    &sysctl__debug_nmx_surf_no_surf,
+    &sysctl__debug_nmx_surf_short,
+    &sysctl__debug_nmx_surf_prep_fail,
+    &sysctl__debug_nmx_umap_cache,
+    &sysctl__debug_nmx_wbinvd,
+    &sysctl__debug_nmx_umap_flush,
+    &sysctl__debug_nmx_malloc_irq,
+    &sysctl__debug_nmx_malloc_irq_caller,
+};
+static bool nmx_sysctl_installed;
+
 static void nmx_sysctl_install(void)
 {
-    static bool installed = false;
-    if (installed) return;
-    sysctl_register_oid(&sysctl__debug_nmx_trace);
-    sysctl_register_oid(&sysctl__debug_nmx_grab);
-    sysctl_register_oid(&sysctl__debug_nmx_jobs);
-    sysctl_register_oid(&sysctl__debug_nmx_jobs_flushed);
-    sysctl_register_oid(&sysctl__debug_nmx_jobs_no_flush);
-    sysctl_register_oid(&sysctl__debug_nmx_timeouts);
-    sysctl_register_oid(&sysctl__debug_nmx_grab_flushed);
-    sysctl_register_oid(&sysctl__debug_nmx_grab_skipped);
-    sysctl_register_oid(&sysctl__debug_nmx_grab_stray);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_write_fail);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_write_retry_ok);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_ro_retry);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_last_rc);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_last_rc2);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_other_fail);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_other_rc);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_other_name);
-    sysctl_register_oid(&sysctl__debug_nmx_pin_by_proc);
-    sysctl_register_oid(&sysctl__debug_nmx_pages_live);
-    sysctl_register_oid(&sysctl__debug_nmx_page_chunks);
-    sysctl_register_oid(&sysctl__debug_nmx_page_free);
-    sysctl_register_oid(&sysctl__debug_nmx_page_chunks_freed);
-    sysctl_register_oid(&sysctl__debug_nmx_page_chunks_filled);
-    sysctl_register_oid(&sysctl__debug_nmx_page_chunks_inline);
-    sysctl_register_oid(&sysctl__debug_nmx_page_single_runs);
-    sysctl_register_oid(&sysctl__debug_nmx_page_alloc_waits);
-    sysctl_register_oid(&sysctl__debug_nmx_page_alloc_fails);
-    sysctl_register_oid(&sysctl__debug_nmx_page_hwm);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_count);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_pages);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_by_kind);
-    sysctl_register_oid(&sysctl__debug_nmx_frametrace);
-    sysctl_register_oid(&sysctl__debug_nmx_surfwire_count);
-    sysctl_register_oid(&sysctl__debug_nmx_surfwire_pages);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_parked);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_parked_pages);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_parks);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_unparks);
-    sysctl_register_oid(&sysctl__debug_nmx_userwire_unpark_fail);
-    sysctl_register_oid(&sysctl__debug_nmx_upin_restore_fail);
-    sysctl_register_oid(&sysctl__debug_nmx_upin_destroy_rec);
-    sysctl_register_oid(&sysctl__debug_nmx_park_skip_busy);
-    sysctl_register_oid(&sysctl__debug_nmx_park_fail);
-    sysctl_register_oid(&sysctl__debug_nmx_park_skip_vm);
-    sysctl_register_oid(&sysctl__debug_nmx_park_abort);
-    sysctl_register_oid(&sysctl__debug_nmx_park_pt_update);
-    sysctl_register_oid(&sysctl__debug_nmx_fault_kick);
-    sysctl_register_oid(&sysctl__debug_nmx_fault_kick_ignored);
-    sysctl_register_oid(&sysctl__debug_nmx_fault_kick_fail);
-    sysctl_register_oid(&sysctl__debug_nmx_fault_kick_on);
-    sysctl_register_oid(&sysctl__debug_nmx_userptr_park_ms);
-    sysctl_register_oid(&sysctl__debug_nmx_ft);
+    if (nmx_sysctl_installed) return;
     {
         int v;
         if (PE_parse_boot_argn("nmxkfence", &v, sizeof v)) nmx_flip_kfence = v != 0;
         if (PE_parse_boot_argn("nmxflipirq", &v, sizeof v)) nmx_flip_irq = v != 0;
         if (PE_parse_boot_argn("nmxvblirq", &v, sizeof v)) nmx_vbl_irq = v != 0;
     }
-    sysctl_register_oid(&sysctl__debug_nmx_flip_kfence);
-    sysctl_register_oid(&sysctl__debug_nmx_flip_irq);
-    sysctl_register_oid(&sysctl__debug_nmx_vbl_irq);
-    sysctl_register_oid(&sysctl__debug_nmx_flip_fenced);
-    sysctl_register_oid(&sysctl__debug_nmx_flip_nofence);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_fence_set);
-    sysctl_register_oid(&sysctl__debug_nmx_flip_notified);
-    sysctl_register_oid(&sysctl__debug_nmx_vbl_delivered);
-    sysctl_register_oid(&sysctl__debug_nmx_gtt);
-    sysctl_register_oid(&sysctl__debug_nmx_tt_census);
-    sysctl_register_oid(&sysctl__debug_nmx_userrec_live);
-    sysctl_register_oid(&sysctl__debug_nmx_userrec_made);
-    sysctl_register_oid(&sysctl__debug_nmx_userrec_freed);
-    sysctl_register_oid(&sysctl__debug_nmx_userrec_kept);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_hint);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_wire);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_miss);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_bad_page);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_no_surf);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_short);
-    sysctl_register_oid(&sysctl__debug_nmx_surf_prep_fail);
-    sysctl_register_oid(&sysctl__debug_nmx_umap_cache);
-    sysctl_register_oid(&sysctl__debug_nmx_wbinvd);
-    sysctl_register_oid(&sysctl__debug_nmx_umap_flush);
-    installed = true;
+    for (size_t i = 0; i < sizeof nmx_oids / sizeof *nmx_oids; i++)
+        sysctl_register_oid(nmx_oids[i]);
+    nmx_sysctl_installed = true;
+}
+
+/* unload (nmx_kmod_stop), before the port goes: no new read reaches the driver; reads in flight are waited for by
+ * sysctl_unregister_oid */
+static void nmx_sysctl_remove(void)
+{
+    if (!nmx_sysctl_installed) return;
+    for (size_t i = sizeof nmx_oids / sizeof *nmx_oids; i-- > 0; )
+        sysctl_unregister_oid(nmx_oids[i]);
+    nmx_sysctl_installed = false;
 }
 
 /*
@@ -1000,9 +1020,11 @@ kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data)
             IOLog("NullMoth GPU: still in use; not unloading\n");
             return KERN_FAILURE;
         }
+        nmx_sysctl_remove();
         nmx_port_stop();
         g_started = false;
     }
+    nmx_sysctl_remove();     /* also when no device ever started the port (start() installs them first) */
     IOLockUnlock(g_lock);
     IOLockFree(g_lock);
     g_lock = nullptr;
