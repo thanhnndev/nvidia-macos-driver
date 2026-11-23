@@ -1081,6 +1081,8 @@ static struct { uint64_t hits, misses, fresh, otherKey, gone[6], shadowDrops, sh
 // idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
 static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropAt;
 static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_gone;   // surface ID -> why its last entry went
+static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropTab; // surface ID -> the keep table that dropped it (a
+                                                                      // return counts toward that table's raise only)
 static NSCountedSet<NSNumber *> *nvmtl_sk_live;                      // surface IDs with an entry in keep
 static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull; }
 static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
@@ -1127,8 +1129,10 @@ static void nvmtl_sk_miss(NSDictionary *keep, NVMTLSurfKey *key) {
                 nvmtl_sk.shadowBack[back < 1000 ? 0 : back < 3000 ? 1 : back < 10000 ? 2 : 3]++;
                 // A frame back within 10 s of its drop: the pool cycles slower than the timeout. Its reuse period is about
                 // the timeout it was dropped at plus this gap; the sweep's window check raises the timeout past it.
+                // The raise is per keep table (one per device), not per pool: every pool the table holds shares it.
                 NVMTLShadowState *st = objc_getAssociatedObject(keep, &nvmtl_shadow_state_key);
-                if (st && back < 10000) { st->winBack++; const uint64_t need = ((uint64_t)st->effMs + back) * 5 / 4 + 1000; if (need > st->winNeed) st->winNeed = need; }
+                const BOOL sameTab = [nvmtl_sk_dropTab[sid] unsignedLongLongValue] == (unsigned long long)(uintptr_t)(__bridge void *)keep;
+                if (st && sameTab && back < 10000) { st->winBack++; const uint64_t need = ((uint64_t)st->effMs + back) * 5 / 4 + 1000; if (need > st->winNeed) st->winNeed = need; }
             }
             if (g == NVMTL_GONE_EXPIRED) {
                 nvmtl_sk.expBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
@@ -1166,6 +1170,8 @@ static void nvmtl_sk_drop(NSMutableDictionary *keep, NVMTLSurfKey *k, unsigned w
     if (!nvmtl_sk_dropAt || nvmtl_sk_dropAt.count > 4096) nvmtl_sk_dropAt = [NSMutableDictionary new];
     const uint64_t now = nvmtl_keep_now_ms(), idle = old ? MIN(now - old->_last, (uint64_t)0xfffff) : 0;
     nvmtl_sk_dropAt[sid] = @((now << 20) | idle);
+    if (!nvmtl_sk_dropTab || nvmtl_sk_dropTab.count > 4096) nvmtl_sk_dropTab = [NSMutableDictionary new];
+    nvmtl_sk_dropTab[sid] = @((unsigned long long)(uintptr_t)(__bridge void *)keep);
 }
 // The nvmtl_sk* statistics and bookkeeping (and the sweep's statics) are process-wide while each device's table is
 // guarded by @synchronized(device): two devices in one process (review of 7ceff16) would mutate them concurrently, so
@@ -1228,6 +1234,7 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
                       e = getenv("NVMTL_KEEP_DEAD"); dropDead = e ? e[0] == '1' : strcmp(getprogname(), "WindowServer") != 0;
                       e = getenv("NVMTL_KEEP_SHADOW_MS"); keepShadowMs = e ? atol(e) : 3000;
                       e = getenv("NVMTL_KEEP_SHADOW_MAX_MS"); keepShadowMaxMs = e ? atol(e) : keepViewMs; if (keepShadowMaxMs < keepShadowMs) keepShadowMaxMs = keepShadowMs;
+                      if (keepShadowMaxMs > 3600000) keepShadowMaxMs = 3600000;   /* 1 h: keeps old * 2 below in range (review of 84e17be) */
                       nvlog("surface keep: a read-only plane's GPU shadow (plane start or pitch off 256 B: a full copy of the plane) is dropped "
                             "%ld ms after its last use by a command buffer, held or not (NVMTL_KEEP_SHADOW_MS, 0 = never); raised up to %ld ms while dropped "
                             "frames come back (NVMTL_KEEP_SHADOW_MAX_MS)", keepShadowMs, keepShadowMaxMs);
@@ -1272,7 +1279,7 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         if (!sst->winStart) sst->winStart = now;
         if (now - sst->winStart >= 10000) {
             const long old = sst->effMs;
-            if (sst->winBack >= 4 && sst->winBack * 4 >= sst->winDrops) sst->effMs = MIN(keepShadowMaxMs, MAX(old * 2, (long)sst->winNeed));
+            if (sst->winBack >= 4 && sst->winBack * 4 >= sst->winDrops) sst->effMs = (long)MIN((uint64_t)keepShadowMaxMs, MAX((uint64_t)old * 2, sst->winNeed));
             else if (!sst->winBack && !sst->winHeld && old > keepShadowMs) sst->effMs = MAX(keepShadowMs, old / 2);
             if (sst->effMs != old) nvlog("surface keep: unused-plane-shadow timeout %ld -> %ld ms (last 10 s: %llu dropped, %llu back within 10 s, "
                                          "longest reuse seen %llu ms, %llu kept only by the raise)", old, sst->effMs, sst->winDrops, sst->winBack, sst->winNeed, sst->winHeld);

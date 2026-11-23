@@ -478,6 +478,9 @@ static VkResult nvmtl_opaque_CreateCommandPool(VkDevice dev, const VkCommandPool
    translator) and the driver's own vkCreate*Pipelines (RADV: compile or its disk cache). The rest of "creating" is our
    other work (shader modules, reflection of the SPIR-V, layouts). */
 static __thread uint64_t t_pl_lower_ns, t_pl_vk_ns, t_pl_lower_miss;
+/* at the start of each graphics/compute create: stage time of a create that returned before nvmtl_pstat_record (a
+   failure) is dropped, not added to the thread's next pipeline (review of 84e17be) */
+static inline void nvmtl_pstat_begin(void) { t_pl_lower_ns = t_pl_vk_ns = t_pl_lower_miss = 0; }
 static VkResult nvmtl_opaque_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
@@ -4214,8 +4217,14 @@ int nvmtl_vk_pipeline_create_ex(const void *vs, size_t vn, const void *fs, size_
 {
     return nvmtl_vk_pipeline_create_ex2(vs, vn, fs, fn, vkfmt, hasDepth ? VK_FORMAT_D32_SFLOAT : 0, out);
 }
+/* set by a pass that returned its input unchanged for a transient reason (allocation failure): the lowering's answer is
+   then not deterministic and must not be stored in low2 or the memo (review of 84e17be) */
+static __thread int t_lower_transient;
 #include "nvmtl_physical_bounds.h"
 #include "nvmtl_independent_helpers.h"
+/* LOWER CACHE: the chain of our passes after the translator (physical bounds, independent helpers); a pass added here
+   changes what low2 stores. Bump NVMTL_LOWER_PASSES_VERSION (nvmtl_vk.c) whenever its output for a given input can
+   change, or every process keeps loading the old result from disk (NVMTL_LOWER_VERIFY=1 checks it). */
 static NSData *nvmtl_safe_physical_shader(const void *data, size_t len) {
     if (len % sizeof(uint32_t)) { nvlog("physical bounds: malformed shader size"); return nil; }
     NSMutableData *result = [NSMutableData dataWithBytes:data length:len];
@@ -4335,11 +4344,38 @@ static void nvmtl_lower_disk_write(NSString *path, NSData *d, const uint32_t inf
 }
 static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det);
 static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det);
+/* NVMTL_LOWER_VERIFY=1 (off by default; one boot after a package that touched a LOWER CACHE pass): every low2 disk hit
+   is lowered again uncached and compared (module bytes, align-guard info, refusal); a mismatch means our passes changed
+   without a NVMTL_LOWER_PASSES_VERSION bump. The disk answer is still used; the check only logs. */
+static _Atomic unsigned long g_low_verified, g_low_mismatch;
+static __thread uint64_t t_lower_verify_ns;
+static int nvmtl_lower_verify_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_LOWER_VERIFY"); on = e && e[0] == '1';
+        if (on) nvlog("lower cache: VERIFY on (NVMTL_LOWER_VERIFY=1): every disk hit is lowered again and compared, our passes version %u; the checks' time shows under \"our other work\" in the pipelines report", NVMTL_LOWER_PASSES_VERSION); }
+    return on;
+}
+static void nvmtl_lower_verify(NSString *path, const void *data, size_t len, uint32_t flags, NSData *disk, const uint32_t dinfo[4]) {
+    uint32_t info[4] = {0}; int det = 0;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    NSData *d = nvmtl_address_shader_g_uncached(data, len, flags, info, &det);
+    t_lower_verify_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;   /* the check's own time is not the pipeline's */
+    if (!det) return;   /* transient now: nothing to compare */
+    const int same = (d == nil) == (disk == nil) && (!d || [d isEqualToData:disk]) && !memcmp(info, dinfo, sizeof info);
+    const unsigned long k = atomic_fetch_add(&g_low_verified, 1) + 1;
+    if (!same) {
+        const unsigned long m = atomic_fetch_add(&g_low_mismatch, 1) + 1;
+        if (m <= 16 || !(m & (m - 1)))
+            nvlog("lower cache: VERIFY MISMATCH %s (flags %u): disk %lu B info %u/%u/%u/%u, now %lu B info %u/%u/%u/%u - our passes changed "
+                  "without a NVMTL_LOWER_PASSES_VERSION bump (%lu mismatches in %lu checks)", path.lastPathComponent.UTF8String, flags,
+                  (unsigned long)disk.length, dinfo[0], dinfo[1], dinfo[2], dinfo[3], (unsigned long)d.length, info[0], info[1], info[2], info[3], m, k);
+    } else if (!(k & (k - 1))) nvlog("lower cache: VERIFY %lu disk hits checked, %lu mismatches", k, (unsigned long)g_low_mismatch);
+}
 static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_t flags, uint32_t *info);
 static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t flags, uint32_t *info) {
-    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), v0 = t_lower_verify_ns;
     NSData *d = nvmtl_address_shader_g_body(data, len, flags, info);
-    t_pl_lower_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    t_pl_lower_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 - (t_lower_verify_ns - v0);
     return d;
 }
 static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_t flags, uint32_t *info) {
@@ -4357,6 +4393,7 @@ static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_
     NSString *dpath = nvmtl_lower_disk_path(data, len, flags);
     if (dpath) {
         int had = 0; NSData *d = nvmtl_lower_disk_read(dpath, got, &had);
+        if (had && nvmtl_lower_verify_on()) nvmtl_lower_verify(dpath, data, len, flags, d, got);
         if (had) {
             if (info) memcpy(info, got, sizeof got);
             pthread_mutex_lock(&lk);
@@ -4384,6 +4421,8 @@ static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_
     pthread_mutex_unlock(&lk);
     return d;
 }
+/* LOWER CACHE: what this returns (the G1 refusal) and its *det are what low2 stores. Bump NVMTL_LOWER_PASSES_VERSION
+   (nvmtl_vk.c) whenever its output for a given input can change. */
 static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det) {
     NSData *d = nvmtl_address_shader_g0(data, len, flags, info, det);
     if (d && nvmtl_table_ubo() && nvmtl_spirv_ssbo_table(d.bytes, d.length)) {
@@ -4393,9 +4432,13 @@ static NSData *nvmtl_address_shader_g_uncached(const void *data, size_t len, uin
     }
     return d;
 }
+/* LOWER CACHE: the flags sent to the translator (flags | (ubo ? 2 : 0)), the choice of the _ex entry, the info zeroing
+   and what counts as det all shape what low2 stores. Bump NVMTL_LOWER_PASSES_VERSION (nvmtl_vk.c) whenever its output
+   for a given input can change. */
 static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t flags, uint32_t *info, int *det) {
     if (info) memset(info, 0, 4 * sizeof *info);
     *det = 0;
+    t_lower_transient = 0;
     __attribute__((objc_precise_lifetime)) NSData *prepared = nvmtl_preserve_readonly_metadata([NSData dataWithBytes:data length:len]);
     data = prepared.bytes; len = prepared.length;
     static unsigned said;
@@ -4413,7 +4456,9 @@ static NSData *nvmtl_address_shader_g0(const void *data, size_t len, uint32_t fl
     }
     if (info && !nvmtl_align_guard_on()) memset(info, 0, 4 * sizeof *info);
     NSData *result = nvmtl_safe_physical_shader(out, n); xlate_free(out, n);
-    *det = result != nil;   /* the translator's module, through our passes; nil there is malformed input or no memory */
+    *det = result != nil && !t_lower_transient;   /* the translator's module, through our passes; nil there is malformed
+                                                     input or no memory, and a pass that skipped itself for lack of
+                                                     memory (t_lower_transient) gave a result that may differ next time */
     return result;
 }
 static NSData *nvmtl_address_shader(const void *data, size_t len) {
@@ -5096,6 +5141,7 @@ static int nvmtl_vk_pipeline_create_impl(const void *vs, size_t vn, const void *
                                          const void *vin_, uint32_t samples, const nvk_tess_desc *td, const nvk_rt *rt, void *out_)
 {
     nvk_pipeline pending = {0};
+    nvmtl_pstat_begin();
     const uint64_t pt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     int result = nvmtl_vk_pipeline_create_impl_lifetime_body(vs, vn, fs, fn, vkfmt, depthfmt, blend_, vin_, samples, td, rt, &pending);
     {   /* WS-CPU fix 1 counter: approximate key = shaders + attachment state (vertex layout and blend pointers left out) */
@@ -5354,6 +5400,7 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
 static int nvmtl_vk_compute_pipeline_create_g(const void *cs, size_t n, uint32_t flags, nvk_pipeline *out)
 {
     nvk_pipeline pending = {0};
+    nvmtl_pstat_begin();
     int result = nvmtl_vk_compute_pipeline_create_g_lifetime_body(cs, n, flags, &pending);
     if (result) { nvmtl_failed_pipeline(&pending); memset(out, 0, sizeof pending); }
     else *(nvk_pipeline *)out = pending;

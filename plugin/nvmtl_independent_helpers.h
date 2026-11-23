@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+/* LOWER CACHE: this opcode whitelist decides whether nvmtl_independent_helpers rewrites a module, so it shapes what the
+   lowering cache (low2) stores. Bump NVMTL_LOWER_PASSES_VERSION (nvmtl_vk.c) whenever its answer for a given input can
+   change, or every process keeps loading the old result from disk. */
 static BOOL nvmtl_helpers_independent(NSData *input) {
     if (!input || input.length < 20 || input.length % 4) return NO;
     const uint32_t *w=input.bytes; size_t count=input.length/4;
