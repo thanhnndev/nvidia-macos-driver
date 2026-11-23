@@ -354,10 +354,12 @@ SYSCTL_PROC(_debug, OID_AUTO, nmx_gtt, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOC
  * temperatures), the GFXOFF bookkeeping and the SMU workload profile; nmx_pp_features: the SMU feature list
  * (pp_features). One SMU query per read, none for the size probe; nothing periodic. */
 extern "C" int nmx_power_format(char *buf, size_t size, int features);
-/* The port's own GPU power changes (NMXGPU::setPowerState -> nmx_port_power: amdgpu suspend/resume) hold g_pwr_lock;
- * a reader only try-locks it, so it never delays or blocks a power change behind an SMU message, and it never queries
- * the SMU while the GPU is down (g_gpu_powered 0) or between the two halves of a transition. macOS readers keep
- * running across setPowerState; Linux relies on frozen user space instead. */
+/* The port's own GPU power changes (NMXGPU::setPowerState -> nmx_port_power: amdgpu suspend/resume, and
+ * systemWillShutdown) hold g_pwr_lock; a reader only try-locks it, so it never starts a query during a power change and
+ * never queries the SMU while the GPU is down (g_gpu_powered 0) or between the two halves of a transition. A reader
+ * already inside its query when a power change begins does delay it: setPowerState waits for the lock, i.e. for one
+ * SMU table transfer, normally about a millisecond, at worst one SMU message timeout per message (2-4 s) on a hung
+ * PMFW. macOS readers keep running across setPowerState; Linux relies on frozen user space instead. */
 static IOLock *g_pwr_lock;
 static volatile int g_gpu_powered = 1;
 static int nmx_power_sysctl SYSCTL_HANDLER_ARGS
@@ -1065,8 +1067,13 @@ IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
 
 void NMXGPU::systemWillShutdown(IOOptionBits spec)
 {
-    if (dev_ != nullptr)
+    if (dev_ != nullptr) {
+        /* as setPowerState: no power readout may query the SMU while (or after) the port tears the GPU down */
+        if (g_pwr_lock) IOLockLock(g_pwr_lock);
+        g_gpu_powered = 0;
         nmx_port_shutdown(dev_);
+        if (g_pwr_lock) IOLockUnlock(g_pwr_lock);
+    }
     IOService::systemWillShutdown(spec);
 }
 
@@ -1081,7 +1088,11 @@ kern_return_t nmx_kmod_start(kmod_info_t *ki, void *data)
 {
     g_lock = IOLockAlloc();
     g_pwr_lock = IOLockAlloc();
-    return g_lock && g_pwr_lock ? KERN_SUCCESS : KERN_FAILURE;
+    if (g_lock && g_pwr_lock)
+        return KERN_SUCCESS;
+    if (g_lock) { IOLockFree(g_lock); g_lock = nullptr; }
+    if (g_pwr_lock) { IOLockFree(g_pwr_lock); g_pwr_lock = nullptr; }
+    return KERN_FAILURE;
 }
 
 kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data)
