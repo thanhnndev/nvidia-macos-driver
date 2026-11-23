@@ -1,3 +1,4 @@
+#include <sys/mount.h>
 #include <os/lock.h>
 /*
  * NullMoth NVIDIA driver for macOS
@@ -1825,11 +1826,14 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
     NSString *fp = url.isFileURL ? url.absoluteURL.path : nil; struct stat s0; int st0 = fp ? stat(fp.fileSystemRepresentation, &s0) : -1;
     /* 2026-11-23 WindowServer memory: a library on the sealed system volume (Core Animation's QuartzCore default.metallib,
        153 MB) was read whole into malloc and kept in _raw for the library's life: 153 MB of dirty heap in every process
-       that renders with CA, WindowServer's MALLOC_LARGE. Files under /System cannot change while mapped (read-only
-       sealed volume, cryptexes too), so map them: clean file-backed pages the kernel can drop, not footprint. Other
-       paths keep the plain read (an app bundle can be replaced under a mapping: SIGBUS). NVMTL_LIB_NOMAP=1: old way. */
+       that renders with CA, WindowServer's MALLOC_LARGE. A file on a read-only mount cannot change while mapped, so map
+       it: clean file-backed pages the kernel can drop, not footprint. The test is the mount, not the path: statfs follows
+       symlinks, ".." and firmlinks to the real volume (/System/Volumes/Data, /System/Library/Caches and AssetsV2 are
+       writable). Anything else keeps the plain read: a file rewritten in place under a mapping is SIGBUS when _raw is
+       read later (extern names, MTLB dynamic info, the Sass digest). NVMTL_LIB_NOMAP=1: always the plain read. */
     NSData *d = nil;
-    if (fp && [fp hasPrefix:@"/System/"] && st0 == 0 && !getenv("NVMTL_LIB_NOMAP")) {
+    struct statfs sf;
+    if (fp && st0 == 0 && S_ISREG(s0.st_mode) && !getenv("NVMTL_LIB_NOMAP") && statfs(fp.fileSystemRepresentation, &sf) == 0 && (sf.f_flags & MNT_RDONLY)) {
         d = [NSData dataWithContentsOfFile:fp options:NSDataReadingMappedAlways error:NULL];
         static int said; if (d && said++ < 4) nvlog("newLibraryWithURL: %s mapped (%lu bytes, not copied)", fp.lastPathComponent.UTF8String, (unsigned long)d.length);
     }

@@ -225,7 +225,7 @@ static uint64_t g_pool_blocks, g_pool_live, g_pool_bytes;
 enum { MK_BUF_DEV, MK_BUF_HOST, MK_BUF_BAR1, MK_BUF_SPARSE, MK_BUF_IMPORT, MK_HEAP, MK_POOL_SYS, MK_POOL_VRAM, MK_N };
 static _Atomic int64_t g_mk[MK_N], g_mk_n[MK_N];
 static inline int mk_buf_kind(const nvk_buffer *b) { return b->imported ? MK_BUF_IMPORT : b->bar1 ? MK_BUF_BAR1 : b->sparse ? MK_BUF_SPARSE : b->map ? MK_BUF_HOST : MK_BUF_DEV; }
-void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes);
+void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes, uint64_t *hit, uint64_t *miss, uint64_t *evict);
 static inline void mk_add(int k, int64_t bytes, int n) { atomic_fetch_add(&g_mk[k], bytes); atomic_fetch_add(&g_mk_n[k], n); }
 static uint64_t g_img_align, g_sys_align;
 void (*nvmtl_purge_report_hook)(const char *why);
@@ -3805,16 +3805,16 @@ void nvmtl_vk_frame_census(int what)
                  (unsigned long long)(g_alloc_bytes >> 20), (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
                  atomic_load(&g_btsh_bytes) >> 20, (unsigned)atomic_load(&g_btsh_live), atomic_load(&g_btsh_wbytes) >> 20);
     {   int64_t m[MK_N], n[MK_N]; for (int i = 0; i < MK_N; i++) { m[i] = atomic_load(&g_mk[i]) >> 20; n[i] = atomic_load(&g_mk_n[i]); }
-        uint64_t lc = 0, lb = 0; nvmtl_lower_memo_stats(&lc, &lb);
+        uint64_t lc = 0, lb = 0, lh = 0, lm = 0, le = 0; nvmtl_lower_memo_stats(&lc, &lb, &lh, &lm, &le);
         nvlog_report("frame census memory by kind (MB/count): images device %llu system %llu; buffers device %lld/%lld, host %lld/%lld, "
                      "BAR1 %lld/%lld, sparse %lld/%lld, imported caller pages %lld/%lld; heaps %lld/%lld, of them buffer-pool blocks "
                      "system %lld/%lld + VRAM %lld/%lld holding %llu MB of live ranges in %llu buffers; parked buffers %llu MB in %u; "
-                     "lowering memo %llu entries %llu MB (CPU heap)",
+                     "lowering memo %llu entries %llu MB (CPU heap; %llu hits, %llu misses, %llu evicted so far)",
                      (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
                      m[MK_BUF_DEV], n[MK_BUF_DEV], m[MK_BUF_HOST], n[MK_BUF_HOST], m[MK_BUF_BAR1], n[MK_BUF_BAR1], m[MK_BUF_SPARSE], n[MK_BUF_SPARSE],
                      m[MK_BUF_IMPORT], n[MK_BUF_IMPORT], m[MK_HEAP], n[MK_HEAP], m[MK_POOL_SYS], n[MK_POOL_SYS], m[MK_POOL_VRAM], n[MK_POOL_VRAM],
                      (unsigned long long)(g_pool_bytes >> 20), (unsigned long long)g_pool_live,
-                     (unsigned long long)(g_bpark_bytes >> 20), (unsigned)g_bpark_n, (unsigned long long)lc, (unsigned long long)(lb >> 20)); }
+                     (unsigned long long)(g_bpark_bytes >> 20), (unsigned)g_bpark_n, (unsigned long long)lc, (unsigned long long)(lb >> 20), (unsigned long long)lh, (unsigned long long)lm, (unsigned long long)le); }
     nvmtl_churn_sites_dump(p);
 }
 /* *dyn gets the dynamic offset of binding 640 that goes with the returned set (0 unless the desc-cache reused a set
@@ -4400,21 +4400,32 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
     return d;
 }
 static NSMutableDictionary *g_lower_memo; static pthread_mutex_t g_lower_memo_lk = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_lower_memo_bytes;   /* keys (flags + input SPIR-V) + lowered modules, under g_lower_memo_lk */
-void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes) {
-    pthread_mutex_lock(&g_lower_memo_lk); *count = g_lower_memo.count; *bytes = g_lower_memo_bytes; pthread_mutex_unlock(&g_lower_memo_lk);
+static NSMutableArray *g_lower_memo_order;   /* keys of the entries that carry a module, oldest first */
+static uint64_t g_lower_memo_bytes;          /* keys (flags + length + SHA-256) + lowered modules + info, under g_lower_memo_lk */
+static uint64_t g_lower_memo_hit, g_lower_memo_miss, g_lower_memo_evict;
+void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes, uint64_t *hit, uint64_t *miss, uint64_t *evict) {
+    pthread_mutex_lock(&g_lower_memo_lk); *count = g_lower_memo.count; *bytes = g_lower_memo_bytes;
+    *hit = g_lower_memo_hit; *miss = g_lower_memo_miss; *evict = g_lower_memo_evict; pthread_mutex_unlock(&g_lower_memo_lk);
 }
 /* Bounded by bytes, not only by count: 4096 entries of ~700 KB lowered modules could reach GBs and the memo was never
-   trimmed. Past NVMTL_LOWER_MEMO_MB (default 32) it starts over; a miss then is a low2 disk hit (a file read), not a
-   translator run. */
+   trimmed. Past NVMTL_LOWER_MEMO_MB (default 64, 1-4096: ~90 Core Animation fragment modules; WindowServer saw 307
+   pipeline keys in a 30 min boot, and a pipeline already built is not lowered again) the oldest modules go first; a
+   miss then is a low2 disk hit (a file read), not a translator run. Refusals (no module) are a few bytes and are never
+   evicted, so a stored G1 refusal is not counted again. The census line gives hits, misses and evictions. */
 static void nvmtl_lower_memo_put_locked(NSData *key, NSData *d, NSData *info) {
-    static uint64_t cap; if (!cap) { const char *e = getenv("NVMTL_LOWER_MEMO_MB"); const long mb = e ? strtol(e, NULL, 10) : 32; cap = (uint64_t)(mb > 0 ? mb : 32) << 20; }
-    if (!g_lower_memo || g_lower_memo.count >= 4096 || g_lower_memo_bytes + d.length > cap) {
-        static unsigned resets; if (g_lower_memo.count && resets++ < 8) nvlog("lowering memo: started over at %lu entries, %llu MB (cap %llu MB)",
-                                                                               (unsigned long)g_lower_memo.count, (unsigned long long)(g_lower_memo_bytes >> 20), (unsigned long long)(cap >> 20));
-        g_lower_memo = [NSMutableDictionary new]; g_lower_memo_bytes = 0; }
-    if (!g_lower_memo[key]) g_lower_memo_bytes += key.length + d.length + info.length;
-    g_lower_memo[key] = @[d ?: (id)[NSNull null], info];
+    static uint64_t cap;
+    if (!cap) { const char *e = getenv("NVMTL_LOWER_MEMO_MB"); long mb = e ? strtol(e, NULL, 10) : 64; if (mb < 1 || mb > 4096) mb = 64; cap = (uint64_t)mb << 20; }
+    if (!g_lower_memo) { g_lower_memo = [NSMutableDictionary new]; g_lower_memo_order = [NSMutableArray new]; }
+    if (g_lower_memo[key]) return;
+    const uint64_t sz = key.length + d.length + info.length;
+    while (d && g_lower_memo_order.count && g_lower_memo_bytes + sz > cap) {
+        NSData *ok = g_lower_memo_order[0]; NSArray *ov = g_lower_memo[ok];
+        if (ov) g_lower_memo_bytes -= ok.length + [ov[0] length] + [ov[1] length];
+        [g_lower_memo removeObjectForKey:ok]; [g_lower_memo_order removeObjectAtIndex:0]; g_lower_memo_evict++;
+    }
+    if (g_lower_memo.count >= 4096) return;   /* full of refusals and small modules: do not grow further */
+    g_lower_memo[key] = @[d ?: (id)[NSNull null], info]; g_lower_memo_bytes += sz;
+    if (d) [g_lower_memo_order addObject:key];
 }
 static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_t flags, uint32_t *info) {
 #define cache g_lower_memo
@@ -4425,6 +4436,7 @@ static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_
     NSData *key = [NSData dataWithBytes:kb length:sizeof kb];
     pthread_mutex_lock(&lk);
     NSArray *hit = cache[key];
+    if (hit) g_lower_memo_hit++; else g_lower_memo_miss++;
     pthread_mutex_unlock(&lk);
     if (hit) {
         if (info) memcpy(info, [hit[1] bytes], 4 * sizeof *info);
@@ -7163,9 +7175,10 @@ static void nvmtl_vk_buffer_destroy_body(nvk_buffer *b)
     if (b->imported) nvmtl_nocopy_unregister(b->buf);
     pvkDestroyBuffer(g_dev, (VkBuffer)b->buf, NULL);
     if (b->pool) pool_buffer_release(b);
+    const int mk = mk_buf_kind(b);   /* before the unmap: a host buffer must be subtracted from "host", not "device" */
     if (!b->placed && !b->imported && b->mem && b->map && pvkUnmapMemory) { pvkUnmapMemory(g_dev, (VkDeviceMemory)b->mem); b->map = NULL; }
     if (b->bar1) g_bar1_bytes -= b->alloc;
-    if (!b->placed && b->mem) { mk_add(mk_buf_kind(b), -(int64_t)b->alloc, -1); pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL); g_alloc_bytes -= b->alloc; }
+    if (!b->placed && b->mem) { mk_add(mk, -(int64_t)b->alloc, -1); pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL); g_alloc_bytes -= b->alloc; }
     memset(b, 0, sizeof *b);
 }
 
