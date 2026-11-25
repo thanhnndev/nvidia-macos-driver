@@ -3763,6 +3763,7 @@ void nvmtl_vk_frame_census(int what)
 {
     if (what < 0 || what >= NVC_N) return;
     atomic_fetch_add_explicit(&g_fc[what], 1, memory_order_relaxed);
+    if (what == NVC_CAWUS && __builtin_expect(g_flc != 0, 0)) nvmtl_flc_present();   /* flip census: one present ends */
     if (what != NVC_COMMIT) return;
     /* awake time: an interval that spans a system sleep would otherwise dilute the rates */
     const unsigned long long now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -3778,6 +3779,7 @@ void nvmtl_vk_frame_census(int what)
     const unsigned long long hit = __atomic_load_n(&g_dc_hit, __ATOMIC_RELAXED), miss = __atomic_load_n(&g_dc_miss, __ATOMIC_RELAXED);
     const unsigned long long dh = hit - dclast[0], dm = miss - dclast[1]; dclast[0] = hit; dclast[1] = miss;
     const double p = d[NVC_CAWUS] ? (double)d[NVC_CAWUS] : 1.0;
+    { void nvmtl_flc_report(double secs); nvmtl_flc_report((double)(now - t0) / 1e9); }
     nvlog_report("frame census %.0f s: %llu commits, %llu commitAndWaitUntilSubmitted (presents), waits: %llu scheduled %llu completed; "
                  "%llu vkQueueSubmit; per present: %.2f commits, %.2f submits, %.2f views made / %.2f destroyed, %.2f VkBuffers made / %.2f destroyed, "
                  "%.2f desc-cache misses (%.1f %% of %llu lookups)",
@@ -6705,12 +6707,29 @@ void nvmtl_vk_pt_note(nvk_cmdbuf *c, uint32_t fs)
     if (!c || !c->pt_open || !c->pt_pool || c->pt_n >= 128 || !fs) return;
     for (unsigned k = 0; k < 4; k++) { if (c->pt_fs[c->pt_n][k] == fs) return; if (!c->pt_fs[c->pt_n][k]) { c->pt_fs[c->pt_n][k] = fs; return; } }
 }
+/* Pass timer trigger. 2026-11-25: was /tmp/nvmtl-passtime-request, polled by every process on the GPU (it armed
+   Zalo's GPU helper along with WindowServer). Now off unless NVMTL_PASSTIME=1 (environment or nvrm610.conf), and the
+   request file is in this process's own per-user temp dir (confstr _CS_DARWIN_USER_TEMP_DIR, mode 0700; WindowServer's
+   is its own user's) and carries the process name (nvmtl-passtime-request.WindowServer), so arming one process arms
+   no other. Compiled out of release builds. */
 int nvmtl_pt_armed(void)
 {
+#if NVMTL_RELEASE
+    return 0;
+#else
+    static int on = -1; static char req[600];
+    if (on < 0) {
+        const char *e = getenv("NVMTL_PASSTIME"); char td[512] = "";
+        if (e && *e && *e != '0' && confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td) > 1 && td[0] == '/') {
+            snprintf(req, sizeof req, "%s%snvmtl-passtime-request.%s", td, td[strlen(td) - 1] == '/' ? "" : "/", getprogname() ?: "unknown");
+            nvlog("passtime: NVMTL_PASSTIME set, polling %s", req); on = 1;
+        } else on = 0; }
+    if (!on) return 0;
     static uint64_t next; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (g_pt_left <= 0 && now >= next) { next = now + 250000000ull;
-        if (access("/tmp/nvmtl-passtime-request", F_OK) == 0) { unlink("/tmp/nvmtl-passtime-request"); g_pt_left = 400; nvlog("passtime: ARMED for 400 passes"); } }
+        if (access(req, F_OK) == 0) { unlink(req); g_pt_left = 400; nvlog("passtime: ARMED for 400 passes"); } }
     return g_pt_left > 0;
+#endif
 }
 void nvmtl_vk_cmd_end_render(nvk_cmdbuf *c) {
     pvkCmdEndRenderPass(c->cb); c->in_rp = 0;

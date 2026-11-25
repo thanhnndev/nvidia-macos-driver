@@ -199,6 +199,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
   NVMTLTexture *_resolve; uint32_t _passSamples;
   int _cull; uint32_t _passFmt; int _passDepth;
   uint32_t _load; BOOL _hasVP, _hasSC; float _vp[6]; uint32_t _sc[4];
+  BOOL _flcBig; MTLLoadAction _flcLoad; uint32_t _flcFs[8]; uint8_t _flcFsN;   /* flip census (NVMTLFlipCensus.m): this pass draws a >= 4 Mpx IOSurface target */
   NSMutableDictionary *_vertexSamplers, *_fragmentSamplers;
   NSMutableDictionary *_vbufAt, *_fbufAt;
   NVMTLRenderPipelineState *_ps;

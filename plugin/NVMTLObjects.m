@@ -1035,6 +1035,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (nvmtl_surface_pending_write(cb, r)) return;
     [t nvmtlSurfaceIn];
 }
+#import "NVMTLFlipCensus.m"
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
 static int nvmtl_noseed(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-noseed", F_OK) == 0;
@@ -2914,7 +2915,7 @@ bind:
         nvmtl_vk_cmd_bind_pipeline(&_cb->_c, &p->_p);
         static int told; if (!told++) nvlog("G12 a second pipeline was bound inside one encoder (first time in this process)");
     }
-    if (_cb->_c.pt_open && _cb->_c.pt_pool) {
+    if ((_cb->_c.pt_open && _cb->_c.pt_pool) || (_flcBig && g_flc == 1)) {
         static const char kPtHash = 0; NSNumber *hn = objc_getAssociatedObject(p, &kPtHash);
         if (!hn) {
             uint32_t hv = 0, hf = 0;
@@ -2924,20 +2925,53 @@ bind:
                 NSData *d = ((NVMTLFunction *)f)->_spirv; if (!d.length) continue;
                 uint32_t h = 2166136261u; const uint8_t *b = d.bytes; for (NSUInteger i = 0; i < d.length; i++) { h ^= b[i]; h *= 16777619u; }
                 if (s) hf = h; else hv = h;
-                NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/nvmtl/pstat"];
+                // 2026-11-25: per-user temp dir (WindowServer's home is not writable; nothing lands in ~/Library/Caches)
+                static NSString *pdir; if (!pdir) { char td[512] = ""; const char *e = getenv("TMPDIR");
+                    if (e && *e == '/') strlcpy(td, e, sizeof td); else if (confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td) <= 1) strlcpy(td, "/tmp", sizeof td);
+                    pdir = [[NSString stringWithUTF8String:td] stringByAppendingPathComponent:@"nvmtl-pstat"]; }
+                NSString *dir = pdir;
                 NSString *pth = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.%s.spv", h, s ? "frag" : "vert"]];
                 if (![[NSFileManager defaultManager] fileExistsAtPath:pth]) {
                     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-                    [d writeToFile:pth atomically:YES]; }
+                    [d writeToFile:pth atomically:YES];
+                    // the function constants that pick this variant of CA's shader (all CA fragment shaders share one name)
+                    NSMutableDictionary *fcn = [NSMutableDictionary dictionary];   // constant index -> name, from the AIR's reflection
+                    @try { NSDictionary *cd = [(NVMTLFunction *)f functionConstantsDictionary];
+                        for (NSString *nm in cd) { MTLFunctionConstant *c = cd[nm]; if ([c respondsToSelector:@selector(index)]) fcn[@(c.index)] = nm; } } @catch (id x) {}
+                    NSDictionary *fcd = ((NVMTLFunction *)f)->_fc; NSMutableString *t = [NSMutableString stringWithFormat:@"%@ %@\n", ((NVMTLFunction *)f)->_fname ?: @"?", ((NVMTLFunction *)f)->_stage ?: @""];
+                    for (NSString *k in [fcd.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) { return [@(a.integerValue) compare:@(b.integerValue)]; }]) {
+                        NSArray *a = fcd[k]; [t appendFormat:@"%@ %@", k, fcn[@(k.integerValue)] ?: @"?"];
+                        if ([a isKindOfClass:[NSArray class]]) for (id v in a) [t appendFormat:@" %02x", [v unsignedCharValue]];
+                        [t appendString:@"\n"]; }
+                    [t writeToFile:[pth stringByAppendingString:@".fc.txt"] atomically:YES encoding:NSUTF8StringEncoding error:NULL]; }
             }
             hn = @(((uint64_t)hv << 32) | hf);
             objc_setAssociatedObject(p, &kPtHash, hn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            {   // flip census: the fragment variant's non-zero function constants, by name ("fc_has_gamma_luts=01 ...")
+                id f = p->_descriptor.fragmentFunction; NSMutableString *nz = [NSMutableString string];
+                if ([f isKindOfClass:[NVMTLFunction class]]) {
+                    NSMutableDictionary *fcn = [NSMutableDictionary dictionary];
+                    @try { NSDictionary *cd = [(NVMTLFunction *)f functionConstantsDictionary];
+                        for (NSString *nm in cd) { MTLFunctionConstant *c = cd[nm]; if ([c respondsToSelector:@selector(index)]) fcn[@(c.index)] = nm; } } @catch (id x) {}
+                    NSDictionary *fcd = ((NVMTLFunction *)f)->_fc;
+                    for (NSString *k in [fcd.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) { return [@(a.integerValue) compare:@(b.integerValue)]; }]) {
+                        NSArray *a = fcd[k]; if (![a isKindOfClass:[NSArray class]]) continue; BOOL any = NO; for (id v in a) if ([v unsignedCharValue]) any = YES;
+                        if (!any) continue; NSString *nm = fcn[@(k.integerValue)] ?: [@"fc" stringByAppendingString:k];
+                        if ([nm hasPrefix:@"fc_"]) nm = [nm substringFromIndex:3];
+                        [nz appendFormat:@"%@%@=", nz.length ? @" " : @"", nm]; for (id v in a) [nz appendFormat:@"%02x", [v unsignedCharValue]]; } }
+                static const char kFlcNz = 0; objc_setAssociatedObject(p, &kFlcNz, nz.length ? nz : @"-", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                g_flc_nz_key = &kFlcNz; }
             extern int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n);
             char st[600]; nvmtl_vk_pipeline_stats(p->_p.pipe, st, sizeof st);
             nvlog("ptpso: vs %08x fs %08x | %s", hv, hf, st);
         }
         extern void nvmtl_vk_pt_note(nvk_cmdbuf *c, uint32_t fs);
         nvmtl_vk_pt_note(&_cb->_c, (uint32_t)(hn.unsignedLongLongValue & 0xffffffffu));
+        if (_flcBig && g_flc == 1) { const uint32_t fsh = (uint32_t)(hn.unsignedLongLongValue & 0xffffffffu); int seen = 0;
+            for (unsigned k = 0; k < _flcFsN; k++) if (_flcFs[k] == fsh) { seen = 1; break; }
+            if (!seen) { if (_flcFsN < 8) _flcFs[_flcFsN++] = fsh;   // once per pass and shader
+                NSString *nz = g_flc_nz_key ? objc_getAssociatedObject(p, g_flc_nz_key) : nil;
+                nvmtl_flc_fs(fsh, _flcLoad, nz.UTF8String); } }
     }
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)off atIndex:(NSUInteger)i {
@@ -3026,6 +3060,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     nvmtl_retain_resource(_cb, nt);
     nvmtl_surface_cpu_dump(nt->_parent ? nt->_parent : nt);
     nvmtl_surface_in_for_cb(_cb, nt);
+    if (__builtin_expect(g_flc != 0, 0)) nvmtl_flc_sample(nt);
     { NVMTLTexture *rt = nt->_parent ? nt->_parent : nt; nvtrace("FTEX[%lu] %ux%u surf %u view %d", (unsigned long)i, [nt nvi]->w, [nt nvi]->h,
         rt->_surf ? (unsigned)IOSurfaceGetID(rt->_surf) : 0u, nt->_parent != nil); }
     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_tbView, nt->_tbStorage);
@@ -4852,6 +4887,8 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     if (d.visibilityResultBuffer) [_resources addObject:d.visibilityResultBuffer];
     if (e->_target) { NVMTLTexture *sr = e->_target->_parent ? e->_target->_parent : e->_target;
         nvmtl_census("render target", [sr nvi]->w, [sr nvi]->h, sr->_surf != NULL);
+        if (__builtin_expect(g_flc != 0, 0)) { nvmtl_flc_target(sr, d.colorAttachments[0].loadAction); e->_flcLoad = d.colorAttachments[0].loadAction;
+            e->_flcBig = sr->_surf && g_flc == 1 && (uint64_t)[sr nvi]->w * [sr nvi]->h >= 4194304; }
         (void)nvtrace_scope([sr nvi]->w, [sr nvi]->h);
         nvtrace("PASS target %ux%u surf %u view %d load %lu store %lu clear (%.3g %.3g %.3g %.3g) depth %d", [sr nvi]->w, [sr nvi]->h,
             sr->_surf ? (unsigned)IOSurfaceGetID(sr->_surf) : 0u, e->_target->_parent != nil, (unsigned long)d.colorAttachments[0].loadAction,
