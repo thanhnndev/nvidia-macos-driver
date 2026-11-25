@@ -156,10 +156,12 @@ int main(void)
         CHECK(nmx_cur_fill(buf, 64, img, 3, 2) == 0, "fill 3x2 into 64");
         for (uint32_t y = 0; y < 64; y++)
             for (uint32_t x = 0; x < 64; x++) {
-                const uint32_t want = (x < 3 && y < 2) ? nmx_cur_premul(img[y * 3 + x]) : 0;
+                const uint32_t want = (x < 3 && y < 2) ? nmx_cur_pixel(img[y * 3 + x]) : 0;
                 CHECK(buf[y * 64 + x] == want, "fill %u,%u = %08x want %08x", x, y, buf[y * 64 + x], want);
             }
         CHECK(buf[64 * 64] == 0xabababab, "fill wrote past side*side");
+        CHECK(buf[2] == NMX_CUR_INVERT_SHOWN, "inverting pixel (0x00ffffff) must show as opaque grey, got %08x", buf[2]);
+        CHECK(nmx_cur_pixel(0) == 0 && nmx_cur_pixel(0x00123456) == 0, "other transparent pixels stay transparent");
         CHECK(nmx_cur_fill(buf, 64, img, 65, 1) == -1 && nmx_cur_fill(buf, 64, img, 1, 65) == -1, "oversize refused");
         CHECK(nmx_cur_buf_side(256, 256) == 256 && nmx_cur_buf_side(512, 256) == 256 && nmx_cur_buf_side(128, 128) == 128,
               "side 256/128");

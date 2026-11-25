@@ -39,10 +39,12 @@ void nmx_fb_close(void *dev);
 int nmx_fb_power(void *dev, int on);
 /* hardware cursor on the CRTC's cursor plane (nmx_fb_bridge.c, end of file); NMXAMDFB is the only caller */
 int nmx_fb_cursor_init(uint32_t *side);
+/* the kInvertingEncoding value NMXAMDFB offers IOFramebuffer (see nmx_fb_cursor.h) */
+#define NMX_CUR_INVERT_PIXEL 0x00ffffffu
 void nmx_fb_cursor_set_kick(void (*fn)(void *), void *arg);
 int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t seq, int32_t x, int32_t y, int visible);
 int nmx_fb_cursor_off(void);
-extern uint64_t gNmxCurCommits, gNmxCurFull, gNmxCurImages, gNmxCurBusy, gNmxCurErrors, gNmxCurRearms, gNmxCurOff;
+extern uint64_t gNmxCurCommits, gNmxCurFull, gNmxCurImages, gNmxCurErrors, gNmxCurRearms, gNmxCurOff;
 #ifdef __cplusplus
 }
 #endif

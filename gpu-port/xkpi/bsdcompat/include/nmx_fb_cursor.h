@@ -29,6 +29,25 @@ static inline uint32_t nmx_cur_premul(uint32_t s)
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
+/*
+ * Inverting pixels. IOFramebuffer::convertCursorImage turns a transparent white source pixel ("invert the screen under
+ * it") into the descriptor's kInvertingEncoding value, or refuses the whole image when the descriptor does not offer
+ * one. A refusal is not safe (WindowServer decides hardware vs software cursor before it loads the image, see
+ * nmx_fb.cpp), so NMXAMDFB offers the encoding with this value: every other transparent pixel converts to 0, so it
+ * cannot collide. DCN's colour cursor modes have no invert; such a pixel is drawn as opaque mid grey, visible on light
+ * and dark backgrounds.
+ */
+#ifndef NMX_CUR_INVERT_PIXEL
+#define NMX_CUR_INVERT_PIXEL 0x00ffffffu     /* also in nmx_port.h for NMXAMDFB */
+#endif
+#define NMX_CUR_INVERT_SHOWN 0xff808080u
+
+/* one converted pixel -> what goes into the cursor buffer */
+static inline uint32_t nmx_cur_pixel(uint32_t s)
+{
+    return s == NMX_CUR_INVERT_PIXEL ? NMX_CUR_INVERT_SHOWN : nmx_cur_premul(s);
+}
+
 /* side of the square cursor buffer: amdgpu_dm accepts a cursor FB whose pitch equals its width and is 64, 128 or 256
  * pixels and no larger than the CRTC's max_cursor_width/height (dm_check_cursor_fb); 0 = no usable size */
 static inline uint32_t nmx_cur_buf_side(uint32_t max_w, uint32_t max_h)
@@ -56,7 +75,7 @@ static inline int nmx_cur_fill(volatile uint32_t *dst, uint32_t side, const uint
         return -1;
     for (uint32_t y = 0; y < side; y++)
         for (uint32_t x = 0; x < side; x++)
-            dst[(uint64_t)y * side + x] = (y < h && x < w) ? nmx_cur_premul(src[(uint64_t)y * w + x]) : 0;
+            dst[(uint64_t)y * side + x] = (y < h && x < w) ? nmx_cur_pixel(src[(uint64_t)y * w + x]) : 0;
     return 0;
 }
 

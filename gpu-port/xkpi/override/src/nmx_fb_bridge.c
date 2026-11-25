@@ -1832,7 +1832,7 @@ int nmx_gtt_format(char *buf, size_t size)
  */
 #include "nmx_fb_cursor.h"
 
-uint64_t gNmxCurCommits, gNmxCurFull, gNmxCurImages, gNmxCurBusy, gNmxCurErrors, gNmxCurRearms, gNmxCurOff;
+uint64_t gNmxCurCommits, gNmxCurFull, gNmxCurImages, gNmxCurErrors, gNmxCurRearms, gNmxCurOff;
 
 static struct {
     struct mutex mtx;
@@ -1847,6 +1847,8 @@ static struct {
     int32_t x, y;
     void (*kick)(void *);
     void *kick_arg;
+    int kick_busy;                      /* cur_rearm callers inside kick (set_kick(NULL) waits them out) */
+    int mtx_inited, init_err;           /* init_err: a permanent init failure, latched (not retried per query) */
     uint32_t logs;
 } cur = { .cur = -1, .display_on = 1 };
 
@@ -1867,20 +1869,61 @@ static void cur_display(int on)
 
 static void cur_rearm(const char *why)
 {
+    void (*fn)(void *);
+
     if (!__atomic_load_n(&cur.ready, __ATOMIC_ACQUIRE))
         return;
     __atomic_store_n(&cur.rearm, 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&gNmxCurRearms, 1, __ATOMIC_RELAXED);
     CUR_LOG("NMX cursor: re-arm after %s\n", why);
-    if (cur.kick)
-        cur.kick(cur.kick_arg);
+    __atomic_add_fetch(&cur.kick_busy, 1, __ATOMIC_SEQ_CST);
+    fn = __atomic_load_n(&cur.kick, __ATOMIC_SEQ_CST);
+    if (fn)
+        fn(__atomic_load_n(&cur.kick_arg, __ATOMIC_ACQUIRE));
+    __atomic_sub_fetch(&cur.kick_busy, 1, __ATOMIC_RELEASE);
 }
 
-/* NMXAMDFB's thread call; called from any context (it only enters a thread call) */
+/* NMXAMDFB's kick (it only enters a thread call; called from any context). NULL unregisters and returns only when no
+ * cur_rearm is still inside the old kick (the vbl sink pattern). */
 void nmx_fb_cursor_set_kick(void (*fn)(void *), void *arg)
 {
-    cur.kick_arg = arg;
-    __atomic_store_n(&cur.kick, fn, __ATOMIC_RELEASE);
+    __atomic_store_n(&cur.kick, NULL, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&cur.kick_busy, __ATOMIC_SEQ_CST))
+        cpu_relax();
+    if (fn) {
+        __atomic_store_n(&cur.kick_arg, arg, __ATOMIC_RELEASE);
+        __atomic_store_n(&cur.kick, fn, __ATOMIC_SEQ_CST);
+    }
+}
+
+/* undo what nmx_fb_cursor_init did to one buffer before it failed */
+static void cur_buf_drop(struct drm_client_buffer *b, int pinned, int mapped)
+{
+    if (mapped)
+        drm_client_buffer_vunmap(b);
+    if (pinned) {
+        struct amdgpu_bo *bo = gem_to_amdgpu_bo(b->gem);
+        if (!amdgpu_bo_reserve(bo, false)) {
+            amdgpu_bo_unpin(bo);
+            amdgpu_bo_unreserve(bo);
+        }
+    }
+    drm_client_framebuffer_delete(b);
+}
+
+static int cur_init_fail(int e)
+{
+    int i;
+
+    for (i = 0; i < 2; i++)
+        if (cur.buf[i]) {
+            cur_buf_drop(cur.buf[i], 1, 1);
+            cur.buf[i] = NULL;
+            cur.va[i] = NULL;
+        }
+    if (e != EAGAIN)
+        cur.init_err = e;           /* getAttribute asks again on every mode set: do not rebuild buffers each time */
+    return e;
 }
 
 /*
@@ -1897,40 +1940,46 @@ int nmx_fb_cursor_init(uint32_t *side)
         *side = cur.side;
         return 0;
     }
+    if (cur.init_err)
+        return cur.init_err;
     if (!flip_init())
         return EAGAIN;
     if (flip.crtc->cursor == NULL)
-        return ENODEV;
+        return cur_init_fail(ENODEV);
     acrtc = to_amdgpu_crtc(flip.crtc);
     cur.side = nmx_cur_buf_side((uint32_t)acrtc->max_cursor_width, (uint32_t)acrtc->max_cursor_height);
     if (!cur.side) {
         CUR_LOG("NMX cursor: DC max cursor %ux%u, no hardware cursor\n", acrtc->max_cursor_width, acrtc->max_cursor_height);
-        return ENODEV;
+        return cur_init_fail(ENODEV);
     }
     cur.hide = (uint32_t)(acrtc->max_cursor_width > acrtc->max_cursor_height ? acrtc->max_cursor_width
                                                                              : acrtc->max_cursor_height);
-    mutex_init(&cur.mtx);
+    if (!cur.mtx_inited) {
+        mutex_init(&cur.mtx);
+        cur.mtx_inited = 1;
+    }
     for (i = 0; i < 2; i++) {
         struct drm_client_buffer *b = fb_create_vram(flip.nfb, cur.side, cur.side, DRM_FORMAT_ARGB8888);
         struct iosys_map map;
 
         if (IS_ERR_OR_NULL(b)) {
             CUR_LOG("NMX cursor: buffer %d not created (%ld)\n", i, (long)PTR_ERR(b));
-            return ENOMEM;
+            return cur_init_fail(ENOMEM);
         }
         if (b->fb->pitches[0] != cur.side * 4) {        /* dm_check_cursor_fb: pitch in pixels must equal the width */
             CUR_LOG("NMX cursor: buffer %d pitch %u, need %u\n", i, b->fb->pitches[0], cur.side * 4);
-            drm_client_framebuffer_delete(b);
-            return ENODEV;
+            cur_buf_drop(b, 0, 0);
+            return cur_init_fail(ENODEV);
         }
         if ((e = flip_pin(b, &cur.gpu[i]))) {
             CUR_LOG("NMX cursor: buffer %d would not pin (%d)\n", i, e);
-            drm_client_framebuffer_delete(b);
-            return ENOMEM;
+            cur_buf_drop(b, 0, 0);
+            return cur_init_fail(ENOMEM);
         }
-        if ((e = drm_client_buffer_vmap(b, &map))) {    /* stays pinned: never freed, like the flip chain */
+        if ((e = drm_client_buffer_vmap(b, &map))) {    /* up: stays pinned, never freed, like the flip chain */
             CUR_LOG("NMX cursor: buffer %d would not map (%d)\n", i, e);
-            return ENOMEM;
+            cur_buf_drop(b, 1, 0);
+            return cur_init_fail(ENOMEM);
         }
         cur.buf[i] = b;
         cur.va[i] = (volatile uint32_t *)(map.is_iomem ? (void *)map.vaddr_iomem : map.vaddr);
@@ -1981,8 +2030,8 @@ retry:
 
 /*
  * Bring the plane to: image seq (pixels img, w x h straight ARGB rows of w; NULL = keep what was uploaded), top-left at
- * x, y (IOFramebuffer's setCursorState coordinates), visible or not. Sleeps. 0 (done or nothing to do), EBUSY (an
- * earlier commit on the plane is in flight: ask again shortly), or an errno.
+ * x, y (IOFramebuffer's setCursorState coordinates), visible or not. Sleeps. 0 (done or nothing to do) or an errno (a failed commit marks the next one full).
+ * (amdgpu_dm turns an async-check -EBUSY into a full commit itself, so no EBUSY reaches here.)
  */
 int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t seq, int32_t x, int32_t y, int visible)
 {
@@ -2039,15 +2088,11 @@ int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t se
     } else {
         if (full)
             __atomic_store_n(&cur.rearm, 1, __ATOMIC_RELEASE);     /* still not on the plane: full commit next time */
-        if (ret == -EBUSY)
-            __atomic_add_fetch(&gNmxCurBusy, 1, __ATOMIC_RELAXED);
-        else {
-            __atomic_add_fetch(&gNmxCurErrors, 1, __ATOMIC_RELAXED);
-            CUR_LOG("NMX cursor: commit at %d,%d %s failed (%d)\n", x, y, full ? "(full)" : "(async)", ret);
-        }
+        __atomic_add_fetch(&gNmxCurErrors, 1, __ATOMIC_RELAXED);
+        CUR_LOG("NMX cursor: commit at %d,%d %s failed (%d)\n", x, y, full ? "(full)" : "(async)", ret);
     }
     mutex_unlock(&cur.mtx);
-    return ret == -EBUSY ? EBUSY : ret < 0 ? -ret : ret;
+    return ret < 0 ? -ret : ret;
 }
 
 /* the plane off (software cursor from now on, or the framebuffer going away). Sleeps. */

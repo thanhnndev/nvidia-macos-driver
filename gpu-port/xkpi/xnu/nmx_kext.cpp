@@ -334,37 +334,23 @@ NMX_CNT(nmx_flip_nofence, gNmxFlipNoFence, "out-31: fence-only flips refused bec
 NMX_CNT(nmx_surf_fence_set, gNmxSurfFenceSet, "out-31: CS jobs recorded as an IOSurface's last fence");
 NMX_CNT(nmx_flip_notified, gNmxFlipNotified, "out-31: pageflip IRQ notifications sent to NMXAccel");
 NMX_CNT(nmx_vbl_delivered, gNmxVblDelivered, "out-31: IOFramebuffer VBLs delivered from the CRTC vblank (only while a 'vbl ' registration is on)");
-/* hardware cursor (2026-11-25, nmx_fb.cpp / nmx_fb_bridge.c): boot-arg nmxhwcur=<0|1> (name audited against every
- * kext on disk) advertises the cursor plane and sets the switch; without it nothing changes */
+/* hardware cursor (2026-11-25 v2, nmx_fb.cpp / nmx_fb_bridge.c): boot-arg nmxhwcur=1 (name audited against every
+ * kext on disk) advertises the cursor plane at framebuffer open; anything else changes nothing. No run-time switch. */
 extern "C" int nmx_hwcursor, nmx_hwcursor_avail;
-extern "C" void nmx_hwcursor_changed(void);
-static int nmx_hwcursor_sysctl SYSCTL_HANDLER_ARGS
-{
-    int v = __atomic_load_n(&nmx_hwcursor, __ATOMIC_ACQUIRE);
-    int err = sysctl_handle_int(oidp, &v, 0, req);
-    if (err || !req->newptr)
-        return err;
-    v = v != 0;
-    if (__atomic_exchange_n(&nmx_hwcursor, v, __ATOMIC_SEQ_CST) != v)
-        nmx_hwcursor_changed();
-    return 0;
-}
-SYSCTL_PROC(_debug, OID_AUTO, nmx_hwcursor, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
-            nmx_hwcursor_sysctl, "I",
-            "hardware cursor: 1 = CRTC cursor plane, 0 = IOFramebuffer software cursor (only with boot-arg nmxhwcur)");
+SYSCTL_INT(_debug, OID_AUTO, nmx_hwcursor, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_hwcursor, 0,
+           "hardware cursor: 1 = boot-arg nmxhwcur=1 was given (read-only)");
 SYSCTL_INT(_debug, OID_AUTO, nmx_hwcursor_avail, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_hwcursor_avail, 0,
            "hardware cursor: 1 = the plane is up and the framebuffer advertises it");
 extern "C" volatile SInt64 gNmxCurStates, gNmxCurAccepted, gNmxCurSwFallback, gNmxCurCopyRetry;
 NMX_CNT(nmx_cur_commits, gNmxCurCommits, "hw cursor: cursor plane commits (async + full)");
-NMX_CNT(nmx_cur_full, gNmxCurFull, "hw cursor: of those, full commits (first, re-arm after a bridge commit / power-on)");
+NMX_CNT(nmx_cur_full, gNmxCurFull, "hw cursor: of those, commits asked for as full (first, after a re-arm); DM picks async or full itself");
 NMX_CNT(nmx_cur_images, gNmxCurImages, "hw cursor: images uploaded to the cursor buffers");
-NMX_CNT(nmx_cur_busy, gNmxCurBusy, "hw cursor: commits refused because the previous one was in flight (retried)");
 NMX_CNT(nmx_cur_errors, gNmxCurErrors, "hw cursor: failed commits / uploads");
 NMX_CNT(nmx_cur_rearms, gNmxCurRearms, "hw cursor: re-arms after the bridge's own commits (restore, hotplug, power-on)");
-NMX_CNT(nmx_cur_off, gNmxCurOff, "hw cursor: plane turned off (switch off, framebuffer stop)");
+NMX_CNT(nmx_cur_off, gNmxCurOff, "hw cursor: plane turned off (framebuffer stop)");
 NMX_CNT(nmx_cur_states, gNmxCurStates, "hw cursor: setCursorState calls from IOFramebuffer");
 NMX_CNT(nmx_cur_accepted, gNmxCurAccepted, "hw cursor: setCursorImage calls taken by the plane");
-NMX_CNT(nmx_cur_sw_fallback, gNmxCurSwFallback, "hw cursor: setCursorImage refusals = software cursor (incl. the probe at open)");
+NMX_CNT(nmx_cur_sw_fallback, gNmxCurSwFallback, "hw cursor: setCursorImage refusals (the descriptor probe at open; anything more is a bug)");
 NMX_CNT(nmx_cur_copy_retry, gNmxCurCopyRetry, "hw cursor: image copies retried because a new image was being written");
 extern "C" int nmx_gtt_format(char *buf, size_t size);
 static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
@@ -567,7 +553,6 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_cur_commits,
     &sysctl__debug_nmx_cur_full,
     &sysctl__debug_nmx_cur_images,
-    &sysctl__debug_nmx_cur_busy,
     &sysctl__debug_nmx_cur_errors,
     &sysctl__debug_nmx_cur_rearms,
     &sysctl__debug_nmx_cur_off,
