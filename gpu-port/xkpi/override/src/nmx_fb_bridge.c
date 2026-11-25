@@ -130,6 +130,9 @@ static struct drm_mode_set *bridge_restrict_to_panel(struct drm_client_dev *clie
 }
 
 /* a monitor plugged or unplugged: probe again and put the panel back on the same buffer */
+static void cur_rearm(const char *why);     /* hardware cursor (end of file) */
+static void cur_display(int on);
+
 static int bridge_hotplug(struct drm_client_dev *client)
 {
     struct nmx_fb *fb = container_of(client, struct nmx_fb, client);
@@ -145,6 +148,7 @@ static int bridge_hotplug(struct drm_client_dev *client)
             ms->fb = fb->buffer->fb;
     mutex_unlock(&client->modeset_mutex);
     drm_client_modeset_commit(client);
+    cur_rearm("hotplug");                   /* the commit disabled the cursor plane */
     return 0;
 }
 
@@ -153,7 +157,9 @@ static void bridge_free(struct nmx_fb *fb);
 /* a userland KMS client (a DRM master) closed: put our scan-out back on the outputs */
 static int bridge_restore(struct drm_client_dev *client)
 {
-    return drm_client_modeset_commit(client);
+    int e = drm_client_modeset_commit(client);
+    cur_rearm("restore");                   /* the commit disabled the cursor plane */
+    return e;
 }
 
 /*
@@ -330,6 +336,7 @@ fail:
  */
 void nmx_fb_close(void *dev)
 {
+    cur_display(0);                         /* the framebuffer is going away: no more cursor commits */
     for (int i = 0; i < MAX_FB; i++)
         if (fbs[i].dev == dev && fbs[i].fb != NULL)
             drm_client_modeset_dpms(&fbs[i].fb->client, DRM_MODE_DPMS_OFF);
@@ -345,7 +352,11 @@ int nmx_fb_power(void *dev, int on)
             int err;
             nanouptime(&t0);
             printf("NullMoth display: power %s begin\n", on ? "on" : "off");
+            if (!on)
+                cur_display(0);             /* no cursor commits while the CRTC is off */
             err = -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
+            if (on)
+                cur_display(1);             /* the DPMS commit disabled the cursor plane: re-arm */
             nanouptime(&t1);
             printf("NullMoth display: power %s done err %d in %ld ms\n", on ? "on" : "off", err,
                    (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
@@ -1791,4 +1802,271 @@ int nmx_gtt_format(char *buf, size_t size)
     mutex_unlock(&dev->filelist_mutex);
 #undef G_P
     return (int)(o < size ? o : size);
+}
+
+/* ---- hardware cursor (2026-11-25) --------------------------------------------------------------------------------
+ *
+ * NMXAMDFB (xnu/nmx_fb.cpp) implements IOFramebuffer's hardware cursor (setCursorImage / setCursorState) on the CRTC's
+ * DRM cursor plane. Everything here runs from NMXAMDFB's cursor thread call (it may sleep); IOFramebuffer's own calls
+ * (cursor lock held, possibly from the HID path) only stage the image and position and enter that thread call.
+ *
+ * The commit is the one Linux's cursor ioctl makes (drm_mode_cursor_common -> drm_mode_cursor_universal ->
+ * __setplane_atomic): the CRTC and cursor plane locks, then the plane's update_plane (drm_atomic_helper_update_plane,
+ * which sets legacy_cursor_update for a cursor plane). amdgpu_dm_atomic_check then takes the async path
+ * (drm_atomic_helper_async_check -> amdgpu_dm_plane_atomic_async_check, native cursor mode only) and
+ * amdgpu_dm_plane_atomic_async_update -> amdgpu_dm_plane_handle_cursor_update programs DC directly: position with
+ * the hot-spot clipping DM does for a cursor partly off the top/left edge (amdgpu_dm_plane_get_cursor_position),
+ * attributes as premultiplied ARGB, and DC's own PSR / Replay / idle-optimisation handling for cursor updates
+ * (dc_stream_program_cursor_position/attributes -> dc_send_update_cursor_info_to_dmu, idle exit). The first commit
+ * after the plane was disabled is not async (async_check needs the plane on the CRTC already) and goes through the full
+ * atomic check, including dm_check_native_cursor_state / dm_check_cursor_fb and the native-vs-overlay cursor mode rule
+ * (dm_crtc_get_cursor_mode: the primary plane is 2880x1800 scanned 1:1, RGB, so native mode holds).
+ *
+ * Hidden = moved to x, y = -side (DM reports the cursor disabled there and programs it off), so hide and show stay
+ * async. Two side x side ARGB8888 buffers in VRAM, pinned once and never unpinned (like the flip chain): an image is
+ * written into the one not on screen and committed as the plane's new FB (async update swaps it).
+ *
+ * The bridge's own commits (drm_client_modeset_commit: open, restore, hotplug, display power) disable every plane but
+ * the primary (drm_client_modeset_commit_atomic), so each of them re-arms the cursor: the next apply is a full commit
+ * of the current image at the current position.
+ */
+#include "nmx_fb_cursor.h"
+
+uint64_t gNmxCurCommits, gNmxCurFull, gNmxCurImages, gNmxCurBusy, gNmxCurErrors, gNmxCurRearms, gNmxCurOff;
+
+static struct {
+    struct mutex mtx;
+    int ready, display_on, rearm, on_plane;
+    uint32_t side, hide;                /* buffer side; DC max cursor (x/y <= -hide = cursor off in DM) */
+    struct drm_client_buffer *buf[2];
+    volatile uint32_t *va[2];
+    uint64_t gpu[2];
+    int cur;                            /* index of the FB on the plane, -1 none */
+    int back_ok;                        /* the buffer not on screen holds image back_seq */
+    uint32_t back_seq, shown_seq;
+    int32_t x, y;
+    void (*kick)(void *);
+    void *kick_arg;
+    uint32_t logs;
+} cur = { .cur = -1, .display_on = 1 };
+
+#define CUR_LOG(...) do { if (cur.logs < 24) { cur.logs++; printf(__VA_ARGS__); } } while (0)
+
+/* display power from nmx_fb_power: off holds every apply; on re-arms */
+static void cur_display(int on)
+{
+    if (!__atomic_load_n(&cur.ready, __ATOMIC_ACQUIRE))
+        return;
+    mutex_lock(&cur.mtx);
+    __atomic_store_n(&cur.display_on, on, __ATOMIC_RELEASE);
+    cur.on_plane = 0;                       /* DPMS off/on commits disable the plane either way */
+    mutex_unlock(&cur.mtx);
+    if (on)
+        cur_rearm("display power-on");
+}
+
+static void cur_rearm(const char *why)
+{
+    if (!__atomic_load_n(&cur.ready, __ATOMIC_ACQUIRE))
+        return;
+    __atomic_store_n(&cur.rearm, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&gNmxCurRearms, 1, __ATOMIC_RELAXED);
+    CUR_LOG("NMX cursor: re-arm after %s\n", why);
+    if (cur.kick)
+        cur.kick(cur.kick_arg);
+}
+
+/* NMXAMDFB's thread call; called from any context (it only enters a thread call) */
+void nmx_fb_cursor_set_kick(void (*fn)(void *), void *arg)
+{
+    cur.kick_arg = arg;
+    __atomic_store_n(&cur.kick, fn, __ATOMIC_RELEASE);
+}
+
+/*
+ * Make the two cursor buffers. 0 and the side of the square image the hardware takes (*side), or an errno: ENODEV
+ * (no cursor plane, or DC's max cursor below 64), EAGAIN (the flip API is not up yet), ENOMEM.
+ */
+int nmx_fb_cursor_init(uint32_t *side)
+{
+    struct amdgpu_crtc *acrtc;
+    int i, e;
+
+    *side = 0;
+    if (__atomic_load_n(&cur.ready, __ATOMIC_ACQUIRE)) {
+        *side = cur.side;
+        return 0;
+    }
+    if (!flip_init())
+        return EAGAIN;
+    if (flip.crtc->cursor == NULL)
+        return ENODEV;
+    acrtc = to_amdgpu_crtc(flip.crtc);
+    cur.side = nmx_cur_buf_side((uint32_t)acrtc->max_cursor_width, (uint32_t)acrtc->max_cursor_height);
+    if (!cur.side) {
+        CUR_LOG("NMX cursor: DC max cursor %ux%u, no hardware cursor\n", acrtc->max_cursor_width, acrtc->max_cursor_height);
+        return ENODEV;
+    }
+    cur.hide = (uint32_t)(acrtc->max_cursor_width > acrtc->max_cursor_height ? acrtc->max_cursor_width
+                                                                             : acrtc->max_cursor_height);
+    mutex_init(&cur.mtx);
+    for (i = 0; i < 2; i++) {
+        struct drm_client_buffer *b = fb_create_vram(flip.nfb, cur.side, cur.side, DRM_FORMAT_ARGB8888);
+        struct iosys_map map;
+
+        if (IS_ERR_OR_NULL(b)) {
+            CUR_LOG("NMX cursor: buffer %d not created (%ld)\n", i, (long)PTR_ERR(b));
+            return ENOMEM;
+        }
+        if (b->fb->pitches[0] != cur.side * 4) {        /* dm_check_cursor_fb: pitch in pixels must equal the width */
+            CUR_LOG("NMX cursor: buffer %d pitch %u, need %u\n", i, b->fb->pitches[0], cur.side * 4);
+            drm_client_framebuffer_delete(b);
+            return ENODEV;
+        }
+        if ((e = flip_pin(b, &cur.gpu[i]))) {
+            CUR_LOG("NMX cursor: buffer %d would not pin (%d)\n", i, e);
+            drm_client_framebuffer_delete(b);
+            return ENOMEM;
+        }
+        if ((e = drm_client_buffer_vmap(b, &map))) {    /* stays pinned: never freed, like the flip chain */
+            CUR_LOG("NMX cursor: buffer %d would not map (%d)\n", i, e);
+            return ENOMEM;
+        }
+        cur.buf[i] = b;
+        cur.va[i] = (volatile uint32_t *)(map.is_iomem ? (void *)map.vaddr_iomem : map.vaddr);
+        for (uint32_t k = 0; k < cur.side * cur.side; k++)
+            cur.va[i][k] = 0;
+    }
+    cur.cur = -1;
+    *side = cur.side;
+    __atomic_store_n(&cur.ready, 1, __ATOMIC_RELEASE);
+    CUR_LOG("NMX cursor: up, plane %p on crtc %p, %ux%u buffers at gpu %llx / %llx (DC max %ux%u)\n", flip.crtc->cursor,
+            flip.crtc, cur.side, cur.side, (unsigned long long)cur.gpu[0], (unsigned long long)cur.gpu[1],
+            acrtc->max_cursor_width, acrtc->max_cursor_height);
+    return 0;
+}
+
+/* the cursor ioctl's commit (see above); fb NULL disables the plane */
+static int cur_commit(struct drm_framebuffer *fb, int32_t x, int32_t y)
+{
+    struct drm_crtc *crtc = flip.crtc;
+    struct drm_plane *plane = crtc->cursor;
+    struct drm_modeset_acquire_ctx ctx;
+    int ret;
+
+    drm_modeset_acquire_init(&ctx, 0);
+retry:
+    ret = drm_modeset_lock(&crtc->mutex, &ctx);
+    if (!ret)
+        ret = drm_modeset_lock(&plane->mutex, &ctx);
+    if (!ret) {
+        if (fb)
+            ret = plane->funcs->update_plane(plane, crtc, fb, x, y, fb->width, fb->height,
+                                             0, 0, fb->width << 16, fb->height << 16, &ctx);
+        else
+            ret = plane->funcs->disable_plane(plane, &ctx);
+        if (!ret && fb) {
+            crtc->cursor_x = x;
+            crtc->cursor_y = y;
+        }
+    }
+    if (ret == -EDEADLK) {
+        drm_modeset_backoff(&ctx);
+        goto retry;
+    }
+    drm_modeset_drop_locks(&ctx);
+    drm_modeset_acquire_fini(&ctx);
+    return ret;
+}
+
+/*
+ * Bring the plane to: image seq (pixels img, w x h straight ARGB rows of w; NULL = keep what was uploaded), top-left at
+ * x, y (IOFramebuffer's setCursorState coordinates), visible or not. Sleeps. 0 (done or nothing to do), EBUSY (an
+ * earlier commit on the plane is in flight: ask again shortly), or an errno.
+ */
+int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t seq, int32_t x, int32_t y, int visible)
+{
+    int full, b, ret;
+
+    if (!__atomic_load_n(&cur.ready, __ATOMIC_ACQUIRE))
+        return ENODEV;
+    mutex_lock(&cur.mtx);
+    if (!__atomic_load_n(&cur.display_on, __ATOMIC_ACQUIRE)) {      /* display off: kept, applied at power-on */
+        mutex_unlock(&cur.mtx);
+        return 0;
+    }
+    full = __atomic_exchange_n(&cur.rearm, 0, __ATOMIC_ACQ_REL) || !cur.on_plane;
+    if (full)
+        cur.back_ok = 0;                                            /* re-upload after a re-arm (VRAM may be lost) */
+    b = cur.cur < 0 ? 0 : cur.cur ^ 1;
+    /* a new image, or the first commit after a re-arm (re-upload: the buffers are in VRAM, cheap, and a GPU reset
+     * may have touched them) */
+    if (img && (seq != cur.shown_seq || full || cur.cur < 0)) {
+        if (!cur.back_ok || cur.back_seq != seq) {
+            if (nmx_cur_fill(cur.va[b], cur.side, img, w, h)) {
+                mutex_unlock(&cur.mtx);
+                __atomic_add_fetch(&gNmxCurErrors, 1, __ATOMIC_RELAXED);
+                return EINVAL;
+            }
+            cur.back_ok = 1;
+            cur.back_seq = seq;
+            __atomic_add_fetch(&gNmxCurImages, 1, __ATOMIC_RELAXED);
+        }
+    } else if (cur.cur < 0) {
+        mutex_unlock(&cur.mtx);                                     /* nothing uploaded yet: nothing to show */
+        return 0;
+    } else
+        b = cur.cur;
+    if (!visible)
+        x = y = nmx_cur_hidden_xy(cur.hide);
+    if (!full && b == cur.cur && x == cur.x && y == cur.y) {
+        mutex_unlock(&cur.mtx);
+        return 0;
+    }
+    ret = cur_commit(cur.buf[b]->fb, x, y);
+    if (ret == 0) {
+        if (b != cur.cur) {
+            cur.back_ok = 0;                                        /* the old front is now the back: stale */
+            cur.shown_seq = cur.back_seq;
+        }
+        cur.cur = b;
+        cur.on_plane = 1;
+        cur.x = x;
+        cur.y = y;
+        __atomic_add_fetch(&gNmxCurCommits, 1, __ATOMIC_RELAXED);
+        if (full)
+            __atomic_add_fetch(&gNmxCurFull, 1, __ATOMIC_RELAXED);
+    } else {
+        if (full)
+            __atomic_store_n(&cur.rearm, 1, __ATOMIC_RELEASE);     /* still not on the plane: full commit next time */
+        if (ret == -EBUSY)
+            __atomic_add_fetch(&gNmxCurBusy, 1, __ATOMIC_RELAXED);
+        else {
+            __atomic_add_fetch(&gNmxCurErrors, 1, __ATOMIC_RELAXED);
+            CUR_LOG("NMX cursor: commit at %d,%d %s failed (%d)\n", x, y, full ? "(full)" : "(async)", ret);
+        }
+    }
+    mutex_unlock(&cur.mtx);
+    return ret == -EBUSY ? EBUSY : ret < 0 ? -ret : ret;
+}
+
+/* the plane off (software cursor from now on, or the framebuffer going away). Sleeps. */
+int nmx_fb_cursor_off(void)
+{
+    int ret = 0;
+
+    if (!__atomic_load_n(&cur.ready, __ATOMIC_ACQUIRE))
+        return 0;
+    mutex_lock(&cur.mtx);
+    if (cur.on_plane && __atomic_load_n(&cur.display_on, __ATOMIC_ACQUIRE)) {
+        ret = cur_commit(NULL, 0, 0);
+        if (ret)
+            __atomic_add_fetch(&gNmxCurErrors, 1, __ATOMIC_RELAXED);
+    }
+    if (!ret) {
+        cur.on_plane = 0;
+        __atomic_add_fetch(&gNmxCurOff, 1, __ATOMIC_RELAXED);
+    }
+    mutex_unlock(&cur.mtx);
+    return ret < 0 ? -ret : ret;
 }

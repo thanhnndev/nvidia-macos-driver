@@ -42,6 +42,20 @@ extern "C" int nmx_vbl_irq;
 
 #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
 
+/*
+ * Hardware cursor (2026-11-25): the switch and the IOKit-side counters. Boot-arg nmxhwcur (any value) makes the
+ * internal panel's framebuffer advertise kIOHardwareCursorAttribute and sets the switch to its value; without the
+ * boot-arg nothing changes (software cursor, the attribute left to IOFramebuffer). debug.nmx_hwcursor flips it at run
+ * time (nmx_kext.cpp): 0 hides the plane and hands the cursor back to IOFramebuffer's software cursor at once; 1 takes
+ * effect at the next cursor image (IOFramebuffer remembers an image it was refused until WindowServer sets it again).
+ */
+extern "C" {
+int nmx_hwcursor;                   // 1 = cursor plane, 0 = software cursor
+int nmx_hwcursor_avail;             // 1 = the boot-arg was given and the plane came up
+volatile SInt64 gNmxCurStates, gNmxCurAccepted, gNmxCurSwFallback, gNmxCurCopyRetry;
+void nmx_hwcursor_changed(void);
+}
+
 /* override/src/linux_pci.c: the panel brightness in percent through amdgpu's backlight ops (set 0 = read) */
 extern "C" int nmx_backlight_percent(int set, unsigned *pct);
 
@@ -403,6 +417,243 @@ private:
         thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
     }
 
+private:
+    /*
+     * ---- hardware cursor (2026-11-25) ----
+     * IOFramebuffer calls setCursorImage / setCursorState with its cursor spinlock held (OSSpinLock, SETSEMA), from
+     * WindowServer's calls and the HID path: nothing there may sleep. They only stage: the image is converted into one
+     * of two staging slots (convertCursorImage, under a generation seqlock), the position and visibility are stored,
+     * and fCurWork (a thread call) is entered. fCurWork copies the image, then commits it to the CRTC's cursor plane
+     * the way Linux's cursor ioctl does (nmx_fb_cursor_apply in nmx_fb_bridge.c). It runs at most once per frame
+     * period (deadline = last commit + fFrameNs): a moving cursor costs one plane update per refresh.
+     */
+    uint32_t fCurSide = 0;              // hardware cursor buffer side; 0 = no hardware cursor
+    uint32_t *fCurStage[2] = {};        // converted images (straight ARGB, rows of fCurW), written under IOFB's lock
+    uint32_t fCurW[2] = {}, fCurH[2] = {};
+    uint32_t *fCurCopy = nullptr;       // fCurWork's copy of the published image
+    volatile UInt32 fCurGen = 0;        // odd while setCursorImage converts (seqlock over the slots)
+    volatile UInt32 fCurSeq = 0;        // published image; slot fCurSeq & 1; 0 = none yet
+    volatile uint64_t fCurPos = 0;      // (uint32)x << 32 | (uint32)y: the image's top-left (setCursorState)
+    volatile UInt32 fCurVis = 0;
+    volatile UInt32 fCurArmed = 0;      // fCurWork entered and not yet run
+    volatile UInt32 fCurNeedImg = 1;    // upload the image on the next commit (first one, re-arm after a bridge commit)
+    volatile uint64_t fCurLastAt = 0;   // mach time of the last commit
+    uint32_t fCurDone = 0;              // fCurWork: the image seq last committed
+    int fCurOn = 0;                     // fCurWork: the switch as it last acted on it
+    thread_call_t fCurWork = nullptr, fCurToggle = nullptr;
+    IOCommandGate *fCurGate = nullptr;
+    unsigned fCurLogs = 0;
+    static NMXAMDFB *volatile sCurFb;   // the framebuffer that owns the cursor plane (one: the internal panel)
+    static volatile SInt32 sCurUsers;   // nmx_hwcursor_changed callers inside (stop waits them out)
+    friend void nmx_hwcursor_changed(void);
+
+#define CURLOG(fmt, ...) do { if (fCurLogs < 32) { fCurLogs++; FBLOG("cursor: " fmt, ##__VA_ARGS__); } } while (0)
+
+    /* enter fCurWork once; deadline = last commit + one frame (or later by afterNs). Any context, never sleeps. */
+    void curArm(uint64_t afterNs) {
+        if (fStopping || !fCurWork) return;
+        if (!OSCompareAndSwap(0, 1, &fCurArmed)) return;
+        uint64_t now = mach_absolute_time(), frame, d;
+        nanoseconds_to_absolutetime(fFrameNs, &frame);
+        d = __atomic_load_n(&fCurLastAt, __ATOMIC_RELAXED) + frame;
+        if (d < now) d = now;
+        if (afterNs) { uint64_t a; nanoseconds_to_absolutetime(afterNs, &a); if (d < now + a) d = now + a; }
+        thread_call_enter_delayed(fCurWork, d);
+    }
+    /* the bridge's re-arm (its own commits disabled the plane, the display came back): re-upload and re-commit */
+    static void curKick(void *arg) {
+        NMXAMDFB *me = (NMXAMDFB *)arg;
+        __atomic_store_n(&me->fCurNeedImg, 1, __ATOMIC_RELEASE);
+        me->curArm(0);
+    }
+    /* copy the published image out of its slot; false = none, or setCursorImage kept writing (asked again later) */
+    bool curCopy(uint32_t &seq, uint32_t &w, uint32_t &h) {
+        for (int n = 0; n < 50; n++) {
+            const UInt32 g1 = __atomic_load_n(&fCurGen, __ATOMIC_ACQUIRE);
+            if (g1 & 1) { IODelay(20); continue; }
+            seq = __atomic_load_n(&fCurSeq, __ATOMIC_ACQUIRE);
+            if (!seq) return false;
+            const int s = seq & 1;
+            w = fCurW[s];
+            h = fCurH[s];
+            if (w > fCurSide || h > fCurSide) return false;
+            bcopy(fCurStage[s], fCurCopy, (size_t)w * h * 4);
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&fCurGen, __ATOMIC_ACQUIRE) == g1) return true;
+            OSIncrementAtomic64(&gNmxCurCopyRetry);
+        }
+        return false;
+    }
+    static void curWorkFire(thread_call_param_t p, thread_call_param_t) { ((NMXAMDFB *)p)->curWork(); }
+    void curWork() {
+        __atomic_store_n(&fCurArmed, 0, __ATOMIC_SEQ_CST);     // changes from here on enter the call again
+        if (fStopping) return;
+        NmxEntry entry;
+        if (entry.err) return;
+        if (!__atomic_load_n(&nmx_hwcursor, __ATOMIC_ACQUIRE)) {
+            if (fCurOn) {
+                const int e = nmx_fb_cursor_off();
+                CURLOG("switched off: plane off (%d), software cursor", e);
+                fCurOn = 0;
+                fCurDone = 0;
+                __atomic_store_n(&fCurNeedImg, 1, __ATOMIC_RELEASE);
+            }
+            return;
+        }
+        if (!fCurOn) { CURLOG("switched on: plane %ux%u", fCurSide, fCurSide); fCurOn = 1; }
+        const uint64_t pos = __atomic_load_n(&fCurPos, __ATOMIC_ACQUIRE);
+        const int vis = __atomic_load_n(&fCurVis, __ATOMIC_ACQUIRE) != 0;
+        const uint32_t *img = nullptr;
+        uint32_t seq = __atomic_load_n(&fCurSeq, __ATOMIC_ACQUIRE), w = 0, h = 0;
+        const bool need = __atomic_exchange_n(&fCurNeedImg, 0, __ATOMIC_ACQ_REL) != 0;
+        if (seq && (need || seq != fCurDone)) {
+            if (curCopy(seq, w, h)) {
+                img = fCurCopy;
+            } else {
+                __atomic_store_n(&fCurNeedImg, 1, __ATOMIC_RELEASE);
+                curArm(1000000);
+                return;
+            }
+        }
+        const int e = nmx_fb_cursor_apply(img, w, h, seq, (int32_t)(pos >> 32), (int32_t)(uint32_t)pos, vis && seq);
+        __atomic_store_n(&fCurLastAt, mach_absolute_time(), __ATOMIC_RELAXED);
+        if (e == 0) {
+            if (img) fCurDone = seq;
+            return;
+        }
+        if (img || need) __atomic_store_n(&fCurNeedImg, 1, __ATOMIC_RELEASE);
+        if (e == EBUSY) { curArm(1000000); return; }       // the plane's previous commit is still in flight
+        CURLOG("commit failed (%d)", e);
+    }
+    /* debug.nmx_hwcursor changed: make IOFramebuffer ask for the image again (resetCursor, as it does on wake), under
+     * its controller's gate. Off: setCursorImage refuses, IOFramebuffer draws the software cursor, fCurWork turns the
+     * plane off. */
+    static IOReturn curResetGated(OSObject *self, void *, void *, void *, void *) {
+        NMXAMDFB *me = (NMXAMDFB *)self;
+        if (!me->fStopping) me->resetCursor();
+        return kIOReturnSuccess;
+    }
+    static void curToggleFire(thread_call_param_t p, thread_call_param_t) { ((NMXAMDFB *)p)->curToggle(); }
+    void curToggle() {
+        if (fStopping) return;
+        if (!fCurGate) {
+            IOWorkLoop *wl = getControllerWorkLoop();
+            IOCommandGate *g = wl ? IOCommandGate::commandGate(this) : nullptr;
+            if (g && wl->addEventSource(g) != kIOReturnSuccess) OSSafeReleaseNULL(g);
+            fCurGate = g;
+        }
+        const int on = __atomic_load_n(&nmx_hwcursor, __ATOMIC_ACQUIRE);
+        if (fCurGate) fCurGate->runAction(&curResetGated);
+        else CURLOG("no controller work loop: the switch applies at the next cursor image");
+        curArm(0);
+        CURLOG("debug.nmx_hwcursor=%d: cursor reset", on);
+    }
+    /* first kIOHardwareCursorAttribute query (IOFramebuffer::open): bring the plane up if asked to */
+    bool curSetup() {
+        if (fCurSide) return true;
+        static bool parsed, wanted;
+        if (!parsed) {
+            int v = 0;
+            parsed = true;
+            wanted = PE_parse_boot_argn("nmxhwcur", &v, sizeof v);
+            if (wanted) nmx_hwcursor = v != 0;
+        }
+        if (!wanted || fStopping || fForeign || !fInternalPanel || __atomic_load_n(&sCurFb, __ATOMIC_SEQ_CST)) return false;
+        uint32_t side = 0;
+        int e;
+        { NmxEntry entry; e = entry.err ? entry.err : nmx_fb_cursor_init(&side); }
+        if (e || !side) { CURLOG("no hardware cursor (bridge %d)", e); return false; }
+        const size_t bytes = (size_t)side * side * 4;
+        fCurStage[0] = (uint32_t *)IOMallocZero(bytes);
+        fCurStage[1] = (uint32_t *)IOMallocZero(bytes);
+        fCurCopy = (uint32_t *)IOMallocZero(bytes);
+        fCurWork = thread_call_allocate(curWorkFire, this);
+        fCurToggle = thread_call_allocate(curToggleFire, this);
+        if (!fCurStage[0] || !fCurStage[1] || !fCurCopy || !fCurWork || !fCurToggle) {
+            CURLOG("no hardware cursor (allocation)");
+            curFree(side);
+            return false;
+        }
+        fCurSide = side;
+        nmx_fb_cursor_set_kick(curKick, this);
+        __atomic_store_n(&sCurFb, this, __ATOMIC_SEQ_CST);
+        nmx_hwcursor_avail = 1;
+        setProperty("NMXHardwareCursor", (unsigned long long)side, 32);
+        CURLOG("hardware cursor %ux%u ARGB (premultiplied on upload), switch %d (debug.nmx_hwcursor)", side, side,
+               nmx_hwcursor);
+        return true;
+    }
+    void curFree(uint32_t side) {
+        const size_t bytes = (size_t)side * side * 4;
+        thread_call_t *tcs[2] = { &fCurWork, &fCurToggle };
+        for (thread_call_t *tc : tcs) {
+            if (!*tc) continue;
+            thread_call_cancel(*tc);
+            while (!thread_call_free(*tc)) { thread_call_cancel(*tc); IOSleep(1); }
+            *tc = nullptr;
+        }
+        uint32_t **bufs[3] = { &fCurStage[0], &fCurStage[1], &fCurCopy };
+        for (uint32_t **b : bufs)
+            if (*b) { IOFree(*b, bytes); *b = nullptr; }
+    }
+    void curTeardown() {
+        if (!fCurSide) return;
+        __atomic_store_n(&sCurFb, (NMXAMDFB *)nullptr, __ATOMIC_SEQ_CST);
+        for (int n = 0; __atomic_load_n(&sCurUsers, __ATOMIC_SEQ_CST) && n < 1000; n++) IODelay(10);
+        nmx_fb_cursor_set_kick(nullptr, nullptr);
+        curFree(fCurSide);                                  // fStopping is set: nothing enters the calls again
+        { NmxEntry entry; if (!entry.err) nmx_fb_cursor_off(); }
+        if (fCurGate) {
+            if (IOWorkLoop *wl = fCurGate->getWorkLoop()) wl->removeEventSource(fCurGate);
+            OSSafeReleaseNULL(fCurGate);
+        }
+        fCurSide = 0;
+        nmx_hwcursor_avail = 0;
+    }
+
+public:
+    IOReturn setCursorImage(void *cursorImage) override {
+        if (!fCurSide) return kIOReturnUnsupported;
+        const UInt32 next = fCurSeq + 1;                    // (4e9 cursor images before it wraps to the "none" 0)
+        const int s = next & 1;
+        IOHardwareCursorDescriptor d;
+        IOHardwareCursorInfo info;
+        bzero(&d, sizeof d);
+        bzero(&info, sizeof info);
+        d.majorVersion = kHardwareCursorDescriptorMajorVersion;
+        d.minorVersion = kHardwareCursorDescriptorMinorVersion;
+        d.width = d.height = fCurSide;                      // IOFramebuffer halves it down to the image (64/128/256)
+        d.bitDepth = 32;                                    // ARGB8888; no inverting pixels (those stay software)
+        info.majorVersion = kHardwareCursorInfoMajorVersion;
+        info.minorVersion = kHardwareCursorInfoMinorVersion;
+        info.hardwareCursorData = (UInt8 *)fCurStage[s];
+        OSIncrementAtomic(&fCurGen);                        // odd: fCurWork does not trust a copy taken now
+        const bool ok = convertCursorImage(cursorImage, &d, &info);
+        if (ok) { fCurW[s] = info.cursorWidth; fCurH[s] = info.cursorHeight; }
+        OSIncrementAtomic(&fCurGen);
+        if (ok && __atomic_load_n(&nmx_hwcursor, __ATOMIC_ACQUIRE) && info.cursorWidth <= fCurSide &&
+            info.cursorHeight <= fCurSide) {
+            __atomic_store_n(&fCurSeq, next, __ATOMIC_RELEASE);
+            OSIncrementAtomic64(&gNmxCurAccepted);
+            curArm(0);
+            return kIOReturnSuccess;
+        }
+        /* software cursor for this image (too large, inverting pixels, switched off, or IOFramebuffer's descriptor
+         * probe at open): IOFramebuffer stops calling setCursorState, so the plane is hidden here */
+        __atomic_store_n(&fCurVis, 0u, __ATOMIC_RELEASE);
+        OSIncrementAtomic64(&gNmxCurSwFallback);
+        curArm(0);
+        return kIOReturnUnsupported;
+    }
+    IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override {
+        if (!fCurSide) return kIOReturnUnsupported;
+        OSIncrementAtomic64(&gNmxCurStates);
+        __atomic_store_n(&fCurPos, ((uint64_t)(uint32_t)x << 32) | (uint32_t)y, __ATOMIC_RELEASE);
+        __atomic_store_n(&fCurVis, visible ? 1u : 0u, __ATOMIC_RELEASE);
+        curArm(0);
+        return kIOReturnSuccess;
+    }
+
 public:
     bool initWith(void *dev, const nmx_fb_info &info) {
         if (!init()) return false;
@@ -500,6 +751,7 @@ public:
     void stop(IOService *provider) override {
         fStopping = true;
         fLcd = false;
+        curTeardown();
         teardownWakeWork();
         if (fBacklight) {
             fBacklight->quiesce();
@@ -755,6 +1007,8 @@ public:
     }
     IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
         if (attribute == kIOWindowServerActiveAttribute) { trace("getAttribute wsrv"); if (value) *value = 1; return kIOReturnSuccess; }
+        /* IOFramebuffer::open reads it once (haveHWCursor); kIOFBHWCursorSupported = 1 */
+        if (attribute == kIOHardwareCursorAttribute && value && curSetup()) { *value = 1; return kIOReturnSuccess; }
         return IOFramebuffer::getAttribute(attribute, value);
     }
     IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
@@ -775,6 +1029,17 @@ public:
     }
 };
 OSDefineMetaClassAndStructors(NMXAMDFB, IOFramebuffer)
+NMXAMDFB *volatile NMXAMDFB::sCurFb;
+volatile SInt32 NMXAMDFB::sCurUsers;
+
+/* debug.nmx_hwcursor was written (nmx_kext.cpp); any context that may enter a thread call */
+void nmx_hwcursor_changed(void)
+{
+    OSIncrementAtomic(&NMXAMDFB::sCurUsers);
+    if (NMXAMDFB *fb = __atomic_load_n(&NMXAMDFB::sCurFb, __ATOMIC_SEQ_CST))
+        if (fb->fCurToggle) thread_call_enter(fb->fCurToggle);
+    OSDecrementAtomic(&NMXAMDFB::sCurUsers);
+}
 
 /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
 IOService *nmx_fb_publish(IOService *gpu, void *dev)
