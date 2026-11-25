@@ -20,6 +20,8 @@ extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS;
 #include "AppleGraphicsDeviceControl_re.h"
 #include "nvrm-agdc-k5.h"
 #include "nmx-agdc-client.h"
+#include "nmx-agdc-color.h"
+#include <pexpert/pexpert.h>
 #pragma pack(push, 1)
 struct NMXAGDCVendorInfo {
     uint32_t version;
@@ -61,6 +63,16 @@ static char   gAgdcFBMap[kAgdcFBMapBytes] = "never scanned";
 static int    gAgdcMaxFBOut = 0;
 static int    gAgdcK5Asked = 0, gAgdcK5LinkMask = 0, gAgdcK5CapsMask = 0;
 static int    gAgdcK5LastRefusedIdx = -1;
+// Hardware colour stages (nmx-agdc-color.h): boot-arg nmxhwcolor=1 answers 0x711 types 1/2/4 for index 0 (the panel).
+// Off (the default) leaves every reply as before: CoreDisplay keeps its GPU colour pass.
+static int    gAgdcHwColor = -1;            // -1 = boot-arg not read yet
+static int    gAgdcColorAsked = 0, gAgdcColorAnswered = 0;   // bit = 0x711 type (1 CSC, 2 gamma, 4 linearization)
+static SInt64 gAgdcColorReplies = 0;
+static bool nmxAgdcHwColor(void)
+{
+    if (gAgdcHwColor < 0) { int v = 0; if (!PE_parse_boot_argn("nmxhwcolor", &v, sizeof v)) v = 0; gAgdcHwColor = v == 1; }
+    return gAgdcHwColor == 1;
+}
 
 class NMXDeviceControl : public AppleGraphicsDeviceControl {
     OSDeclareDefaultStructors(NMXDeviceControl)
@@ -158,6 +170,22 @@ IOReturn NMXDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
         const SInt64 n = OSAddAtomic64(1, &gAgdcClientSet);
         if (n <= 8) FBLOG("AGDC: command 0x2001 value %#x accepted [%lld/8]", value, (long long)n);
         return kIOReturnSuccess;
+    }
+    if (cmd == NVK5_CMD_FBCAPEX && out && outSize && *outSize == sizeof(struct NVAGDCFBExtCap) && in &&
+        inSize == sizeof(struct NVAGDCFBExtCap)) {
+        const struct NVAGDCFBExtCap *q = (const struct NVAGDCFBExtCap *)in;
+        if (nmx_agdc_color_type(q->type)) {
+            OSBitOrAtomic(q->type, (volatile UInt32 *)&gAgdcColorAsked);
+            if (nmxAgdcHwColor() && q->fbIndex == 0) {
+                if (in != out) memmove(out, in, sizeof(struct NVAGDCFBExtCap));
+                if (nmx_agdc_color_fill((uint8_t *)out, sizeof(struct NVAGDCFBExtCap))) {
+                    OSBitOrAtomic(q->type, (volatile UInt32 *)&gAgdcColorAnswered);
+                    const SInt64 n = OSAddAtomic64(1, &gAgdcColorReplies);
+                    if (n < 8) FBLOG("AGDC: 0x711 colour capability type %#x answered (nmxhwcolor=1) [%lld/8]", ((struct NVAGDCFBExtCap *)out)->type, (long long)n + 1);
+                    return kIOReturnSuccess;
+                }
+            }
+        }
     }
     if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {
         IOReturn k5 = nmxK5Answer(fFB, cmd, in, inSize, out, outSize);
@@ -291,10 +319,16 @@ SYSCTL_INT (_debug, OID_AUTO, nmxagdc_maxfb,   CTLFLAG_RD | CTLFLAG_LOCKED, &gAg
 SYSCTL_INT (_debug, OID_AUTO, nmxagdc_k5_asked, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Asked, 0, "bit i = a 0x921/0x711 named index i");
 SYSCTL_INT (_debug, OID_AUTO, nmxagdc_k5_link_mask, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5LinkMask, 0, "bit i = kAGDCLinkConfig answered for index i");
 SYSCTL_INT (_debug, OID_AUTO, nmxagdc_k5_caps_mask, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5CapsMask, 0, "bit i = the plane-scaler capability answered for index i");
+SYSCTL_INT (_debug, OID_AUTO, nmxagdc_hwcolor, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcHwColor, 0, "boot-arg nmxhwcolor: 1 = 0x711 colour capabilities answered for index 0, 0 = not, -1 = never asked");
+SYSCTL_INT (_debug, OID_AUTO, nmxagdc_color_asked, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcColorAsked, 0, "bit = 0x711 colour type IOPresentment asked (1 CSC, 2 gamma, 4 linearization)");
+SYSCTL_INT (_debug, OID_AUTO, nmxagdc_color_answered, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcColorAnswered, 0, "bit = 0x711 colour type answered");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxagdc_color_replies, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcColorReplies, "0x711 colour capability replies");
 SYSCTL_INT (_debug, OID_AUTO, nmxagdc_k5_last_refused_idx, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5LastRefusedIdx, 0, "the index the last BADARG/NOTFOUND refusal named (-1 none); an Unsupported 0x711 type shows in k5_asked only");
 static void nmxAgdcRemoveSysctl(void)
 {
     sysctl_unregister_oid(&sysctl__debug_nmxagdc); sysctl_unregister_oid(&sysctl__debug_nmxagdc_cmds);
+    sysctl_unregister_oid(&sysctl__debug_nmxagdc_hwcolor); sysctl_unregister_oid(&sysctl__debug_nmxagdc_color_asked);
+    sysctl_unregister_oid(&sysctl__debug_nmxagdc_color_answered); sysctl_unregister_oid(&sysctl__debug_nmxagdc_color_replies);
     sysctl_unregister_oid(&sysctl__debug_nmxagdc_refused); sysctl_unregister_oid(&sysctl__debug_nmxagdc_last_refused);
     sysctl_unregister_oid(&sysctl__debug_nmxagdc_client_set); sysctl_unregister_oid(&sysctl__debug_nmxagdc_client_set_value);
     sysctl_unregister_oid(&sysctl__debug_nmxagdc_k5); sysctl_unregister_oid(&sysctl__debug_nmxagdc_k5_link);
@@ -315,6 +349,8 @@ static void nmxAgdcInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxagdc_rescans);
     sysctl_register_oid(&sysctl__debug_nmxagdc_k5_asked); sysctl_register_oid(&sysctl__debug_nmxagdc_k5_link_mask);
     sysctl_register_oid(&sysctl__debug_nmxagdc_k5_caps_mask); sysctl_register_oid(&sysctl__debug_nmxagdc_k5_last_refused_idx);
+    sysctl_register_oid(&sysctl__debug_nmxagdc_hwcolor); sysctl_register_oid(&sysctl__debug_nmxagdc_color_asked);
+    sysctl_register_oid(&sysctl__debug_nmxagdc_color_answered); sysctl_register_oid(&sysctl__debug_nmxagdc_color_replies);
 }
 
 class NMXAGDCLoader : public IOService {
