@@ -37,6 +37,12 @@ struct nmx_fb_display_info {
 int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out);
 void nmx_fb_close(void *dev);
 int nmx_fb_power(void *dev, int on);
+/* hardware colour stages (nmx_fb_bridge.c, end of file): CRTC DEGAMMA_LUT / CTM / GAMMA_LUT staged for the next flip */
+struct nmx_color_lut;
+int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm, const struct nmx_color_lut *gamma);
+int nmx_fb_color_commit(void);
+extern uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors;
+
 #ifdef __cplusplus
 }
 #endif

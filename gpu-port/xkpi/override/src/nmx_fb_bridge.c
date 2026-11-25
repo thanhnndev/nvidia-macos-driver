@@ -691,6 +691,8 @@ static void flip_refresh(void)
 }
 
 static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *set_ns);
+static uint64_t col_apply(struct drm_crtc_state *cs);     /* hardware colour stages (end of file) */
+static void col_applied(uint64_t gen);
 
 static uint32_t flip_submit(struct nmx_flipreq *r)
 {
@@ -700,6 +702,7 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
     struct drm_atomic_state *state;
     struct drm_crtc_commit *commit = NULL;
     struct dma_fence *kf = NULL;        /* out-31 row 1: the surface's last GPU job, waited in the commit */
+    uint64_t colgen = 0;                /* colour state generation this commit carries (0 = none staged) */
     int e = -ENOMEM;
 
     if (!nfbp)
@@ -752,8 +755,11 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
                 e = PTR_ERR(cs);
                 goto deadlk;
             }
+            colgen = col_apply(cs);     /* staged DEGAMMA_LUT / CTM / GAMMA_LUT ride this flip (no-op when unchanged) */
             e = drm_atomic_nonblocking_commit(state);
             if (!e) {
+                if (colgen)
+                    col_applied(colgen);
                 commit = cs->commit;    /* locks still held: nothing can swap the CRTC state yet */
                 if (commit)
                     drm_crtc_commit_get(commit);
@@ -1791,4 +1797,167 @@ int nmx_gtt_format(char *buf, size_t size)
     mutex_unlock(&dev->filelist_mutex);
 #undef G_P
     return (int)(o < size ? o : size);
+}
+
+/*
+ * ---- hardware colour stages (2026-11-25) ----
+ * CoreDisplay runs its colour stages (linearization, CSC, per-channel gamma) on the GPU, one full-screen pass per
+ * present, because the display pipe offers none (WS-CPU.md 9.8). amdgpu_dm has the same three stages in DCN, as CRTC
+ * properties applied in that order: DEGAMMA_LUT (4096 entries), CTM (3x3 S31.32), GAMMA_LUT (4096 entries).
+ * NMXAccel's display-pipe transaction stages them here (nmx_fb_color_stage: thread context, may sleep); the next flip
+ * commit carries them (col_apply in flip_submit), and a transaction with no plane commits them alone
+ * (nmx_fb_color_commit). A NULL stage = bypass (no blob). drm_property_replace_blob compares pointers, so a flip after
+ * the colour state was applied does not touch the CRTC colour state again (no full update per flip).
+ */
+#include "nmx_fb_color.h"
+
+uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors;
+
+static struct {
+    int lock;                           /* hand-rolled like sf: usable before any init hook */
+    uint64_t gen, applied;              /* staged generation; the last one a successful commit carried */
+    struct drm_property_blob *degamma, *ctm, *gamma;
+} col;
+
+static void col_lock(void)
+{
+    while (__atomic_exchange_n(&col.lock, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&col.lock, __ATOMIC_RELAXED))
+            cpu_relax();
+}
+
+static void col_unlock(void)
+{
+    __atomic_store_n(&col.lock, 0, __ATOMIC_RELEASE);
+}
+
+static struct drm_property_blob *col_blob(struct drm_device *dev, const void *data, size_t len)
+{
+    struct drm_property_blob *b;
+
+    if (data == NULL)
+        return NULL;
+    b = drm_property_create_blob(dev, len, data);
+    return IS_ERR(b) ? NULL : b;
+}
+
+/*
+ * Stage the three CRTC colour stages (NULL = bypass). degamma / gamma: NMX_COLOR_LUT_ENTRIES entries; ctm: 9
+ * S31.32 sign-magnitude coefficients (nmx_fb_color.h builds both). Thread context. 0 or an errno.
+ */
+int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm, const struct nmx_color_lut *gamma)
+{
+    struct drm_property_blob *nd, *nc, *ng, *od, *oc, *og;
+    struct drm_device *dev;
+    const size_t lut = NMX_COLOR_LUT_ENTRIES * sizeof(struct drm_color_lut);
+
+    _Static_assert(sizeof(struct nmx_color_lut) == sizeof(struct drm_color_lut), "nmx_color_lut = drm_color_lut");
+    _Static_assert(sizeof(struct drm_color_ctm) == 9 * sizeof(uint64_t), "drm_color_ctm = 9 x u64");
+    if (!flip_init())
+        return EAGAIN;
+    dev = flip.nfb->client.dev;
+    nd = col_blob(dev, degamma, lut);
+    nc = col_blob(dev, ctm, sizeof(struct drm_color_ctm));
+    ng = col_blob(dev, gamma, lut);
+    if ((degamma && !nd) || (ctm && !nc) || (gamma && !ng)) {
+        drm_property_blob_put(nd);
+        drm_property_blob_put(nc);
+        drm_property_blob_put(ng);
+        __atomic_add_fetch(&gNmxColorErrors, 1, __ATOMIC_RELAXED);
+        return ENOMEM;
+    }
+    col_lock();
+    od = col.degamma; oc = col.ctm; og = col.gamma;
+    col.degamma = nd; col.ctm = nc; col.gamma = ng;
+    col.gen++;
+    col_unlock();
+    drm_property_blob_put(od);
+    drm_property_blob_put(oc);
+    drm_property_blob_put(og);
+    __atomic_add_fetch(&gNmxColorStaged, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+/* put the staged stages into a CRTC state being built; returns the generation carried, 0 = nothing staged */
+static uint64_t col_apply(struct drm_crtc_state *cs)
+{
+    struct drm_property_blob *d, *c, *g;
+    uint64_t gen;
+    bool changed = false;
+
+    col_lock();
+    gen = col.gen;
+    d = col.degamma ? drm_property_blob_get(col.degamma) : NULL;
+    c = col.ctm ? drm_property_blob_get(col.ctm) : NULL;
+    g = col.gamma ? drm_property_blob_get(col.gamma) : NULL;
+    col_unlock();
+    if (gen) {
+        changed |= drm_property_replace_blob(&cs->degamma_lut, d);
+        changed |= drm_property_replace_blob(&cs->ctm, c);
+        changed |= drm_property_replace_blob(&cs->gamma_lut, g);
+        if (changed) {
+            cs->color_mgmt_changed = true;
+            __atomic_add_fetch(&gNmxColorFlip, 1, __ATOMIC_RELAXED);
+        }
+    }
+    drm_property_blob_put(d);
+    drm_property_blob_put(c);
+    drm_property_blob_put(g);
+    return gen;
+}
+
+static void col_applied(uint64_t gen)
+{
+    col_lock();
+    if (gen > col.applied)
+        col.applied = gen;
+    col_unlock();
+}
+
+/* a transaction with colour stages and no plane: commit them on their own (blocking). Thread context. */
+int nmx_fb_color_commit(void)
+{
+    struct drm_modeset_acquire_ctx ctx;
+    struct drm_atomic_state *state;
+    struct drm_crtc_state *cs;
+    uint64_t gen = 0;
+    int e = -ENOMEM;
+
+    if (!flip_init())
+        return EAGAIN;
+    col_lock();
+    gen = col.gen;
+    if (gen == col.applied)
+        gen = 0;
+    col_unlock();
+    if (!gen)
+        return 0;                       /* a flip already carried it */
+    drm_modeset_acquire_init(&ctx, 0);
+    state = drm_atomic_state_alloc(flip.nfb->client.dev);
+    if (state) {
+        state->acquire_ctx = &ctx;
+        for (;;) {
+            cs = drm_atomic_get_crtc_state(state, flip.crtc);
+            if (IS_ERR(cs)) {
+                e = PTR_ERR(cs);
+            } else {
+                gen = col_apply(cs);
+                e = drm_atomic_commit(state);
+                if (!e) {
+                    col_applied(gen);
+                    __atomic_add_fetch(&gNmxColorAlone, 1, __ATOMIC_RELAXED);
+                }
+            }
+            if (e != -EDEADLK)
+                break;
+            drm_atomic_state_clear(state);
+            drm_modeset_backoff(&ctx);
+        }
+        drm_atomic_state_put(state);
+    }
+    drm_modeset_drop_locks(&ctx);
+    drm_modeset_acquire_fini(&ctx);
+    if (e)
+        __atomic_add_fetch(&gNmxColorErrors, 1, __ATOMIC_RELAXED);
+    return e < 0 ? -e : e;
 }
