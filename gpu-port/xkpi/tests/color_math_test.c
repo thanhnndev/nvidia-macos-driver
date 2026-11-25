@@ -8,6 +8,8 @@
  * 2. A gamma-2.2 / sRGB-shaped curve of 256, 1024 and 4096 points resamples to 4096 entries within 1/65535 of the
  *    exact curve's linear interpolation; ends are exact; monotonic input stays monotonic.
  * 3. Clamping: >= 1.0 is 0xffff, 0 is 0; frac 8..24.
+ * 5. IEEE-754 single bits -> fixed point (the tables and the matrix arrive as floats) and clamping to [0, 1].
+ * 6. IOPresentment's 3-columns-of-4 matrix layout -> DRM's row-major CTM.
  * 4. CTM: the S31.32 sign-magnitude amdgpu_dm_fixpt_from_s3132 decodes (copied below) equals the input coefficient,
  *    negatives included, for frac 16 / 24 / 32 / 40.
  */
@@ -103,6 +105,48 @@ int main(void)
         uint64_t o[9];
         nmx_color_ctm_build(m, 16, o);
         CHECK(o[0] == 1ull << 32 && o[4] == 1ull << 32 && o[8] == 1ull << 32 && o[1] == 0, "identity CTM");
+    }
+
+    /* 5: float bits -> fixed point (no FPU in the kext), against the host's own conversion */
+    {
+        const float vals[] = { 0.0f, 1.0f, 0.5f, 0.25f, 1.0f / 3.0f, 0.0031308f, 0.999999f, 1.5f, -0.5f, -1.9921875f, 3.75f,
+                               1e-9f, 65535.0f, -1e20f, 1e20f };
+        const unsigned fr[] = { 16, 24, 32 };
+        for (unsigned f = 0; f < 3; f++)
+            for (unsigned k = 0; k < sizeof vals / sizeof *vals; k++) {
+                uint32_t bits; memcpy(&bits, &vals[k], 4);
+                const int64_t got = nmx_color_f32_to_fix(bits, fr[f]);
+                double want = (double)vals[k] * (double)(1ull << fr[f]);
+                const double lim = 4611686018427387904.0;
+                if (want > lim) want = lim;
+                if (want < -lim) want = -lim;
+                CHECK(fabs((double)got - want) <= 0.5 + fabs(want) * 1e-15, "f32 %g frac %u: %lld want %.1f", vals[k], fr[f], (long long)got, want);
+            }
+        uint32_t nan = 0x7fc00000u, pinf = 0x7f800000u;
+        CHECK(nmx_color_f32_to_fix(nan, 16) == 0, "NaN -> 0");
+        CHECK(nmx_color_f32_to_fix(pinf, 16) == (int64_t)1 << 62, "inf saturates");
+        uint32_t b; float x = 1.25f; memcpy(&b, &x, 4);
+        CHECK(nmx_color_f32_unorm(b, 16) == 1u << 16, "unorm clamps above 1");
+        x = -0.25f; memcpy(&b, &x, 4);
+        CHECK(nmx_color_f32_unorm(b, 16) == 0, "unorm clamps below 0");
+        x = 0.5f; memcpy(&b, &x, 4);
+        CHECK(nmx_color_f32_unorm(b, 16) == 1u << 15, "unorm 0.5");
+    }
+
+    /* 6: IOPresentment's matrix layout (row i, component j at k[j * 4 + i]) -> DRM row-major CTM */
+    {
+        const float m[3][3] = { { 0.9f, 0.1f, 0.0f }, { -0.05f, 1.02f, 0.03f }, { 0.0f, 0.2f, 0.8f } };
+        uint32_t k[12] = { 0 };
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                memcpy(&k[j * 4 + i], &m[i][j], 4);
+        uint64_t o[9];
+        nmx_color_ctm_from_iop(k, o);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) {
+                const double back = (double)dm_from_s3132(o[i * 3 + j]) / 4294967296.0;
+                CHECK(fabs(back - (double)m[i][j]) < 1e-7, "ctm[%d][%d] %g want %g", i, j, back, (double)m[i][j]);
+            }
     }
 
     printf("%s: %d failures\n", fails ? "FAIL" : "PASS", fails);

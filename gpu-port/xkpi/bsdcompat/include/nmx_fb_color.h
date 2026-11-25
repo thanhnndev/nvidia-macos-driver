@@ -141,4 +141,56 @@ static inline void nmx_color_ctm_build(const int64_t m[9], unsigned frac, uint64
         out[i] = nmx_color_ctm_coef(m[i], frac);
 }
 
+/*
+ * IEEE-754 single (as its bits) -> signed fixed point with frac fractional bits, rounded to nearest, saturated to
+ * +-2^62 (in fixed-point units). Integer only: IOAcceleratorFamily2 hands the gamma tables and the colour matrix over as floats
+ * (IOAccelDisplayPipeGammaTable2::getTableEntry, getPipeColorMatrix), and a kext has no FPU state.
+ * NaN -> 0; infinities saturate.
+ */
+static inline int64_t nmx_color_f32_to_fix(uint32_t bits, unsigned frac)
+{
+    const int neg = (int)(bits >> 31);
+    const int exp = (int)((bits >> 23) & 0xff);
+    uint64_t man = bits & 0x7fffffu;
+    const int64_t lim = (int64_t)1 << 62;
+    int64_t v;
+    int sh;
+
+    if (exp == 0xff)
+        return man ? 0 : (neg ? -lim : lim);
+    if (exp == 0)
+        return 0;                                   /* denormals are below any frac we use */
+    man |= 0x800000u;                               /* value = man * 2^(exp - 150) */
+    sh = exp - 150 + (int)frac;
+    if (sh >= 0) {
+        v = sh > 38 ? lim : (int64_t)(man << sh);  /* man < 2^24: past sh 38 it would pass 2^62 */
+    } else if (sh > -64) {
+        v = (int64_t)((man + ((1ull << (-sh)) >> 1)) >> (-sh));
+    } else {
+        v = 0;
+    }
+    return neg ? -v : v;
+}
+
+/* a gamma/linearization table value (float bits) -> unsigned fixed point clamped to [0, 1] (frac <= 30) */
+static inline uint32_t nmx_color_f32_unorm(uint32_t bits, unsigned frac)
+{
+    const int64_t v = nmx_color_f32_to_fix(bits, frac);
+    const int64_t one = (int64_t)1 << frac;
+    return v <= 0 ? 0 : v >= one ? (uint32_t)one : (uint32_t)v;
+}
+
+/*
+ * IOAcceleratorFamily2's pipe colour matrix (getPipeColorMatrix, 12 floats) -> the 9 DRM CTM coefficients.
+ * IOPresentment (SetAccelColorMatrixArgs) stores matrix row i, component j at k[j * 4 + i]: three columns of four.
+ * DRM's CTM is row-major (out_i = sum_j ctm[i * 3 + j] * in_j). Assumes CoreDisplay's rows are output rows; an
+ * identity matrix is the same either way, so the first boot cannot tell: the read-out keeps the raw words.
+ */
+static inline void nmx_color_ctm_from_iop(const uint32_t k[12], uint64_t out[9])
+{
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            out[i * 3 + j] = nmx_color_ctm_coef(nmx_color_f32_to_fix(k[j * 4 + i], 32), 32);
+}
+
 #endif

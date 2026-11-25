@@ -1004,6 +1004,8 @@ static uint32_t flip_release_import(uint32_t h)
     return FLIP_R_OK;
 }
 
+static long long col_call(void *req);
+
 /* -1: not a flip call (IOFramebuffer handles it); otherwise the IOReturn */
 long long nmx_fb_flip_call(const char *name, void *req)
 {
@@ -1012,6 +1014,8 @@ long long nmx_fb_flip_call(const char *name, void *req)
 
     if (strncmp(name, "nmxFlip", 7) != 0)
         return -1;
+    if (!strcmp(name, "nmxFlipColor"))
+        return col_call(req);
     fn = !strcmp(name, "nmxFlipStatus") ? 5 : !strcmp(name, "nmxFlipSubmit") ? 4 : !strcmp(name, "nmxFlipCaps") ? 0 :
          !strcmp(name, "nmxFlipBuffers") ? 2 : !strcmp(name, "nmxFlipRelease") ? 3 :
          !strcmp(name, "nmxFlipImport") ? 1 : !strcmp(name, "nmxFlipNotify") ? 6 : -1;
@@ -1960,4 +1964,36 @@ int nmx_fb_color_commit(void)
     if (e)
         __atomic_add_fetch(&gNmxColorErrors, 1, __ATOMIC_RELAXED);
     return e < 0 ? -e : e;
+}
+
+/*
+ * nmxFlipColor (NMXAccel's display-pipe transaction, thread context): stage the three colour stages, and with
+ * NMX_COLOR_COMMIT commit them at once (a transaction without a plane). The stages are copied into blobs here, the
+ * caller's buffers are not kept. Mirrors struct NMXColorRequest (kexts/NVRM/nmx_flip_abi.h).
+ */
+struct nmx_colorreq {
+    unsigned int version;               /* 1 */
+    unsigned int flags;                 /* 1 degamma, 2 ctm, 4 gamma (absent = bypass), 8 commit now */
+    const struct nmx_color_lut *degamma;
+    const uint64_t *ctm;
+    const struct nmx_color_lut *gamma;
+    int err;                            /* out: errno of the failing step */
+    unsigned int pad;
+};
+_Static_assert(sizeof(struct nmx_colorreq) == 40, "NMXColorRequest layout");
+
+static long long col_call(void *req)
+{
+    struct nmx_colorreq *r = req;
+    int e;
+
+    if (!r || r->version != 1 || (r->flags & ~0xfu) ||
+        ((r->flags & 1) && !r->degamma) || ((r->flags & 2) && !r->ctm) || ((r->flags & 4) && !r->gamma))
+        return FLIP_R_BADARG;
+    e = nmx_fb_color_stage(r->flags & 1 ? r->degamma : NULL, r->flags & 2 ? r->ctm : NULL,
+                           r->flags & 4 ? r->gamma : NULL);
+    if (!e && (r->flags & 8))
+        e = nmx_fb_color_commit();
+    r->err = e;
+    return e == 0 ? FLIP_R_OK : e == EAGAIN ? FLIP_R_NOTREADY : FLIP_R_ERROR;
 }
