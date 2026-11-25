@@ -3,10 +3,17 @@
  * CRTC colour properties take. Shared by the bridge (override/src/nmx_fb_bridge.c) and its unit test
  * (tests/color_math_test.c). Integer only (kernel: no FPU). No kernel headers.
  *
- * CoreDisplay's GPU colour pass (CoreDisplay default.metallib "GPUPass", WS-CPU.md 9.8) runs, per pixel:
- *   preMatrixLinearization (degamma)  ->  cscMatrix (3x3)  ->  combinedLUT (per-channel gamma)  ->  postGammaCSC
- * amdgpu_dm maps CRTC DEGAMMA_LUT -> DGM, CTM -> gamut remap, GAMMA_LUT -> RGM in the same order
- * (amdgpu_dm_update_crtc_color_mgmt): the first three stages have a hardware home; postGammaCSC has no CRTC property.
+ * CoreDisplay's GPU colour pass (CoreDisplay default.metallib "GPUPass", WS-CPU.md 9.8; AIR disassembled 25G332) runs,
+ * per pixel, gated by enabledFeatures bits:
+ *   bit0 preMatrixLinearization: parametric, sign-preserving: |x| >= d ? (a|x| + b)^g + e : c|x| + f (7 float3 coeffs)
+ *   bit1 cscMatrix: 4x4
+ *   bit2 combinedLUT: x * scale + offset -> per-channel 1D LUT (EOTF/encoding, transfer tables and EDR folded in)
+ *   bit3 PQ encode (ST 2084 constants, no parameters)
+ *   bit4 postGammaCSC: 4x4
+ * DisplayPipe::RunFullDisplayPipe passes bits 0-3 only (bit3 only when the pipe is forced: mirroring flag / output
+ * mode 4), so postGammaCSC is never asked for there. amdgpu_dm maps CRTC DEGAMMA_LUT -> DGM, CTM -> gamut remap,
+ * GAMMA_LUT -> RGM in the same order (amdgpu_dm_update_crtc_color_mgmt): bits 0-2 have a hardware home. The parametric
+ * linearization is sampled into the 4096-entry DEGAMMA_LUT by the caller.
  *
  * Inputs are unsigned fixed point with `frac` fractional bits (1.0 = 1 << frac); the exact format IOPresentment's
  * transactions carry is given by the capability's FixedFormat, which the caller turns into `frac`.
