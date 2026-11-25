@@ -226,6 +226,11 @@ enum { MK_BUF_DEV, MK_BUF_HOST, MK_BUF_BAR1, MK_BUF_SPARSE, MK_BUF_IMPORT, MK_HE
 static _Atomic int64_t g_mk[MK_N], g_mk_n[MK_N];
 static inline int mk_buf_kind(const nvk_buffer *b) { return b->imported ? MK_BUF_IMPORT : b->bar1 ? MK_BUF_BAR1 : b->sparse ? MK_BUF_SPARSE : b->map ? MK_BUF_HOST : MK_BUF_DEV; }
 void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes, uint64_t *hit, uint64_t *miss, uint64_t *evict);
+/* 2026-11-25 GFX power: what WindowServer draws per present. Render passes (attachment pixels; passes on an
+   attachment of >= 4 Mpx, i.e. the 2880x1800 screen, split by colour-0 load: LOAD keeps the old pixels, CLEAR/DONTCARE
+   repaints), draws and the scissored pixels per draw (the area a draw can touch; the attachment when CA set no scissor). */
+static _Atomic uint64_t g_rp_n, g_rp_px, g_rp_big_load, g_rp_big_new, g_dr_n, g_dr_scpx;
+static __thread uint64_t t_sc_px;
 static inline void mk_add(int k, int64_t bytes, int n) { atomic_fetch_add(&g_mk[k], bytes); atomic_fetch_add(&g_mk_n[k], n); }
 static uint64_t g_img_align, g_sys_align;
 void (*nvmtl_purge_report_hook)(const char *why);
@@ -3804,6 +3809,12 @@ void nvmtl_vk_frame_census(int what)
                  "in %u (watched IOSurface planes %llu MB), not in our allocations",
                  (unsigned long long)(g_alloc_bytes >> 20), (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
                  atomic_load(&g_btsh_bytes) >> 20, (unsigned)atomic_load(&g_btsh_live), atomic_load(&g_btsh_wbytes) >> 20);
+    {   static uint64_t l[6]; const uint64_t v[6] = { atomic_load(&g_rp_n), atomic_load(&g_rp_px), atomic_load(&g_rp_big_load),
+                                                       atomic_load(&g_rp_big_new), atomic_load(&g_dr_n), atomic_load(&g_dr_scpx) };
+        uint64_t dv[6]; for (int i = 0; i < 6; i++) { dv[i] = v[i] - l[i]; l[i] = v[i]; }
+        nvlog_report("frame census draw area per present: %.2f render passes on %.2f Mpx of attachments, %.2f passes on a >= 4 Mpx target "
+                     "(%.2f keep its pixels, %.2f repaint), %.1f draws touching up to %.2f Mpx (scissor or whole attachment)",
+                     dv[0] / p, dv[1] / p / 1e6, (dv[2] + dv[3]) / p, dv[2] / p, dv[3] / p, dv[4] / p, dv[5] / p / 1e6); }
     {   int64_t m[MK_N], n[MK_N]; for (int i = 0; i < MK_N; i++) { m[i] = atomic_load(&g_mk[i]) >> 20; n[i] = atomic_load(&g_mk_n[i]); }
         uint64_t lc = 0, lb = 0, lh = 0, lm = 0, le = 0; nvmtl_lower_memo_stats(&lc, &lb, &lh, &lm, &le);
         nvlog_report("frame census memory by kind (MB/count): images device %llu system %llu; buffers device %lld/%lld, host %lld/%lld, "
@@ -6170,6 +6181,9 @@ int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
               memset(c->pt_fs[c->pt_n], 0, sizeof c->pt_fs[c->pt_n]); }
       } }
     pvkCmdBeginRenderPass(c->cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    { const uint64_t px = (uint64_t)ps->w * ps->h; atomic_fetch_add_explicit(&g_rp_n, 1, memory_order_relaxed);
+      atomic_fetch_add_explicit(&g_rp_px, px, memory_order_relaxed); t_sc_px = px;
+      if (px >= (4u << 20)) atomic_fetch_add_explicit((ps->load & NVMTL_LOAD_COLOUR(0)) ? &g_rp_big_load : &g_rp_big_new, 1, memory_order_relaxed); }
     c->in_rp = 1;
     for (uint32_t i = 0; i < NVMTL_NCOL; i++) c->fetchview[i] = (i < ncol && cf[i]) ? ps->colview[i] : NULL;
     if (p->pipe) pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
@@ -6565,6 +6579,7 @@ int nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4]
 
 void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t instances, uint32_t baseInstance)
 {
+    atomic_fetch_add_explicit(&g_dr_n, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_dr_scpx, t_sc_px, memory_order_relaxed);
     if (c->nobind) return;
     const uint32_t n = instances ? instances : 1;
     if (nvmtl_fetch_split(c, count, n)) {
@@ -6578,7 +6593,7 @@ void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t i
 }
 
 void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h)
-{ VkRect2D r = { { x, y }, { w, h } }; pvkCmdSetScissor(c->cb, 0, 1, &r); }
+{ VkRect2D r = { { x, y }, { w, h } }; pvkCmdSetScissor(c->cb, 0, 1, &r); t_sc_px = (uint64_t)w * h; }
 void nvmtl_vk_cmd_bind_pipeline(nvk_cmdbuf *c, nvk_pipeline *p) { pvkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)p->pipe); }
 int nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType) {
     static const VkPrimitiveTopology map[5] = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
@@ -6634,6 +6649,7 @@ static int nvmtl_index_range_ok(const nvk_buffer *idx, size_t offset)
 void nvmtl_vk_cmd_draw_indexed(nvk_cmdbuf *c, nvk_buffer *idx, size_t offset, uint32_t count, int is32,
                                uint32_t instances, int32_t baseVertex, uint32_t baseInstance)
 {
+    atomic_fetch_add_explicit(&g_dr_n, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_dr_scpx, t_sc_px, memory_order_relaxed);
     if (!nvmtl_index_range_ok(idx, offset)) return;
     pvkCmdBindIndexBuffer(c->cb, (VkBuffer)idx->buf, offset, is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
     if (c->nobind) return;
