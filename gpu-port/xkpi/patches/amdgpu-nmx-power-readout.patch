@@ -68,7 +68,7 @@
 +	u32 req, st = 0, res = 0;
 +	u64 entries = 0;
 +	bool state;
-+	int r_st, r_res, r_ent, i, skip;
++	int r_st, r_res, r_ent, i, skip, r;
 +
 +#define O_P(...) do { if (o < size) o += (size_t)scnprintf(buf + o, size - o, __VA_ARGS__); } while (0)
 +	/* as Linux's amdgpu_get_gpu_metrics / amdgpu_pm_get_access_if_active: nothing during a reset or suspend (an SMU
@@ -135,11 +135,11 @@
 +		goto out;
 +	}
 +	/* units: mW, MHz, %, MB/s, centi-degC; 65535 = not filled by this PMFW */
-+	O_P("power_mw socket %u apu %u gfx %u all_core %u ipu %u dgpu %u sys %u soc_rest %d\n",
-+	    m->average_socket_power, m->average_apu_power, m->average_gfx_power, m->average_all_core_power,
-+	    m->average_ipu_power, m->average_dgpu_power, m->average_sys_power,
-+	    (int)m->average_socket_power - (int)m->average_all_core_power - (int)m->average_gfx_power -
-+	    (int)(m->average_ipu_power == 0xffff ? 0 : m->average_ipu_power));
++	/* rest = APU - GFX - cores - IPU. Each is filtered on its own (socket/APU for PPT, the rails for metrics), so after a
++	 * load step the difference can go below 0 for a second: printed as -1 (not known), never as a number. sys = Psys, not
++	 * filled by this PMFW on this board (63xxx noise): printed raw for reference only. */
++	r = (int)m->average_apu_power - (int)m->average_all_core_power - (int)m->average_gfx_power - (int)(m->average_ipu_power == 0xffff ? 0 : m->average_ipu_power);
++	O_P("power_mw socket %u apu %u gfx %u all_core %u ipu %u dgpu %u sys(raw) %u soc_rest %d\n", m->average_socket_power, m->average_apu_power, m->average_gfx_power, m->average_all_core_power, m->average_ipu_power, m->average_dgpu_power, m->average_sys_power, r < 0 ? -1 : r);
 +	O_P("core_power_mw");
 +	for (i = 0; i < 16; i++)
 +		O_P(" %u", m->average_core_power[i]);
