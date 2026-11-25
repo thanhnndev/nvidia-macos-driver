@@ -963,6 +963,32 @@ static void nvmtl_storage_twins_out(NVMTLCommandBuffer *cb) {
         nvmtl_surf_dirty(cb, t);
     }
 }
+/* 2026-11-25 review of 9d322f98: the debug request files (G15 trace: trace-request / trace-big / trace-long, G17 noseed,
+   G13/G16/G17 dump-request) were /tmp/nvmtl-*, polled by every process on the GPU. Now off unless NVMTL_DEBUG_REQUESTS=1
+   (environment or nvrm610.conf); the files are in this process's own per-user temp dir (confstr
+   _CS_DARWIN_USER_TEMP_DIR, mode 0700) and carry the process name (nvmtl-trace-request.WindowServer), as the pass timer's
+   do. Compiled out of release builds. */
+static int nvmtl_debug_req(const char *what)
+{
+#if NVMTL_RELEASE
+    (void)what; return 0;
+#else
+    static int on = -1; static char dir[520];
+    if (on < 0) {
+        char td[512] = "";
+        const char *e = getenv("NVMTL_DEBUG_REQUESTS");
+        if (e && *e && *e != '0' && confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td) > 1 && td[0] == '/') {
+            snprintf(dir, sizeof dir, "%s%s", td, td[strlen(td) - 1] == '/' ? "" : "/");
+            nvlog("debug requests: NVMTL_DEBUG_REQUESTS set, polling %snvmtl-{trace-request,trace-big,trace-long,noseed,dump-request}.%s",
+                  dir, getprogname() ?: "unknown");
+            on = 1;
+        } else on = 0;
+    }
+    if (!on) return 0;
+    char p[700]; snprintf(p, sizeof p, "%snvmtl-%s.%s", dir, what, getprogname() ?: "unknown");
+    return access(p, F_OK) == 0;
+#endif
+}
 static int g_trace_lines;
 static int g_trace_bigonly, g_trace_mute;
 static int nvmtl_trace_on(void) {
@@ -970,9 +996,9 @@ static int nvmtl_trace_on(void) {
     static int cap = 2500;
     /* the clock is read every 64th call, not on every draw (Step101: 41 samples in 5 s of WindowServer) */
     if ((calls++ & 63) == 0 && clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) >= next) {
-        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW); next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-trace-request", F_OK) == 0;
-        g_trace_bigonly = on && access("/tmp/nvmtl-trace-big", F_OK) == 0; if (!g_trace_bigonly) g_trace_mute = 0;
-        if (on && !was) { g_trace_lines = 0; cap = access("/tmp/nvmtl-trace-long", F_OK) == 0 ? 20000 : 2500; } }
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW); next = now + 250000000ull; int was = on; on = nvmtl_debug_req("trace-request");
+        g_trace_bigonly = on && nvmtl_debug_req("trace-big"); if (!g_trace_bigonly) g_trace_mute = 0;
+        if (on && !was) { g_trace_lines = 0; cap = nvmtl_debug_req("trace-long") ? 20000 : 2500; } }
     return on && !g_trace_mute && g_trace_lines < cap;
 }
 static int nvtrace_scope(uint32_t w, uint32_t h) { int was = g_trace_mute; g_trace_mute = 0; (void)nvmtl_trace_on();
@@ -1038,7 +1064,7 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
 #import "NVMTLFlipCensus.m"
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
 static int nvmtl_noseed(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/nvmtl-noseed", F_OK) == 0;
+    if (now >= next) { next = now + 250000000ull; int was = on; on = nvmtl_debug_req("noseed");
         if (on && !was) nvlog("G17 EXPERIMENT ON: surface-out writes under a read-only lock, the IOSurface seed does not move");
         if (!on && was) nvlog("G17 experiment off: surface-out bumps the seed again"); }
     return on; }
@@ -1055,7 +1081,7 @@ static void nvmtl_frame_dump(const char *tag, const void *base, size_t row, uint
 static void nvmtl_surface_cpu_dump(NVMTLTexture *rt) {
     static uint64_t next; static int on;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    if (now >= next) { next = now + 250000000ull; on = access("/tmp/nvmtl-dump-request", F_OK) == 0; }
+    if (now >= next) { next = now + 250000000ull; on = nvmtl_debug_req("dump-request"); }
     if (!on || !rt || !rt->_surf || IOSurfaceGetBytesPerElement(rt->_surf) != 4 || IOSurfaceGetPlaneCount(rt->_surf) > 1) return;
     if (IOSurfaceLock(rt->_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) { static int said; if (!said++) nvlog("G16 cpu dump: IOSurfaceLock failed"); return; }
     char tag[24]; snprintf(tag, sizeof tag, "cpu%u-", (unsigned)IOSurfaceGetID(rt->_surf));
@@ -1063,7 +1089,7 @@ static void nvmtl_surface_cpu_dump(NVMTLTexture *rt) {
     IOSurfaceUnlock(rt->_surf, kIOSurfaceLockReadOnly, NULL);
 }
 static void nvmtl_frame_dump(const char *tag, const void *base, size_t row, uint32_t w, uint32_t h) {
-    if ((uint64_t)w * h < 1024 || access("/tmp/nvmtl-dump-request", F_OK)) return;
+    if ((uint64_t)w * h < 1024 || !nvmtl_debug_req("dump-request")) return;
     static struct { char tag[24]; uint32_t w, h; uint64_t last; } slot[32]; static int nslot;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW); int k, go = 0;
     @synchronized([NSObject class]) {
@@ -1089,7 +1115,7 @@ static void nvmtl_frame_dump(const char *tag, const void *base, size_t row, uint
 static void nvmtl_blit_dump(NVMTLTexture *d) {
     nvk_image *i = [d nvi]; if (!i || i->w < 1000 || i->h < 100 || i->bpp != 4) return;
     static uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    if ((last && now - last < 2000000000ull) || access("/tmp/nvmtl-dump-request", F_OK)) return;
+    if ((last && now - last < 2000000000ull) || !nvmtl_debug_req("dump-request")) return;
     last = now; size_t row = (size_t)i->w * 4; void *px = malloc(row * i->h);
     if (!px) { nvlog("G17 blit dump: malloc FAILED"); return; }
     if (nvmtl_vk_image_read(d->_q, i, px, row)) nvlog("G17 blit dump: readback FAILED");
@@ -2915,9 +2941,10 @@ bind:
         nvmtl_vk_cmd_bind_pipeline(&_cb->_c, &p->_p);
         static int told; if (!told++) nvlog("G12 a second pipeline was bound inside one encoder (first time in this process)");
     }
-    if ((_cb->_c.pt_open && _cb->_c.pt_pool) || (_flcBig && g_flc == 1)) {
+    const int ptOn = _cb->_c.pt_open && _cb->_c.pt_pool, flcOn = _flcBig && g_flc == 1;
+    if (ptOn || flcOn) {
         static const char kPtHash = 0; NSNumber *hn = objc_getAssociatedObject(p, &kPtHash);
-        if (!hn) {
+        if (!hn) {   // once per pipeline: FNV-1a of each stage's SPIR-V (the id the census and the pass timer print)
             uint32_t hv = 0, hf = 0;
             for (int s = 0; s < 2; s++) {
                 id f = s ? p->_descriptor.fragmentFunction : p->_descriptor.vertexFunction;
@@ -2925,29 +2952,13 @@ bind:
                 NSData *d = ((NVMTLFunction *)f)->_spirv; if (!d.length) continue;
                 uint32_t h = 2166136261u; const uint8_t *b = d.bytes; for (NSUInteger i = 0; i < d.length; i++) { h ^= b[i]; h *= 16777619u; }
                 if (s) hf = h; else hv = h;
-                // 2026-11-25: per-user temp dir (WindowServer's home is not writable; nothing lands in ~/Library/Caches)
-                static NSString *pdir; if (!pdir) { char td[512] = ""; const char *e = getenv("TMPDIR");
-                    if (e && *e == '/') strlcpy(td, e, sizeof td); else if (confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td) <= 1) strlcpy(td, "/tmp", sizeof td);
-                    pdir = [[NSString stringWithUTF8String:td] stringByAppendingPathComponent:@"nvmtl-pstat"]; }
-                NSString *dir = pdir;
-                NSString *pth = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.%s.spv", h, s ? "frag" : "vert"]];
-                if (![[NSFileManager defaultManager] fileExistsAtPath:pth]) {
-                    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-                    [d writeToFile:pth atomically:YES];
-                    // the function constants that pick this variant of CA's shader (all CA fragment shaders share one name)
-                    NSMutableDictionary *fcn = [NSMutableDictionary dictionary];   // constant index -> name, from the AIR's reflection
-                    @try { NSDictionary *cd = [(NVMTLFunction *)f functionConstantsDictionary];
-                        for (NSString *nm in cd) { MTLFunctionConstant *c = cd[nm]; if ([c respondsToSelector:@selector(index)]) fcn[@(c.index)] = nm; } } @catch (id x) {}
-                    NSDictionary *fcd = ((NVMTLFunction *)f)->_fc; NSMutableString *t = [NSMutableString stringWithFormat:@"%@ %@\n", ((NVMTLFunction *)f)->_fname ?: @"?", ((NVMTLFunction *)f)->_stage ?: @""];
-                    for (NSString *k in [fcd.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) { return [@(a.integerValue) compare:@(b.integerValue)]; }]) {
-                        NSArray *a = fcd[k]; [t appendFormat:@"%@ %@", k, fcn[@(k.integerValue)] ?: @"?"];
-                        if ([a isKindOfClass:[NSArray class]]) for (id v in a) [t appendFormat:@" %02x", [v unsignedCharValue]];
-                        [t appendString:@"\n"]; }
-                    [t writeToFile:[pth stringByAppendingString:@".fc.txt"] atomically:YES encoding:NSUTF8StringEncoding error:NULL]; }
+                // 2026-11-25 review of 9d322f98: the file dump runs on a utility queue, and for the census only with
+                // NVMTL_FLIP_CENSUS_SPV=1 (NVMTLFlipCensus.m)
+                if (ptOn || g_flc_spv) nvmtl_spv_dump_async(d, h, s, (NVMTLFunction *)f);
             }
             hn = @(((uint64_t)hv << 32) | hf);
             objc_setAssociatedObject(p, &kPtHash, hn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            {   // flip census: the fragment variant's non-zero function constants, by name ("fc_has_gamma_luts=01 ...")
+            if (g_flc == 1) {   // flip census: the fragment variant's non-zero function constants, by name ("has_gamma_luts=01 ...")
                 id f = p->_descriptor.fragmentFunction; NSMutableString *nz = [NSMutableString string];
                 if ([f isKindOfClass:[NVMTLFunction class]]) {
                     NSMutableDictionary *fcn = [NSMutableDictionary dictionary];
@@ -2961,17 +2972,20 @@ bind:
                         [nz appendFormat:@"%@%@=", nz.length ? @" " : @"", nm]; for (id v in a) [nz appendFormat:@"%02x", [v unsignedCharValue]]; } }
                 static const char kFlcNz = 0; objc_setAssociatedObject(p, &kFlcNz, nz.length ? nz : @"-", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 g_flc_nz_key = &kFlcNz; }
-            extern int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n);
-            char st[600]; nvmtl_vk_pipeline_stats(p->_p.pipe, st, sizeof st);
-            nvlog("ptpso: vs %08x fs %08x | %s", hv, hf, st);
+            if (ptOn) {   // pass timer only: pipeline statistics and its log line
+                extern int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n);
+                char st[600]; nvmtl_vk_pipeline_stats(p->_p.pipe, st, sizeof st);
+                nvlog("ptpso: vs %08x fs %08x | %s", hv, hf, st);
+            }
         }
-        extern void nvmtl_vk_pt_note(nvk_cmdbuf *c, uint32_t fs);
-        nvmtl_vk_pt_note(&_cb->_c, (uint32_t)(hn.unsignedLongLongValue & 0xffffffffu));
-        if (_flcBig && g_flc == 1) { const uint32_t fsh = (uint32_t)(hn.unsignedLongLongValue & 0xffffffffu); int seen = 0;
+        if (ptOn) { extern void nvmtl_vk_pt_note(nvk_cmdbuf *c, uint32_t fs); nvmtl_vk_pt_note(&_cb->_c, (uint32_t)(hn.unsignedLongLongValue & 0xffffffffu)); }
+        if (flcOn && _flcFsN <= 8) { const uint32_t fsh = (uint32_t)(hn.unsignedLongLongValue & 0xffffffffu); int seen = 0;
             for (unsigned k = 0; k < _flcFsN; k++) if (_flcFs[k] == fsh) { seen = 1; break; }
-            if (!seen) { if (_flcFsN < 8) _flcFs[_flcFsN++] = fsh;   // once per pass and shader
-                NSString *nz = g_flc_nz_key ? objc_getAssociatedObject(p, g_flc_nz_key) : nil;
-                nvmtl_flc_fs(fsh, _flcLoad, nz.UTF8String); } }
+            if (!seen) {
+                if (_flcFsN < 8) { _flcFs[_flcFsN++] = fsh;   // once per pass and shader
+                    NSString *nz = g_flc_nz_key ? objc_getAssociatedObject(p, g_flc_nz_key) : nil;
+                    nvmtl_flc_fs(fsh, _flcLoad, nz.UTF8String); }
+                else { _flcFsN = 9; nvmtl_flc_fs_full(); } } }   // 9th shader: the pass is counted once, no more lookups
     }
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)off atIndex:(NSUInteger)i {
