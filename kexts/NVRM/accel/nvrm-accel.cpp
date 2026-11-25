@@ -1106,11 +1106,26 @@ public:
     unsigned int        getSurfaceID() const;
     OSObject           *copyValue(const char *key, unsigned int *err) const;   // IOSurfaceSetValue's store (kernel side)
 };
+// IOAcceleratorFamily2's gamma table object (IOAccelDisplayPipeGammaTable2): count entries of {r, g, b} floats
+class IOAccelDisplayPipeGammaTable2 {
+public:
+    unsigned int getTableCount() const;
+    void         getTableEntry(unsigned int, float *, float *, float *) const;   // only stores the bits: no FPU use
+};
+// returned by value (sret): getPipeColorMatrix copies 12 floats (0x30 bytes), getPipeColorMatrixArgs 3 x u64
+struct IOAccelDisplayPipeColorMatrix     { unsigned int k[12]; };
+struct IOAccelDisplayPipeColorMatrixArgs { unsigned long long type, format, configurationID; };
 class IOAccelDisplayPipeTransaction2 {
 public:
     IOSurface *getPlaneIOSurface(unsigned int, unsigned int) const;
     OSObject  *getPlaneResource(unsigned int, unsigned int) const;
+    IOAccelDisplayPipeGammaTable2 *getPipePreGammaTable() const;     // IOPresentment: plane linearization, table types
+    IOAccelDisplayPipeGammaTable2 *getPipePostGammaTable() const;    // IOPresentment: pipe gamma, table types
+    IOAccelDisplayPipeColorMatrix      getPipeColorMatrix() const;
+    IOAccelDisplayPipeColorMatrixArgs  getPipeColorMatrixArgs() const;
 };
+static_assert(sizeof(IOAccelDisplayPipeColorMatrix) == 0x30 && sizeof(IOAccelDisplayPipeColorMatrixArgs) == 0x18,
+              "IOAcceleratorFamily2 25G332: getPipeColorMatrix copies 0x30 bytes, getPipeColorMatrixArgs 0x18");
 
 
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
@@ -2281,6 +2296,141 @@ capsDone:
     return false;
 }
 #endif
+#ifdef NMX_ACCEL
+/*
+ * Hardware colour stages (2026-11-25, boot-arg nmxhwcolor=1, default off). With it NMXAGDC advertises pipe CSC,
+ * gamma and linearization (kexts/NMXAGDC/nmx-agdc-color.h), CoreDisplay then sends its colour stages in the display
+ * pipe transaction instead of running them in its GPUPass shader, and IOAcceleratorFamily2 hands them over here:
+ *   getPipePreGammaTable   = linearization (DCN degamma)      getPipeColorMatrix(Args) = CSC (DCN CTM)
+ *   getPipePostGammaTable  = gamma (DCN regamma)
+ * Each changed stage is converted (nmx_fb_color.h: floats decoded without the FPU, resampled to 4096 entries) and all
+ * three are staged in NMXGPU (nmxFlipColor); the next flip commits them, or this transaction alone when it has no
+ * plane. A table that is not in the transaction keeps its last value; identical content is not staged again.
+ * Read-out: debug.nmxaccel_color_* (what CoreDisplay asked, what was staged); the flip census (shader f1c2052c) shows
+ * whether GPUPass still runs.
+ */
+#include "../../../gpu-port/xkpi/bsdcompat/include/nmx_fb_color.h"
+static int gNmxHwColor = -1;
+static SInt64 gColTxn, gColDeg, gColCtm, gColGam, gColSame, gColErr, gColStaged, gColAlone;
+static int gColLastRc, gColDegN, gColGamN;
+static char gColCtmRaw[12 * 9 + 3 * 17 + 8] = "none";
+static struct nmx_color_lut *gColDegLut, *gColGamLut;
+static unsigned long long gColCtmOut[9];
+static unsigned gColHave;                                  // NMX_COLOR_DEGAMMA | CTM | GAMMA staged at least once
+static unsigned long long gColHash[3];
+static const OSSymbol *gColSym;
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_hwcolor, CTLFLAG_RD | CTLFLAG_LOCKED, &gNmxHwColor, 0, "boot-arg nmxhwcolor (1 = colour stages to DCN; -1 = no transaction yet)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_txn, CTLFLAG_RD | CTLFLAG_LOCKED, &gColTxn, "transactions that carried a colour stage");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_degamma, CTLFLAG_RD | CTLFLAG_LOCKED, &gColDeg, "linearization (pre-gamma) tables changed");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_ctm, CTLFLAG_RD | CTLFLAG_LOCKED, &gColCtm, "colour matrices changed");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_gamma, CTLFLAG_RD | CTLFLAG_LOCKED, &gColGam, "gamma (post-gamma) tables changed");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_same, CTLFLAG_RD | CTLFLAG_LOCKED, &gColSame, "stages sent again with identical content (not restaged)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_staged, CTLFLAG_RD | CTLFLAG_LOCKED, &gColStaged, "nmxFlipColor calls that succeeded");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_alone, CTLFLAG_RD | CTLFLAG_LOCKED, &gColAlone, "colour-only commits (transaction without a plane)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &gColErr, "colour stages refused (bad table, no memory, NMXGPU error)");
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_color_last_rc, CTLFLAG_RD | CTLFLAG_LOCKED, &gColLastRc, 0, "last nmxFlipColor IOReturn");
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_color_degamma_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gColDegN, 0, "entries in the last linearization table");
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_color_gamma_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gColGamN, 0, "entries in the last gamma table");
+SYSCTL_STRING(_debug, OID_AUTO, nmxaccel_color_ctm_raw, CTLFLAG_RD | CTLFLAG_LOCKED, gColCtmRaw, sizeof gColCtmRaw,
+              "last colour matrix as IOAccel gave it: 12 float words (3 columns of 4), then type format configID");
+
+static unsigned long long nmxColorFnv(unsigned long long h, unsigned int w)
+{
+    for (int i = 0; i < 4; i++) { h ^= (w >> (8 * i)) & 0xff; h *= 0x100000001b3ull; }
+    return h;
+}
+
+// one gamma table -> a 4096-entry DRM LUT; 0 = ok, 1 = same content as last time, -1 = refused
+static int nmxColorTable(const IOAccelDisplayPipeGammaTable2 *t, struct nmx_color_lut *out, unsigned long long *hash, int *nOut)
+{
+    const unsigned n = t->getTableCount();
+    *nOut = (int)n;
+    if (n < 2 || n > 65536) return -1;
+    const vm_size_t bytes = (vm_size_t)n * 3 * sizeof(uint32_t);
+    uint32_t *buf = (uint32_t *)IOMallocData(bytes);
+    if (!buf) return -1;
+    uint32_t *r = buf, *g = buf + n, *b = buf + 2 * n;
+    unsigned long long h = 0xcbf29ce484222325ull ^ n;
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t e[3];
+        t->getTableEntry(i, (float *)&e[0], (float *)&e[1], (float *)&e[2]);
+        h = nmxColorFnv(nmxColorFnv(nmxColorFnv(h, e[0]), e[1]), e[2]);
+        r[i] = nmx_color_f32_unorm(e[0], 24); g[i] = nmx_color_f32_unorm(e[1], 24); b[i] = nmx_color_f32_unorm(e[2], 24);
+    }
+    int rc = 1;
+    if (h != *hash || !(*hash)) {
+        rc = nmx_color_lut_build(r, g, b, n, 24, out) ? -1 : 0;
+        if (!rc) *hash = h;
+    }
+    IOFreeData(buf, bytes);
+    return rc;
+}
+
+static void nmxColorTxn(IOService *fb, IOAccelDisplayPipeTransaction2 *txn, bool noPlane)
+{
+    if (gNmxHwColor < 0) { int v = 0; if (!PE_parse_boot_argn("nmxhwcolor", &v, sizeof v)) v = 0; gNmxHwColor = v == 1; }
+    if (gNmxHwColor != 1 || !fb) return;
+    const IOAccelDisplayPipeGammaTable2 *pre = txn->getPipePreGammaTable(), *post = txn->getPipePostGammaTable();
+    const IOAccelDisplayPipeColorMatrix m = txn->getPipeColorMatrix();
+    const IOAccelDisplayPipeColorMatrixArgs ma = txn->getPipeColorMatrixArgs();
+    bool hasM = ma.type != 0;
+    for (int i = 0; i < 12 && !hasM; i++) hasM = m.k[i] != 0;
+    if (!pre && !post && !hasM) return;
+    OSAddAtomic64(1, &gColTxn);
+    if (!gColDegLut) {
+        struct nmx_color_lut *d = (struct nmx_color_lut *)IOMallocZeroData(2 * NMX_COLOR_LUT_ENTRIES * sizeof *d);
+        if (!d) { OSAddAtomic64(1, &gColErr); return; }
+        gColDegLut = d; gColGamLut = d + NMX_COLOR_LUT_ENTRIES;
+    }
+    bool changed = false; int n, rc;
+    if (pre) {
+        rc = nmxColorTable(pre, gColDegLut, &gColHash[0], &n); gColDegN = n;
+        if (rc < 0) OSAddAtomic64(1, &gColErr); else if (rc) OSAddAtomic64(1, &gColSame);
+        else { OSAddAtomic64(1, &gColDeg); gColHave |= NMX_COLOR_DEGAMMA; changed = true; }
+    }
+    if (post) {
+        rc = nmxColorTable(post, gColGamLut, &gColHash[2], &n); gColGamN = n;
+        if (rc < 0) OSAddAtomic64(1, &gColErr); else if (rc) OSAddAtomic64(1, &gColSame);
+        else { OSAddAtomic64(1, &gColGam); gColHave |= NMX_COLOR_GAMMA; changed = true; }
+    }
+    if (hasM) {
+        unsigned long long h = 0xcbf29ce484222325ull;
+        for (int i = 0; i < 12; i++) h = nmxColorFnv(h, m.k[i]);
+        if (h == gColHash[1]) OSAddAtomic64(1, &gColSame);
+        else {
+            gColHash[1] = h;
+            nmx_color_ctm_from_iop(m.k, gColCtmOut);
+            gColHave |= NMX_COLOR_CTM; changed = true; OSAddAtomic64(1, &gColCtm);
+            snprintf(gColCtmRaw, sizeof gColCtmRaw, "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x | %llx %llx %llx",
+                     m.k[0], m.k[1], m.k[2], m.k[3], m.k[4], m.k[5], m.k[6], m.k[7], m.k[8], m.k[9], m.k[10], m.k[11],
+                     ma.type, ma.format, ma.configurationID);
+        }
+    }
+    if (!changed) return;
+    if (!gColSym) {
+        const OSSymbol *sym = OSSymbol::withCString(NMX_FLIP_FN_COLOR);
+        if (sym && !OSCompareAndSwapPtr(nullptr, (void *)sym, (void *volatile *)&gColSym)) sym->release();
+        if (!gColSym) { OSAddAtomic64(1, &gColErr); return; }
+    }
+    struct NMXColorRequest req = {};
+    req.version = 1;
+    req.flags = gColHave | (noPlane ? NMX_COLOR_COMMIT : 0u);
+    req.degamma = gColDegLut; req.ctm = gColCtmOut; req.gamma = gColGamLut;
+    const IOReturn r = fb->callPlatformFunction(gColSym, false, &req, nullptr, nullptr, nullptr);
+    gColLastRc = (int)r;
+    if (r != kIOReturnSuccess) {
+        OSAddAtomic64(1, &gColErr);
+        static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: nmxFlipColor -> %#x (errno %d)", r, req.err); }
+        return;
+    }
+    OSAddAtomic64(1, &gColStaged);
+    if (noPlane) OSAddAtomic64(1, &gColAlone);
+    static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: staged degamma %d (%d) ctm %d gamma %d (%d)%s",
+        !!(gColHave & NMX_COLOR_DEGAMMA), gColDegN, !!(gColHave & NMX_COLOR_CTM), !!(gColHave & NMX_COLOR_GAMMA), gColGamN,
+        noPlane ? ", committed alone" : ""); }
+}
+#endif
+
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const SInt64 trace = OSAddAtomic64(1, &gCntIopPerform);
@@ -2295,6 +2445,9 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
+#ifdef NMX_ACCEL
+    if (head == 0) nmxColorTxn(fb, txn, !s && !ro);   // nmxhwcolor=1 only: the panel's colour stages (before the flip)
+#endif
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
 #ifdef NMX_ACCEL
     (void)nmxFtBegin(s);
@@ -2652,6 +2805,19 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_tripped);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_auto_rearm);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_submitted);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_hwcolor);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_txn);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_degamma);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_ctm);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_gamma);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_same);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_staged);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_alone);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_errors);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_last_rc);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_degamma_n);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_gamma_n);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_ctm_raw);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_latched);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_fallback);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_refused);

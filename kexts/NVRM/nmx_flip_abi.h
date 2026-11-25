@@ -49,6 +49,13 @@
 #define NMX_FLIP_FN_RELEASE  "nmxFlipRelease"
 #define NMX_FLIP_FN_SUBMIT   "nmxFlipSubmit"
 #define NMX_FLIP_FN_STATUS   "nmxFlipStatus"
+/*
+ * nmxFlipColor (2026-11-25, hardware colour stages, boot-arg nmxhwcolor=1): struct NMXColorRequest, not an
+ * NMXFlipRequest. Stages DCN degamma / CTM / regamma for the next flip (absent = bypass); NMX_COLOR_COMMIT commits them
+ * at once (a transaction without a plane). The tables are copied: the caller's buffers are not kept. An NMXGPU without
+ * it answers kIOReturnUnsupported.
+ */
+#define NMX_FLIP_FN_COLOR    "nmxFlipColor"
 
 #define NMX_FLIP_HOME        0u
 #define NMX_FLIP_NONE        0xffffffffu
@@ -105,6 +112,22 @@ struct NMXFlipRequest {
     unsigned long long vblankNs;        // out: status, uptime of the last vertical blank
     struct NMXFlipBuffer buf[NMX_FLIP_MAX_BUFFERS];   // out: buffers
 };
+enum {
+    NMX_COLOR_DEGAMMA = 1u,   // degamma: NMX_COLOR_LUT_ENTRIES x {u16 r, g, b, pad} (drm_color_lut)
+    NMX_COLOR_CTM     = 2u,   // ctm: 9 x u64, S31.32 sign-magnitude, row-major (drm_color_ctm)
+    NMX_COLOR_GAMMA   = 4u,   // gamma: as degamma
+    NMX_COLOR_COMMIT  = 8u,   // commit now (blocking) instead of with the next flip
+};
+/* NMXGPU's struct nmx_colorreq (nmx_fb_bridge.c) must match */
+struct NMXColorRequest {
+    unsigned int              version;    // in: 1
+    unsigned int              flags;      // in: NMX_COLOR_*
+    const void               *degamma;
+    const unsigned long long *ctm;
+    const void               *gamma;
+    int                       err;        // out: errno of the failing step
+    unsigned int              pad;
+};
 /* version 2: NMXGPU's struct nmx_flipreq2 (nmx_fb_bridge.c) must match */
 struct NMXFlipRequest2 {
     struct NMXFlipRequest v1;           // v1.version = NMX_FLIP_ABI_VERSION2
@@ -119,7 +142,9 @@ struct NMXFlipRequest2 {
 #ifdef __cplusplus
 static_assert(sizeof(struct NMXFlipRequest) == 240, "NMXFlipRequest v1 layout (NMXGPU nmx_flipreq)");
 static_assert(sizeof(struct NMXFlipRequest2) == 288, "NMXFlipRequest v2 layout (NMXGPU nmx_flipreq2)");
+static_assert(sizeof(struct NMXColorRequest) == 40, "NMXColorRequest layout (NMXGPU nmx_colorreq)");
 #else
 _Static_assert(sizeof(struct NMXFlipRequest) == 240, "NMXFlipRequest v1 layout (NMXGPU nmx_flipreq)");
 _Static_assert(sizeof(struct NMXFlipRequest2) == 288, "NMXFlipRequest v2 layout (NMXGPU nmx_flipreq2)");
+_Static_assert(sizeof(struct NMXColorRequest) == 40, "NMXColorRequest layout (NMXGPU nmx_colorreq)");
 #endif
