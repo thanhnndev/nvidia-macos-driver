@@ -1337,8 +1337,36 @@ SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_frames, CTLFLAG_RD | CTLFLAG_LOCKED
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_waited, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceWaited, "frames that had to wait for their GPU work");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceWaitUs, "microseconds spent waiting for GPU work");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFenceTimeouts, "waits given up after 100 ms (the frame is copied anyway)");
+// WS-CPU cut 1 item 1: the plugin's fence marks may come through NMXDrmClient selector 3 instead of IOSurface
+// properties (nmx/nmx_fence_table.h, debug.nmxaccel_fence_table, default 0). The table is asked first; the surface ID is
+// read before its lock is taken, and no IOSurface call is made under it.
+#include "nmx/nmx_fence_table.h"
+static int nmxaccel_fence_table_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = nmx_fence_table_on;
+    const int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v != 0 && v != 1) return EINVAL;
+    nmx_fence_table_set(v);
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmxaccel_fence_table, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmxaccel_fence_table_sysctl, "I", "1 = NVMTL fence marks through NMXDrmClient selector 3 (table), 0 = IOSurface properties only (default); a write clears the table");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_calls, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_calls, "selector 3 calls while the table was on");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_entries, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_entries, "surface marks written to the table");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_refused, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_refused, "calls refused: every row in flight (the caller's rows dropped)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_bad, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_bad, "calls rejected by validation");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_hits, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_hits, "fence key reads answered by the table");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_misses, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_misses, "fence key reads that went to the IOSurface property");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_evicted, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_evicted, "rows (not in flight) reused for another surface");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_cleared, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_cleared, "rows dropped on client close or refusal");
 static unsigned long long nmxSurfValue(IOSurface *s, const char *key)
 {
+    if (nmx_fence_table_on) {
+        const int ki = nmx_fence_key_index(key);
+        unsigned long long tv;
+        if (ki >= 0 && nmx_fence_table_get(s->getSurfaceID(), ki, &tv)) return tv;
+    }
     unsigned int err = 0;
     OSObject *o = s->copyValue(key, &err);
     OSNumber *n = OSDynamicCast(OSNumber, o);
@@ -3206,6 +3234,15 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_waited);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_wait_us);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_timeouts);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_calls);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_entries);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_refused);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_bad);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_hits);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_misses);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_evicted);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_cleared);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_sync);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_api);

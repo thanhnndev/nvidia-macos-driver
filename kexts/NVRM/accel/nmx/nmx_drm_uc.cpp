@@ -25,6 +25,8 @@
 #include <sys/vnode_if.h>
 #include <sys/proc.h>
 #include <string.h>
+#include <libkern/OSAtomic.h>
+#include "nmx_fence_table.h"
 
 extern "C" {
 typedef void (*nmx_thread_fn)(void *param, int wait_result);
@@ -39,8 +41,146 @@ enum {
     kNmxDrmSelOpen  = 0,   /* in: node minor (128 = renderD128); out: errno, dev major, dev minor of the open */
     kNmxDrmSelIoctl = 1,   /* in: cmd; struct in/out: the ioctl argument (IOCPARM_LEN(cmd) bytes); out: errno */
     kNmxDrmSelStat  = 2,   /* in: node minor; out: errno, dev major, node minor (stat(2) of the node, no DRM file) */
+    kNmxDrmSelFence = 3,   /* struct in: nmx_fence_call_v1 (nmx_fence_table.h); no output. debug.nmxaccel_fence_table */
     kNmxDrmSelCount
 };
+
+
+/* ---- fence table (nmx_fence_table.h) ----
+ * 64 rows keyed by IOSurface ID. One spin lock, held only inside nmx_fence_table_get and the selector's apply step:
+ * no IOSurface (or any other) call is made with it held. A row is owned by the client that last wrote it; clientClose
+ * clears the rows it owns. A new surface takes a free row, else the least recently written row that is not in flight
+ * (Done >= Pending, or no Pending); when every row is in flight the call is refused and nothing is written. */
+int nmx_fence_table_on = 0;
+int64_t nmx_fence_table_calls, nmx_fence_table_entries, nmx_fence_table_refused, nmx_fence_table_bad,
+        nmx_fence_table_hits, nmx_fence_table_misses, nmx_fence_table_evicted, nmx_fence_table_cleared;
+#define NMX_FT_ROWS 64
+struct NmxFenceRow {
+    uint32_t sid;              /* 0 = free */
+    uint32_t valid;            /* bit k: v[k] was written through the table */
+    const void *owner;
+    uint64_t tick;             /* last write, for eviction */
+    unsigned long long v[kNmxFkCount];
+};
+static NmxFenceRow gFt[NMX_FT_ROWS];
+static uint64_t gFtTick;
+static IOSimpleLock *volatile gFtLock;
+static IOSimpleLock *nmxFtLock(void)
+{
+    IOSimpleLock *l = gFtLock;
+    if (l) return l;
+    IOSimpleLock *n = IOSimpleLockAlloc();
+    if (!n) return nullptr;
+    if (!OSCompareAndSwapPtr(nullptr, n, (void *volatile *)&gFtLock)) IOSimpleLockFree(n);
+    return gFtLock;
+}
+static inline bool nmxFtBusy(const NmxFenceRow &r)   /* in flight: a Pending the row has not seen Done for */
+{
+    if (!(r.valid & (1u << kNmxFkPending))) return false;
+    return !(r.valid & (1u << kNmxFkDone)) || r.v[kNmxFkDone] < r.v[kNmxFkPending];
+}
+extern "C" int nmx_fence_key_index(const char *key)
+{
+    if (!key || strncmp(key, "NMXFence", 8) != 0) return -1;
+    const char *k = key + 8;
+    if (!strcmp(k, "Pending")) return kNmxFkPending;
+    if (!strcmp(k, "PendingT")) return kNmxFkPendingT;
+    if (!strcmp(k, "Submitted")) return kNmxFkSubmitted;
+    if (!strcmp(k, "Done")) return kNmxFkDone;
+    if (!strcmp(k, "DoneT")) return kNmxFkDoneT;
+    if (!strcmp(k, "GpuEndT")) return kNmxFkGpuEndT;
+    return -1;
+}
+extern "C" bool nmx_fence_table_get(uint32_t sid, int ki, unsigned long long *v)
+{
+    if (!nmx_fence_table_on || !sid || ki < 0 || ki >= kNmxFkCount) return false;
+    IOSimpleLock *l = gFtLock;
+    if (!l) return false;
+    bool hit = false;
+    IOSimpleLockLock(l);
+    for (int i = 0; i < NMX_FT_ROWS; i++)
+        if (gFt[i].sid == sid) {
+            if (gFt[i].valid & (1u << ki)) { *v = gFt[i].v[ki]; hit = true; }
+            break;
+        }
+    IOSimpleLockUnlock(l);
+    OSAddAtomic64(1, hit ? &nmx_fence_table_hits : &nmx_fence_table_misses);
+    return hit;
+}
+static bool nmxFtFlagsOk(uint32_t f)
+{
+    return f == NMX_FENCE_F_PENDING || f == (NMX_FENCE_F_PENDING | NMX_FENCE_F_SUBMITTED) || f == NMX_FENCE_F_SUBMITTED ||
+           f == NMX_FENCE_F_DONE;
+}
+/* the call's entries, already validated and copied to kernel memory: all applied, or none (false = no row free).
+ * Rows are chosen first without touching the table (a bitmap of the rows taken), then written. */
+static bool nmxFtApply(const nmx_fence_entry_v1 *e, uint32_t n, const void *owner)
+{
+    IOSimpleLock *l = nmxFtLock();
+    if (!l) return false;
+    int slot[NMX_FENCE_CALL_MAX];
+    uint64_t taken = 0;
+    uint32_t evicted = 0;
+    bool ok = true;
+    IOSimpleLockLock(l);
+    for (uint32_t j = 0; j < n && ok; j++) {
+        int at = -1, freeAt = -1, evictAt = -1;
+        for (uint32_t p = 0; p < j && at < 0; p++) if (e[p].surfaceID == e[j].surfaceID) at = slot[p];
+        for (int i = 0; i < NMX_FT_ROWS && at < 0; i++) {
+            if (gFt[i].sid == e[j].surfaceID) at = i;
+            else if (taken & (1ull << i)) continue;
+            else if (!gFt[i].sid) { if (freeAt < 0) freeAt = i; }
+            else if (!nmxFtBusy(gFt[i]) && (evictAt < 0 || gFt[i].tick < gFt[evictAt].tick)) evictAt = i;
+        }
+        if (at < 0) at = freeAt >= 0 ? freeAt : evictAt;
+        if (at < 0) ok = false;
+        else { slot[j] = at; taken |= 1ull << at; }
+    }
+    if (ok) {
+        const uint64_t tick = ++gFtTick;
+        for (uint32_t j = 0; j < n; j++) {
+            NmxFenceRow &r = gFt[slot[j]];
+            if (r.sid != e[j].surfaceID) {
+                if (r.sid) evicted++;
+                bzero(&r, sizeof r);
+                r.sid = e[j].surfaceID;
+            }
+            const uint32_t f = e[j].flags;
+            if (f & NMX_FENCE_F_PENDING) {
+                r.v[kNmxFkPending] = e[j].seq; r.v[kNmxFkPendingT] = e[j].tNs;
+                r.valid |= (1u << kNmxFkPending) | (1u << kNmxFkPendingT);
+            }
+            if (f & NMX_FENCE_F_SUBMITTED) { r.v[kNmxFkSubmitted] = e[j].seq; r.valid |= 1u << kNmxFkSubmitted; }
+            if (f & NMX_FENCE_F_DONE) {
+                r.v[kNmxFkDone] = e[j].seq; r.v[kNmxFkDoneT] = e[j].tNs; r.v[kNmxFkGpuEndT] = e[j].gpuEndNs;
+                r.valid |= (1u << kNmxFkDone) | (1u << kNmxFkDoneT) | (1u << kNmxFkGpuEndT);
+            }
+            r.owner = owner;
+            r.tick = tick;
+        }
+    }
+    IOSimpleLockUnlock(l);
+    if (evicted) OSAddAtomic64(evicted, &nmx_fence_table_evicted);
+    return ok;
+}
+extern "C" void nmx_fence_table_set(int on)
+{
+    IOSimpleLock *l = nmxFtLock();
+    if (l) IOSimpleLockLock(l);
+    nmx_fence_table_on = on ? 1 : 0;
+    bzero(gFt, sizeof gFt);
+    if (l) IOSimpleLockUnlock(l);
+}
+static void nmxFtClearOwner(const void *owner)
+{
+    IOSimpleLock *l = gFtLock;
+    if (!l) return;
+    uint32_t n = 0;
+    IOSimpleLockLock(l);
+    for (int i = 0; i < NMX_FT_ROWS; i++) if (gFt[i].sid && gFt[i].owner == owner) { bzero(&gFt[i], sizeof gFt[i]); n++; }
+    IOSimpleLockUnlock(l);
+    if (n) OSAddAtomic64(n, &nmx_fence_table_cleared);
+}
 
 class NMXDrmClient : public IOUserClient {
     OSDeclareDefaultStructors(NMXDrmClient)
@@ -62,6 +202,7 @@ public:
         IOUserClient::free();
     }
     IOReturn clientClose() APPLE_KEXT_OVERRIDE {
+        nmxFtClearOwner(this);
         closeNode("close");
         if (!isInactive()) terminate();
         return kIOReturnSuccess;
@@ -74,6 +215,7 @@ public:
         case kNmxDrmSelOpen:  return selOpen(a);
         case kNmxDrmSelIoctl: return selIoctl(a);
         case kNmxDrmSelStat:  return selStat(a);
+        case kNmxDrmSelFence: return selFence(a);
         default: return kIOReturnBadArgument;
         }
     }
@@ -217,6 +359,35 @@ private:
         IORWLockUnlock(fLock);
         a->structureOutputSize = len;
         a->scalarOutput[0] = (uint64_t)err;
+        return kIOReturnSuccess;
+    }
+
+    /* fence marks for up to 16 surfaces (nmx_fence_table.h). Strict: exact size for the version, n 1..16, known flag
+     * combinations only, no scalars, no struct output, no out-of-line input. */
+    IOReturn selFence(IOExternalMethodArguments *a) {
+        if (!nmx_fence_table_on) return kIOReturnUnsupported;
+        OSAddAtomic64(1, &nmx_fence_table_calls);
+        const uint32_t sz = a->structureInputSize;
+        if (a->scalarInputCount || a->scalarOutputCount || a->structureOutputSize || a->structureInputDescriptor ||
+            a->structureOutputDescriptor || !a->structureInput || sz < 8 || sz > sizeof(nmx_fence_call_v1)) {
+            OSAddAtomic64(1, &nmx_fence_table_bad); return kIOReturnBadArgument;
+        }
+        nmx_fence_call_v1 c;                     /* 520 bytes, copied once: no field is read twice from the caller */
+        memcpy(&c, a->structureInput, sz);
+        if (c.version != NMX_FENCE_CALL_VERSION || c.n < 1 || c.n > NMX_FENCE_CALL_MAX || sz != NMX_FENCE_CALL_SIZE(c.n)) {
+            OSAddAtomic64(1, &nmx_fence_table_bad); return kIOReturnBadArgument;
+        }
+        for (uint32_t j = 0; j < c.n; j++)
+            if (!c.e[j].surfaceID || !nmxFtFlagsOk(c.e[j].flags)) { OSAddAtomic64(1, &nmx_fence_table_bad); return kIOReturnBadArgument; }
+        if (!nmxFtApply(c.e, c.n, this)) {
+            /* Every row in flight. The caller goes back to IOSurface properties for the rest of its life, so its rows are
+             * dropped now: a row left behind would shadow the newer property values it writes from here on. */
+            nmxFtClearOwner(this);
+            const SInt64 k = OSAddAtomic64(1, &nmx_fence_table_refused);
+            if (k < 4) NMX_DRM_LOG("pid %d: fence table full (%d rows in flight), call refused, its rows dropped", proc_selfpid(), NMX_FT_ROWS);
+            return kIOReturnNoSpace;
+        }
+        OSAddAtomic64((SInt64)c.n, &nmx_fence_table_entries);
         return kIOReturnSuccess;
     }
 
