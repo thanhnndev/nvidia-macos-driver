@@ -131,7 +131,7 @@ static bool nmxFtApply(const nmx_fence_entry_v1 *e, uint32_t n, const void *owne
     if (!staleAbs) nanoseconds_to_absolutetime(2000000000ull, &staleAbs);
     const uint64_t now = mach_absolute_time();
     int slot[NMX_FENCE_CALL_MAX];
-    uint64_t taken = 0;
+    uint64_t taken = 0, staleRows = 0;   /* staleRows: rows step 2 took as stale (counted there, not as evicted) */
     uint32_t evicted = 0, stale = 0;
     bool ok = true;
     IOSimpleLockLock(l);
@@ -153,7 +153,7 @@ static bool nmxFtApply(const nmx_fence_entry_v1 *e, uint32_t n, const void *owne
         }
         const int at = freeAt >= 0 ? freeAt : evictAt >= 0 ? evictAt : staleAt;
         if (at < 0) { ok = false; break; }
-        if (at == staleAt && freeAt < 0 && evictAt < 0) stale++;
+        if (at == staleAt && freeAt < 0 && evictAt < 0) { stale++; staleRows |= 1ull << at; }
         slot[j] = at; taken |= 1ull << at;
     }
     if (ok) {
@@ -161,7 +161,7 @@ static bool nmxFtApply(const nmx_fence_entry_v1 *e, uint32_t n, const void *owne
         for (uint32_t j = 0; j < n; j++) {
             NmxFenceRow &r = gFt[slot[j]];
             if (r.sid != e[j].surfaceID) {
-                if (r.sid) evicted++;
+                if (r.sid && !(staleRows & (1ull << slot[j]))) evicted++;
                 bzero(&r, sizeof r);
                 r.sid = e[j].surfaceID;
             }
@@ -194,6 +194,22 @@ extern "C" void nmx_fence_table_set(int on)
     nmx_fence_table_on = on;
     bzero(gFt, sizeof gFt);
     if (l) IOSimpleLockUnlock(l);
+}
+/* a refused call: drop the rows of its surfaces (whoever wrote them), so none can shadow the property values the caller
+ * writes for them instead; the caller's other rows stay valid */
+static void nmxFtClearSurfaces(const nmx_fence_entry_v1 *e, uint32_t n)
+{
+    IOSimpleLock *l = gFtLock;
+    if (!l) return;
+    uint32_t cleared = 0;
+    IOSimpleLockLock(l);
+    for (int i = 0; i < NMX_FT_ROWS; i++) {
+        if (!gFt[i].sid) continue;
+        for (uint32_t j = 0; j < n; j++)
+            if (gFt[i].sid == e[j].surfaceID) { bzero(&gFt[i], sizeof gFt[i]); cleared++; break; }
+    }
+    IOSimpleLockUnlock(l);
+    if (cleared) OSAddAtomic64(cleared, &nmx_fence_table_cleared);
 }
 static void nmxFtClearOwner(const void *owner)
 {
@@ -398,6 +414,8 @@ private:
         /* only WindowServer may write fence rows (any other process could make WindowServer's frames wait or flip
          * early); gate 2 lets any process call, for own-process tests only */
         if (nmx_fence_table_on != 2 && !fFenceWs) { OSAddAtomic64(1, &nmx_fence_table_denied); return kIOReturnNotPrivileged; }
+        /* the connection's own task only (fFenceWs was decided for it; a port handed to another task must not inherit it) */
+        if (current_task() != fTask) { OSAddAtomic64(1, &nmx_fence_table_denied); return kIOReturnNotPrivileged; }
         OSAddAtomic64(1, &nmx_fence_table_calls);
         const uint32_t sz = a->structureInputSize;
         if (a->scalarInputCount || a->scalarOutputCount || a->structureOutputSize || a->structureInputDescriptor ||
@@ -412,11 +430,12 @@ private:
         for (uint32_t j = 0; j < c.n; j++)
             if (!c.e[j].surfaceID || !nmxFtFlagsOk(c.e[j].flags)) { OSAddAtomic64(1, &nmx_fence_table_bad); return kIOReturnBadArgument; }
         if (!nmxFtApply(c.e, c.n, this)) {
-            /* Every row in flight. The caller goes back to IOSurface properties for the rest of its life, so its rows are
-             * dropped now: a row left behind would shadow the newer property values it writes from here on. */
-            nmxFtClearOwner(this);
+            /* Every row in flight. The caller writes these marks to IOSurface properties instead, so the rows of this
+             * call's surfaces are dropped: one left behind would shadow those property values. The caller's other rows
+             * stay (they are still the newest values for their surfaces). */
+            nmxFtClearSurfaces(c.e, c.n);
             const SInt64 k = OSAddAtomic64(1, &nmx_fence_table_refused);
-            if (k < 4) NMX_DRM_LOG("pid %d: fence table full (%d rows in flight), call refused, its rows dropped", proc_selfpid(), NMX_FT_ROWS);
+            if (k < 4) NMX_DRM_LOG("pid %d: fence table full (%d rows in flight), call refused, the rows of its surfaces dropped", proc_selfpid(), NMX_FT_ROWS);
             return kIOReturnNoSpace;
         }
         OSAddAtomic64((SInt64)c.n, &nmx_fence_table_entries);

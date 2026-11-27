@@ -71,9 +71,38 @@ int main(){
     { nmx_fence_entry_v1 p[]={E(1000,NMX_FENCE_F_PENDING,9)}; CHECK(nmxFtApply(p,1,&B)); }   // 1000 in flight again
     { nmx_fence_entry_v1 x[]={E(3000,NMX_FENCE_F_PENDING,1)}; CHECK(!nmxFtApply(x,1,&B)); }  // all in flight, fresh
     gNow += 2000000001ull;
-    int64_t s0=nmx_fence_table_stale;
+    int64_t s0=nmx_fence_table_stale, v0=nmx_fence_table_evicted;
     { nmx_fence_entry_v1 x[]={E(3000,NMX_FENCE_F_PENDING,1)}; CHECK(nmxFtApply(x,1,&B)); }
     CHECK(nmx_fence_table_stale-s0==1); CHECK(G(3000,kNmxFkPending)==1);
+    CHECK(nmx_fence_table_evicted==v0);                 // review 2026-11-27: a stale reuse is not also counted as evicted
+    nmx_fence_table_set(0); nmx_fence_table_set(1);
+  }
+  // review 2026-11-28 (A2b): a refused call drops only the rows of its own surfaces; the client's others stay
+  {
+    nmx_fence_table_set(1);
+    for(uint32_t i=0;i<64;i++){ nmx_fence_entry_v1 e[]={E(5000+i,NMX_FENCE_F_PENDING,1)}; CHECK(nmxFtApply(e,1,&B)); }
+    nmx_fence_entry_v1 r[]={E(5000,NMX_FENCE_F_PENDING,2), E(5001,NMX_FENCE_F_DONE,1), E(6000,NMX_FENCE_F_PENDING,1)};
+    CHECK(!nmxFtApply(r,3,&B));                         // 6000 has no row and all 64 are in flight
+    int64_t c0=nmx_fence_table_cleared;
+    nmxFtClearSurfaces(r,3);
+    CHECK(nmx_fence_table_cleared-c0==2);               // 5000 and 5001 (6000 had none)
+    G(5000,kNmxFkPending,&hit); CHECK(!hit); G(5001,kNmxFkPending,&hit); CHECK(!hit);
+    CHECK(G(5002,kNmxFkPending)==1); CHECK(G(5063,kNmxFkPending)==1);   // the other 62 rows are untouched
+    nmx_fence_table_set(0); nmx_fence_table_set(1);
+  }
+  // review 2026-11-27: the same NEW surface twice in one call takes one row and gets both entries
+  {
+    nmx_fence_table_set(1);
+    nmx_fence_entry_v1 e[]={E(7000,NMX_FENCE_F_PENDING,4,40), E(7000,NMX_FENCE_F_SUBMITTED,4), E(7001,NMX_FENCE_F_PENDING,5)};
+    CHECK(nmxFtApply(e,3,&A));
+    CHECK(G(7000,kNmxFkPending)==4 && G(7000,kNmxFkPendingT)==40 && G(7000,kNmxFkSubmitted)==4); CHECK(G(7001,kNmxFkPending)==5);
+    int rows=0; for(int i=0;i<NMX_FT_ROWS;i++) if(gFt[i].sid) rows++;
+    CHECK(rows==2);
+    // and with the table one row short: [new X, new X] fits in the last free row
+    nmx_fence_table_set(1);
+    for(uint32_t i=0;i<63;i++){ nmx_fence_entry_v1 f[]={E(8000+i,NMX_FENCE_F_PENDING,1)}; CHECK(nmxFtApply(f,1,&B)); }
+    nmx_fence_entry_v1 x[]={E(9000,NMX_FENCE_F_PENDING,6), E(9000,NMX_FENCE_F_SUBMITTED,6)};
+    CHECK(nmxFtApply(x,2,&B)); CHECK(G(9000,kNmxFkSubmitted)==6);
     nmx_fence_table_set(0); nmx_fence_table_set(1);
   }
   CHECK(nmxFtFlagsOk(1)&&nmxFtFlagsOk(3)&&nmxFtFlagsOk(2)&&nmxFtFlagsOk(4)); CHECK(!nmxFtFlagsOk(0)&&!nmxFtFlagsOk(5)&&!nmxFtFlagsOk(6)&&!nmxFtFlagsOk(7)&&!nmxFtFlagsOk(8));

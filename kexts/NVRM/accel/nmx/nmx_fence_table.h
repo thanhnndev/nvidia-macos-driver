@@ -12,9 +12,10 @@
  * when the connection is opened, other callers get kIOReturnNotPrivileged; 2 = any process, own-process tests only).
  * While it is 0 the selector answers kIOReturnUnsupported and
  * nmxSurfValue never looks here, so behaviour is exactly the property path. The plugin side is NVMTL_NMX_FENCE_CALL
- * (default off); it falls back to properties for the rest of the process on Unsupported and on a refused call
- * (kIOReturnNoSpace: every row in flight). A refused call writes nothing and drops every row of that client, so no
- * row can shadow the property values the process writes from then on. Any write of the gate clears the whole table
+ * (default off; plugin 62d862c8+): on a failed call that publish goes to properties and calls pause until the plugin's
+ * next gate read (once a second); on any failure but kIOReturnNoSpace (every row in flight) it also closes the
+ * connection, which drops all of its rows. A refused call writes nothing and drops the rows of its surfaces, so no
+ * row can shadow the property values the process writes for them instead. Any write of the gate clears the whole table
  * (a process that fell back while it was 0 must not be shadowed by its old rows when it is turned on again).
  *
  * ABI (struct input of selector 3, no scalars, no output), version 1:
