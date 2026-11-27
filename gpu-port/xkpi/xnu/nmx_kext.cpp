@@ -353,6 +353,12 @@ NMX_CNT(nmx_cur_accepted, gNmxCurAccepted, "hw cursor: setCursorImage calls take
 NMX_CNT(nmx_cur_sw_fallback, gNmxCurSwFallback, "hw cursor: setCursorImage refusals (the descriptor probe at open; anything more is a bug)");
 NMX_CNT(nmx_cur_kept_last, gNmxCurKeptLast, "hw cursor: images not converted after an accepted one (last image kept, answered yes)");
 NMX_CNT(nmx_cur_copy_retry, gNmxCurCopyRetry, "hw cursor: image copies retried because a new image was being written");
+/* hardware colour stages (2026-11-25, nmx_fb_bridge.c): CRTC DEGAMMA_LUT / CTM / GAMMA_LUT, staged by NMXAccel (nmxhwcolor=1) */
+NMX_CNT(nmx_color_staged, gNmxColorStaged, "hw colour: colour states staged (degamma / CTM / gamma)");
+NMX_CNT(nmx_color_flip, gNmxColorFlip, "hw colour: flips that changed the CRTC colour state");
+NMX_CNT(nmx_color_alone, gNmxColorAlone, "hw colour: colour-only commits (transactions with no plane)");
+NMX_CNT(nmx_color_errors, gNmxColorErrors, "hw colour: failed stagings / colour commits");
+NMX_CNT(nmx_color_rejected, gNmxColorRejected, "hw colour: colour states DM refused (the flip went up without them; the last accepted state stays)");
 extern "C" int nmx_gtt_format(char *buf, size_t size);
 static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -562,6 +568,11 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_cur_sw_fallback,
     &sysctl__debug_nmx_cur_kept_last,
     &sysctl__debug_nmx_cur_copy_retry,
+    &sysctl__debug_nmx_color_staged,
+    &sysctl__debug_nmx_color_flip,
+    &sysctl__debug_nmx_color_alone,
+    &sysctl__debug_nmx_color_errors,
+    &sysctl__debug_nmx_color_rejected,
     &sysctl__debug_nmx_gtt,
     &sysctl__debug_nmx_gpu_metrics,
     &sysctl__debug_nmx_pp_features,

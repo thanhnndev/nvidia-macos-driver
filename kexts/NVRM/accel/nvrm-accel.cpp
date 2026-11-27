@@ -1106,11 +1106,26 @@ public:
     unsigned int        getSurfaceID() const;
     OSObject           *copyValue(const char *key, unsigned int *err) const;   // IOSurfaceSetValue's store (kernel side)
 };
+// IOAcceleratorFamily2's gamma table object (IOAccelDisplayPipeGammaTable2): count entries of {r, g, b} floats
+class IOAccelDisplayPipeGammaTable2 {
+public:
+    unsigned int getTableCount() const;
+    void         getTableEntry(unsigned int, float *, float *, float *) const;   // only stores the bits: no FPU use
+};
+// returned by value (sret): getPipeColorMatrix copies 12 floats (0x30 bytes), getPipeColorMatrixArgs 3 x u64
+struct IOAccelDisplayPipeColorMatrix     { unsigned int k[12]; };
+struct IOAccelDisplayPipeColorMatrixArgs { unsigned long long type, format, configurationID; };
 class IOAccelDisplayPipeTransaction2 {
 public:
     IOSurface *getPlaneIOSurface(unsigned int, unsigned int) const;
     OSObject  *getPlaneResource(unsigned int, unsigned int) const;
+    IOAccelDisplayPipeGammaTable2 *getPipePreGammaTable() const;     // IOPresentment: plane linearization, table types
+    IOAccelDisplayPipeGammaTable2 *getPipePostGammaTable() const;    // IOPresentment: pipe gamma, table types
+    IOAccelDisplayPipeColorMatrix      getPipeColorMatrix() const;
+    IOAccelDisplayPipeColorMatrixArgs  getPipeColorMatrixArgs() const;
 };
+static_assert(sizeof(IOAccelDisplayPipeColorMatrix) == 0x30 && sizeof(IOAccelDisplayPipeColorMatrixArgs) == 0x18,
+              "IOAcceleratorFamily2 25G332: getPipeColorMatrix copies 0x30 bytes, getPipeColorMatrixArgs 0x18");
 
 
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
@@ -1130,8 +1145,14 @@ void NVDisplayPipe::iopDropSources()
     }
 }
 
+#ifdef NMX_ACCEL
+static void nmxColorDropPipe(const void *pipe);
+#endif
 void NVDisplayPipe::free()
 {
+#ifdef NMX_ACCEL
+    nmxColorDropPipe(this);     // the colour state's table references (hardware colour stages)
+#endif
     iopDropSources();
     IOAccelLegacyDisplayPipe::free();
 }
@@ -2281,6 +2302,366 @@ capsDone:
     return false;
 }
 #endif
+#ifdef NMX_ACCEL
+/*
+ * Hardware colour stages (2026-11-25, boot-arg nmxhwcolor=1, default off). With it NMXAGDC advertises pipe CSC,
+ * gamma and linearization (kexts/NMXAGDC/nmx-agdc-color.h), CoreDisplay then sends its colour stages in the display
+ * pipe transaction instead of running them in its GPUPass shader, and IOAcceleratorFamily2 hands them over here:
+ *   getPipePreGammaTable   = linearization (DCN degamma)      getPipeColorMatrix(Args) = CSC (DCN CTM)
+ *   getPipePostGammaTable  = gamma (DCN regamma)
+ * Every transaction carries the pipe's whole colour state: IOAccelDisplayPipeTransaction2::set_transaction_args
+ * (25G332) copies the pipe's current table object / matrix into a transaction that does not set them (dirty bits
+ * 0x20 pre-gamma, 0x80 post-gamma, 0x40 matrix), and a set with no table stores NULL. So NULL / an all-zero matrix =
+ * that stage is off (bypass), and an unchanged table is the same retained object: compared by identity (we keep a
+ * reference, so the address cannot be reused), nothing is read per frame. A changed stage is converted
+ * (nmx_fb_color.h: floats decoded without the FPU, resampled to 4096 entries) and the whole state is staged in NMXGPU
+ * (nmxFlipColor); the next flip carries it, a transaction without a plane commits it alone, and after every present
+ * a sync (NMX_COLOR_SYNC) commits it if no flip did (same surface, CPU copy path, busy drop) and reports a state DM
+ * refused. Any failure forgets what was staged, so the next transaction stages the whole state again.
+ * Read-out: debug.nmxaccel_color_*; the flip census (shader f1c2052c) shows whether GPUPass still runs.
+ */
+#include "../../../gpu-port/xkpi/bsdcompat/include/nmx_fb_color.h"
+static int gNmxHwColor = -1;
+static SInt64 gColTxn, gColDeg, gColCtm, gColGam, gColSame, gColErr, gColStaged, gColAlone, gColSync, gColRejected,
+              gColRefused, gColClamped, gColCtmPad;
+static int gColLastRc, gColDegN, gColGamN, gColTableMax;
+static char gColCtmRaw[256] = "none";
+static struct nmx_color_lut *gColDegLut, *gColGamLut;
+static unsigned long long gColCtmOut[9];
+static OSObject *gColPreObj, *gColPostObj;      // retained: the table objects of the state last staged
+static unsigned gColPreRefused, gColPostRefused; // that object was refused (staged as bypass, not read again)
+static unsigned gColM[12];                       // the matrix words last staged (all 0 = no CTM)
+static bool gColKnown;                           // a state was staged and nothing failed since
+static bool gColPending;                         // staged with a flip still to carry it: sync after the present
+static unsigned long long gColHash[2];           // content of the tables last converted (pre, post)
+static const OSSymbol *gColSym;
+static unsigned gColFlags;                       // NMX_COLOR_* of the wanted state
+static bool gColDirty;                           // the wanted state is converted but not staged in NMXGPU yet
+static bool gColNoSync;                          // NMXGPU without NMX_COLOR_SYNC: colour reaches the screen with flips only
+static unsigned gColStageFails, gColSyncFails;  // consecutive staging / sync failures (separate counts)
+static unsigned gColRefusals;                    // DM refusals this boot
+static unsigned gColSkip;                        // NOTREADY: staging attempts to skip before the next retry
+static IOLock *gColLock;                         // every gCol* state below and above, and the NMXGPU colour calls
+static const void *gColPipe;                     // the display pipe whose transactions carry the colour state
+enum { kColMaxFails = 16, kColMaxRefusals = 4, kColNotReadySkip = 8 };
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_hwcolor, CTLFLAG_RD | CTLFLAG_LOCKED, &gNmxHwColor, 0, "boot-arg nmxhwcolor (1 = colour stages to DCN; 2 = turned off at run time, see the log; -1 = no transaction yet)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_txn, CTLFLAG_RD | CTLFLAG_LOCKED, &gColTxn, "transactions whose colour state changed");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_degamma, CTLFLAG_RD | CTLFLAG_LOCKED, &gColDeg, "linearization (pre-gamma) changes (new table or off)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_ctm, CTLFLAG_RD | CTLFLAG_LOCKED, &gColCtm, "colour matrix changes (new matrix or off)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_gamma, CTLFLAG_RD | CTLFLAG_LOCKED, &gColGam, "gamma (post-gamma) changes (new table or off)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_same, CTLFLAG_RD | CTLFLAG_LOCKED, &gColSame, "new table objects with the content already staged");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_staged, CTLFLAG_RD | CTLFLAG_LOCKED, &gColStaged, "nmxFlipColor stagings that succeeded");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_alone, CTLFLAG_RD | CTLFLAG_LOCKED, &gColAlone, "colour-only commits (transaction without a plane)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_sync, CTLFLAG_RD | CTLFLAG_LOCKED, &gColSync, "states confirmed on screen by the sync after a present");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_rejected, CTLFLAG_RD | CTLFLAG_LOCKED, &gColRejected, "states DM refused (the screen keeps the last accepted one): GPUPass is not running them");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &gColRefused, "tables refused here (size outside 2..65536 or no memory): that stage staged as off");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_clamped, CTLFLAG_RD | CTLFLAG_LOCKED, &gColClamped, "table entries outside 0..1 (clamped: EDR above 1 would clip)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_ctm_pad, CTLFLAG_RD | CTLFLAG_LOCKED, &gColCtmPad, "matrices with a non-zero 4th word (k3, k7, k11: dropped)");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &gColErr, "nmxFlipColor failures (state forgotten, staged again next transaction)");
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_color_last_rc, CTLFLAG_RD | CTLFLAG_LOCKED, &gColLastRc, 0, "last nmxFlipColor IOReturn");
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_color_degamma_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gColDegN, 0, "entries in the last linearization table (0 = off)");
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_color_gamma_n, CTLFLAG_RD | CTLFLAG_LOCKED, &gColGamN, 0, "entries in the last gamma table (0 = off)");
+SYSCTL_INT (_debug, OID_AUTO, nmxaccel_color_table_max_raw, CTLFLAG_RD | CTLFLAG_LOCKED, &gColTableMax, 0, "largest table entry seen, as float bits (0x3f800000 = 1.0)");
+SYSCTL_STRING(_debug, OID_AUTO, nmxaccel_color_ctm_raw, CTLFLAG_RD | CTLFLAG_LOCKED, gColCtmRaw, sizeof gColCtmRaw,
+              "last colour matrix: 12 float words (3 groups of 4), type format configID, row sums x1000 as used (k0+k4+k8) / transposed (k0+k1+k2)");
+
+static unsigned long long nmxColorFnv(unsigned long long h, unsigned int w)
+{
+    for (int i = 0; i < 4; i++) { h ^= (w >> (8 * i)) & 0xff; h *= 0x100000001b3ull; }
+    return h;
+}
+
+/*
+ * one table object that changed -> a 4096-entry DRM LUT. 0 = converted, 1 = same content as the table last converted
+ * for this stage (nothing written), -1 = refused (size, memory). Runs only when the object changed.
+ */
+static int nmxColorTable(const IOAccelDisplayPipeGammaTable2 *t, struct nmx_color_lut *out, unsigned long long *hash, int *nOut)
+{
+    const unsigned n = t->getTableCount();
+    *nOut = (int)n;
+    if (n < 2 || n > 65536) return -1;
+    const vm_size_t bytes = (vm_size_t)n * 3 * sizeof(uint32_t);
+    uint32_t *buf = (uint32_t *)IOMallocData(bytes);
+    if (!buf) return -1;
+    uint32_t *r = buf, *g = buf + n, *b = buf + 2 * n;
+    unsigned long long h = 0xcbf29ce484222325ull ^ n;
+    unsigned clamped = 0, mx = 0;
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t e[3];
+        t->getTableEntry(i, (float *)&e[0], (float *)&e[1], (float *)&e[2]);
+        for (int c = 0; c < 3; c++) {
+            h = nmxColorFnv(h, e[c]);
+            const bool neg = (e[c] >> 31) && (e[c] & 0x7fffffffu);
+            if (neg || e[c] > 0x3f800000u) clamped++;
+            if (!(e[c] >> 31) && e[c] > mx) mx = e[c];
+        }
+        r[i] = nmx_color_f32_unorm(e[0], 24); g[i] = nmx_color_f32_unorm(e[1], 24); b[i] = nmx_color_f32_unorm(e[2], 24);
+    }
+    if ((int)mx > gColTableMax) gColTableMax = (int)mx;
+    if (clamped) {
+        OSAddAtomic64(clamped, &gColClamped);
+        static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: table of %u entries has %u values outside 0..1 (largest %#x): clamped", n, clamped, mx); }
+    }
+    int rc = 1;
+    if (h != *hash) {
+        rc = nmx_color_lut_build(r, g, b, n, 24, out) ? -1 : 0;
+        *hash = rc ? 0 : h;
+    }
+    IOFreeData(buf, bytes);
+    return rc;
+}
+
+static void nmxColorForget(void)
+{
+    if (gColPreObj) { gColPreObj->release(); gColPreObj = nullptr; }
+    if (gColPostObj) { gColPostObj->release(); gColPostObj = nullptr; }
+    gColPreRefused = gColPostRefused = 0;
+    gColHash[0] = gColHash[1] = 0;
+    gColKnown = gColPending = gColDirty = false;
+}
+
+static IOReturn nmxColorCall(IOService *fb, struct NMXColorRequest *req)
+{
+    if (!gColSym) {
+        const OSSymbol *sym = OSSymbol::withCString(NMX_FLIP_FN_COLOR);
+        if (sym && !OSCompareAndSwapPtr(nullptr, (void *)sym, (void *volatile *)&gColSym)) sym->release();
+        if (!gColSym) return kIOReturnNoMemory;
+    }
+    const IOReturn r = fb->callPlatformFunction(gColSym, false, req, nullptr, nullptr, nullptr);
+    gColLastRc = (int)r;
+    return r;
+}
+
+static long long nmxColorClampFix(long long v) { const long long l = 1ll << 40; return v > l ? l : v < -l ? -l : v; }
+static int nmxColorMilli(const unsigned *k, int a, int b, int c)
+{
+    // each term clamped to +-2^24 (in 16.16): the debug string never overflows
+    const long long s = nmxColorClampFix(nmx_color_f32_to_fix(k[a], 16)) + nmxColorClampFix(nmx_color_f32_to_fix(k[b], 16)) +
+                        nmxColorClampFix(nmx_color_f32_to_fix(k[c], 16));
+    const long long v = s * 1000 / 65536;                    // |s| <= 3 * 2^40: no overflow here
+    return v > 999999999 ? 999999999 : v < -999999999 ? -999999999 : (int)v;
+}
+
+static void nmxColorStage(IOService *fb, bool noPlane);
+
+static IOReturn nmxColorBypass(IOService *fb, int *err)
+{
+    struct NMXColorRequest req = {};
+    req.version = 1;
+    req.flags = NMX_COLOR_COMMIT;                            // no stage = bypass (all off), committed now
+    const IOReturn r = nmxColorCall(fb, &req);
+    if (err) *err = req.err;
+    return r;
+}
+
+/* hardware colour off for the rest of the boot: CoreDisplay keeps its stages off the GPU (the AGDC answers stay), so
+ * the screen shows them untransformed: loud in the log and in debug.nmxaccel_hwcolor (2 = turned off). The panel is
+ * put to bypass first (best effort, not counted), so no last DCN state (a Night Shift tint) stays for the boot. */
+static void nmxColorOff(IOService *fb, const char *why, bool bypass = true)
+{
+    if (bypass && fb) {
+        int err = 0;
+        const IOReturn r = nmxColorBypass(fb, &err);
+        if (r != kIOReturnSuccess) ALOG("iop: colour: bypass before turning off -> %#x (errno %d)", r, err);
+    }
+    gNmxHwColor = 2;
+    gColPending = gColDirty = false;
+    ALOG("iop: colour: HARDWARE COLOUR TURNED OFF for this boot: %s (colour stages now not applied at all)", why);
+}
+
+/* DM refused a colour state: put the panel to bypass (all stages off) rather than keep the last accepted state
+ * (which CoreDisplay no longer matches), count it, and after kColMaxRefusals turn hardware colour off */
+static void nmxColorRefused(IOService *fb, const char *what)
+{
+    OSAddAtomic64(1, &gColRejected);
+    gColRefusals++;
+    ALOG("iop: colour: DM REFUSED the %s (degamma %d ctm %d gamma %d), refusal %u: panel colour set to bypass", what,
+         gColDegN, !!(gColFlags & NMX_COLOR_CTM), gColGamN, gColRefusals);
+    int err = 0;
+    const IOReturn r = nmxColorBypass(fb, &err);
+    if (r != kIOReturnSuccess) {
+        // NMXGPU never marks bypass refused, so this is a plain failure: nothing better to put up
+        ALOG("iop: colour: bypass commit -> %#x (errno %d)", r, err);
+        nmxColorOff(fb, "the bypass after a refusal failed", false);
+        return;
+    }
+    if (gColRefusals >= kColMaxRefusals) nmxColorOff(fb, "DM refused colour states repeatedly", false);   // already bypass
+}
+
+/* the pipe goes away: drop the table references */
+static void nmxColorDropPipe(const void *pipe)
+{
+    IOLock *l = gColLock;
+    if (!l) return;                                          // no colour state was ever kept
+    IOLockLock(l);
+    if (pipe == gColPipe) { nmxColorForget(); gColPipe = nullptr; }
+    IOLockUnlock(l);
+}
+
+static void nmxColorTxnLocked(const void *pipe, IOService *fb, IOAccelDisplayPipeTransaction2 *txn, bool noPlane);
+/*
+ * stage (head 0) when the transaction's colour state differs from the one last staged. One IOLock covers all colour
+ * state: NVDisplayPipe::free (nmxColorDropPipe) runs on whatever thread drops the last reference, which IOAF2 does
+ * not order against performTransaction on a new pipe (a WindowServer restart).
+ */
+static void nmxColorTxn(const void *pipe, IOService *fb, IOAccelDisplayPipeTransaction2 *txn, bool noPlane)
+{
+    if (gNmxHwColor < 0) { int v = 0; if (!PE_parse_boot_argn("nmxhwcolor", &v, sizeof v)) v = 0; gNmxHwColor = v == 1; }
+    if (gNmxHwColor != 1 || !fb) return;
+    if (!gColLock) {
+        IOLock *l = IOLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, (void *)l, (void *volatile *)&gColLock)) IOLockFree(l);
+        if (!gColLock) return;
+    }
+    IOLockLock(gColLock);
+    if (gNmxHwColor == 1) nmxColorTxnLocked(pipe, fb, txn, noPlane);
+    IOLockUnlock(gColLock);
+}
+
+static void nmxColorTxnLocked(const void *pipe, IOService *fb, IOAccelDisplayPipeTransaction2 *txn, bool noPlane)
+{
+    gColPipe = pipe;
+    IOAccelDisplayPipeGammaTable2 *pre = txn->getPipePreGammaTable(), *post = txn->getPipePostGammaTable();
+    OSObject *preO = reinterpret_cast<OSObject *>(pre), *postO = reinterpret_cast<OSObject *>(post);
+    const IOAccelDisplayPipeColorMatrix m = txn->getPipeColorMatrix();
+    const IOAccelDisplayPipeColorMatrixArgs ma = txn->getPipeColorMatrixArgs();
+    bool hasM = false;
+    for (int i = 0; i < 12 && !hasM; i++) hasM = m.k[i] != 0;
+    const bool preChg = !gColKnown || preO != gColPreObj, postChg = !gColKnown || postO != gColPostObj;
+    const bool mChg = !gColKnown || __builtin_memcmp(m.k, gColM, sizeof gColM) != 0;
+    if (!preChg && !postChg && !mChg) { nmxColorStage(fb, noPlane); return; }   // unchanged; staged unless NOTREADY before
+    OSAddAtomic64(1, &gColTxn);
+    if (!gColDegLut) {
+        struct nmx_color_lut *d = (struct nmx_color_lut *)IOMallocZeroData(2 * NMX_COLOR_LUT_ENTRIES * sizeof *d);
+        if (!d) { OSAddAtomic64(1, &gColErr); return; }
+        gColDegLut = d; gColGamLut = d + NMX_COLOR_LUT_ENTRIES;
+    }
+    bool need = !gColKnown;
+    unsigned flags = 0, preRef = gColPreRefused, postRef = gColPostRefused;
+    int n, rc;
+    // linearization: NULL = off; a refused table is staged as off (loud, counted) and not read again until it changes
+    if (preChg) {
+        preRef = 0;
+        if (!pre) { gColDegN = 0; gColHash[0] = 0; need = true; OSAddAtomic64(1, &gColDeg); }
+        else if ((rc = nmxColorTable(pre, gColDegLut, &gColHash[0], &n)) < 0) {
+            preRef = 1; gColDegN = n; need = true; OSAddAtomic64(1, &gColRefused);
+            ALOG("iop: colour: linearization table of %d entries refused: staged as off", n);
+        } else { gColDegN = n; if (rc) OSAddAtomic64(1, &gColSame); else { need = true; OSAddAtomic64(1, &gColDeg); } }
+    }
+    if (pre && !preRef) flags |= NMX_COLOR_DEGAMMA;
+    if (postChg) {
+        postRef = 0;
+        if (!post) { gColGamN = 0; gColHash[1] = 0; need = true; OSAddAtomic64(1, &gColGam); }
+        else if ((rc = nmxColorTable(post, gColGamLut, &gColHash[1], &n)) < 0) {
+            postRef = 1; gColGamN = n; need = true; OSAddAtomic64(1, &gColRefused);
+            ALOG("iop: colour: gamma table of %d entries refused: staged as off", n);
+        } else { gColGamN = n; if (rc) OSAddAtomic64(1, &gColSame); else { need = true; OSAddAtomic64(1, &gColGam); } }
+    }
+    if (post && !postRef) flags |= NMX_COLOR_GAMMA;
+    if (mChg) {
+        need = true;
+        OSAddAtomic64(1, &gColCtm);
+        if (hasM) {
+            if (m.k[3] || m.k[7] || m.k[11]) {
+                OSAddAtomic64(1, &gColCtmPad);
+                static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: matrix 4th words %08x %08x %08x not zero: dropped", m.k[3], m.k[7], m.k[11]); }
+            }
+            nmx_color_ctm_from_iop(m.k, gColCtmOut);
+        }
+        snprintf(gColCtmRaw, sizeof gColCtmRaw,
+                 "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x | %llx %llx %llx | rows %d %d %d / transposed %d %d %d",
+                 m.k[0], m.k[1], m.k[2], m.k[3], m.k[4], m.k[5], m.k[6], m.k[7], m.k[8], m.k[9], m.k[10], m.k[11],
+                 ma.type, ma.format, ma.configurationID,
+                 nmxColorMilli(m.k, 0, 4, 8), nmxColorMilli(m.k, 1, 5, 9), nmxColorMilli(m.k, 2, 6, 10),
+                 nmxColorMilli(m.k, 0, 1, 2), nmxColorMilli(m.k, 4, 5, 6), nmxColorMilli(m.k, 8, 9, 10));
+    }
+    if (hasM) flags |= NMX_COLOR_CTM;
+    // the transaction's state is now the wanted one (a reference keeps each object's address from being reused)
+    if (preO != gColPreObj) { if (preO) preO->retain(); if (gColPreObj) gColPreObj->release(); gColPreObj = preO; }
+    if (postO != gColPostObj) { if (postO) postO->retain(); if (gColPostObj) gColPostObj->release(); gColPostObj = postO; }
+    gColPreRefused = preRef; gColPostRefused = postRef;
+    __builtin_memcpy(gColM, m.k, sizeof gColM);
+    gColKnown = true;
+    if (need) { gColFlags = flags; gColDirty = true; }
+    nmxColorStage(fb, noPlane);
+}
+
+/*
+ * Stage the wanted state (gColFlags + the converted LUTs / CTM) when it is not staged yet. Never re-reads a table:
+ * NOTREADY or a transient error leaves gColDirty set and the next transaction stages the same buffers again.
+ * A permanent failure (an NMXGPU without nmxFlipColor, repeated errors) turns hardware colour off for the boot.
+ */
+static void nmxColorStage(IOService *fb, bool noPlane)
+{
+    if (!gColDirty || gNmxHwColor != 1) return;
+    if (gColSkip) { gColSkip--; return; }                    // NOTREADY back-off: not every frame
+    struct NMXColorRequest req = {};
+    req.version = 1;
+    req.flags = gColFlags | (noPlane ? NMX_COLOR_COMMIT : 0u);
+    req.degamma = gColDegLut; req.ctm = gColCtmOut; req.gamma = gColGamLut;
+    const IOReturn r = nmxColorCall(fb, &req);
+    if (r == kIOReturnSuccess) {
+        gColDirty = false;
+        gColStageFails = 0;
+        OSAddAtomic64(1, &gColStaged);
+        if (noPlane) OSAddAtomic64(1, &gColAlone);
+        gColPending = !noPlane;
+        static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: staged degamma %d (%d) ctm %d gamma %d (%d)%s",
+            !!(gColFlags & NMX_COLOR_DEGAMMA), gColDegN, !!(gColFlags & NMX_COLOR_CTM), !!(gColFlags & NMX_COLOR_GAMMA), gColGamN,
+            noPlane ? ", committed alone" : ""); }
+        return;
+    }
+    if (noPlane && req.err == EINVAL) { gColDirty = false; nmxColorRefused(fb, "colour-only commit"); return; }
+    if (r == kIOReturnNotReady) { gColSkip = kColNotReadySkip; return; }   // not up / memory: same LUTs, later
+    if (r == kIOReturnUnsupported || r == kIOReturnBadArgument) {
+        nmxColorOff(fb, "NMXGPU has no nmxFlipColor (older than d99b503e)");
+        return;
+    }
+    OSAddAtomic64(1, &gColErr);
+    static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: nmxFlipColor -> %#x (errno %d): staged again next transaction", r, req.err); }
+    if (++gColStageFails >= kColMaxFails) nmxColorOff(fb, "nmxFlipColor keeps failing");
+}
+
+/*
+ * after a present: the staged state reaches the screen even when no flip carried it. Accepted cost (review item 5):
+ * the commit is blocking on this (WindowServer's present) thread and waits for a flip in flight, up to about one frame,
+ * but only for a present that changed the colour state and was not a flip (same surface, CPU copy path, busy drop);
+ * every other present returns at once (NMXGPU: the generation is already applied). A work item would put the colour
+ * change a frame later still, behind the present it belongs to, for a case that comes with colour changes only.
+ */
+static void nmxColorSyncLocked(IOService *fb);
+static void nmxColorSync(IOService *fb)
+{
+    if (!gColPending || !fb || !gColLock) return;            // the common case: nothing waiting, no lock taken
+    IOLockLock(gColLock);
+    nmxColorSyncLocked(fb);
+    IOLockUnlock(gColLock);
+}
+static void nmxColorSyncLocked(IOService *fb)
+{
+    if (!gColPending || gColNoSync || gNmxHwColor != 1) return;
+    struct NMXColorRequest req = {};
+    req.version = 1;
+    req.flags = NMX_COLOR_SYNC;
+    const IOReturn r = nmxColorCall(fb, &req);
+    if (r == kIOReturnSuccess) { gColPending = false; gColSyncFails = 0; OSAddAtomic64(1, &gColSync); return; }
+    if (req.err == EINVAL) { gColPending = false; nmxColorRefused(fb, "colour state"); return; }
+    if (r == kIOReturnNotReady) return;        // not ready / transient: retried after the next present
+    if (r == kIOReturnBadArgument) {           // an NMXGPU that predates the sync flag: never ask again
+        gColNoSync = true; gColPending = false;
+        ALOG("iop: colour: NMXGPU has no colour sync: colour changes reach the screen with the next flip only");
+        return;
+    }
+    // EIO: the commit failed for a reason other than the colour state; it stays staged and the next flip carries it
+    // (no blocking retry on every later non-flip present)
+    gColPending = false;
+    OSAddAtomic64(1, &gColErr);
+    gColSyncFails++;
+    static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: sync -> %#x (errno %d): left to the next flip (%u in a row)", r, req.err, gColSyncFails); }
+}
+struct NMXColorSyncAfter { IOService *fb; ~NMXColorSyncAfter() { nmxColorSync(fb); } };
+#endif
+
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     const SInt64 trace = OSAddAtomic64(1, &gCntIopPerform);
@@ -2295,6 +2676,10 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
+#ifdef NMX_ACCEL
+    if (head == 0) nmxColorTxn(this, fb, txn, !s && !ro);   // nmxhwcolor=1 only: the panel's colour stages (before the flip)
+    NMXColorSyncAfter colSync = { head == 0 ? fb : nullptr };   // on every return below: colour on screen without a flip
+#endif
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
 #ifdef NMX_ACCEL
     (void)nmxFtBegin(s);
@@ -2652,6 +3037,25 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_tripped);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_auto_rearm);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_submitted);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_hwcolor);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_txn);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_degamma);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_ctm);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_gamma);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_same);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_staged);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_alone);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_sync);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_rejected);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_refused);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_clamped);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_ctm_pad);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_table_max_raw);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_errors);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_last_rc);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_degamma_n);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_gamma_n);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_color_ctm_raw);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_latched);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_fallback);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_refused);

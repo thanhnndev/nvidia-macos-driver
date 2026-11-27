@@ -45,6 +45,12 @@ void nmx_fb_cursor_set_kick(void (*fn)(void *), void *arg);
 int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t seq, int32_t x, int32_t y, int visible);
 int nmx_fb_cursor_off(void);
 extern uint64_t gNmxCurCommits, gNmxCurFull, gNmxCurImages, gNmxCurErrors, gNmxCurRearms, gNmxCurOff;
+/* hardware colour stages (nmx_fb_bridge.c, end of file): CRTC DEGAMMA_LUT / CTM / GAMMA_LUT staged for the next flip */
+struct nmx_color_lut;
+int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm, const struct nmx_color_lut *gamma);
+int nmx_fb_color_commit(void);
+extern uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors, gNmxColorRejected;
+
 #ifdef __cplusplus
 }
 #endif
