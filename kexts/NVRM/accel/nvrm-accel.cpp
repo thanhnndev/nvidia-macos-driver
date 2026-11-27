@@ -2343,6 +2343,11 @@ static unsigned gColRefusals;                    // DM refusals this boot
 static unsigned gColSkip;                        // NOTREADY: staging attempts to skip before the next retry
 static IOLock *gColLock;                         // every gCol* state below and above, and the NMXGPU colour calls
 static const void *gColPipe;                     // the display pipe whose transactions carry the colour state
+// a pipe freed while gColLock was held (by a blocking colour commit): handled by the next holder (nmxColorDropDue)
+static const void *volatile gColDropPipe;
+static volatile bool gColDropAll;                // a second pipe was freed before the first was handled: forget anyway
+// gColLock, gColPreObj / gColPostObj and the LUT buffers are never freed: NMXAccel never unloads (no stop/free path
+// for a kext that IOAF2 keeps loaded), so they live for the boot on purpose.
 enum { kColMaxFails = 16, kColMaxRefusals = 4, kColNotReadySkip = 8 };
 SYSCTL_INT (_debug, OID_AUTO, nmxaccel_hwcolor, CTLFLAG_RD | CTLFLAG_LOCKED, &gNmxHwColor, 0, "boot-arg nmxhwcolor (1 = colour stages to DCN; 2 = turned off at run time, see the log; -1 = no transaction yet)");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_color_txn, CTLFLAG_RD | CTLFLAG_LOCKED, &gColTxn, "transactions whose colour state changed");
@@ -2488,14 +2493,31 @@ static void nmxColorRefused(IOService *fb, const char *what)
     if (gColRefusals >= kColMaxRefusals) nmxColorOff(fb, "DM refused colour states repeatedly", false);   // already bypass
 }
 
-/* the pipe goes away: drop the table references */
+/* under gColLock: a pipe freed while the lock was held. Forgetting a live pipe's state only re-stages it. */
+static void nmxColorDropDue(void)
+{
+    if (!gColDropPipe && !gColDropAll) return;
+    const void *p = (const void *)__atomic_exchange_n((const void **)&gColDropPipe, (const void *)nullptr, __ATOMIC_ACQ_REL);
+    const bool all = __atomic_exchange_n((bool *)&gColDropAll, false, __ATOMIC_ACQ_REL);
+    if (all || (p && p == gColPipe)) { nmxColorForget(); gColPipe = nullptr; }
+}
+
+/*
+ * the pipe goes away: drop the table references. Never waits on gColLock: its holder may be in a blocking colour
+ * commit (about a frame; up to DM's flip_done timeout, ~10 s, on a GPU hang), and NVDisplayPipe::free runs on
+ * whatever thread drops the last reference. Busy: leave the pipe for the holder or the next entry (nmxColorDropDue).
+ */
 static void nmxColorDropPipe(const void *pipe)
 {
     IOLock *l = gColLock;
     if (!l) return;                                          // no colour state was ever kept
-    IOLockLock(l);
-    if (pipe == gColPipe) { nmxColorForget(); gColPipe = nullptr; }
-    IOLockUnlock(l);
+    if (IOLockTryLock(l)) {
+        nmxColorDropDue();
+        if (pipe == gColPipe) { nmxColorForget(); gColPipe = nullptr; }
+        IOLockUnlock(l);
+        return;
+    }
+    if (!OSCompareAndSwapPtr(nullptr, (void *)pipe, (void *volatile *)&gColDropPipe)) gColDropAll = true;
 }
 
 static void nmxColorTxnLocked(const void *pipe, IOService *fb, IOAccelDisplayPipeTransaction2 *txn, bool noPlane);
@@ -2514,7 +2536,9 @@ static void nmxColorTxn(const void *pipe, IOService *fb, IOAccelDisplayPipeTrans
         if (!gColLock) return;
     }
     IOLockLock(gColLock);
+    nmxColorDropDue();                                       // before gColPipe is set to this pipe
     if (gNmxHwColor == 1) nmxColorTxnLocked(pipe, fb, txn, noPlane);
+    nmxColorDropDue();                                       // a pipe freed while this held the lock
     IOLockUnlock(gColLock);
 }
 
@@ -2582,7 +2606,7 @@ static void nmxColorTxnLocked(const void *pipe, IOService *fb, IOAccelDisplayPip
     gColPreRefused = preRef; gColPostRefused = postRef;
     __builtin_memcpy(gColM, m.k, sizeof gColM);
     gColKnown = true;
-    if (need) { gColFlags = flags; gColDirty = true; }
+    if (need) { gColFlags = flags; gColDirty = true; gColSkip = 0; }   // a new state: no NOTREADY back-off for it
     nmxColorStage(fb, noPlane);
 }
 
@@ -2634,7 +2658,9 @@ static void nmxColorSync(IOService *fb)
 {
     if (!gColPending || !fb || !gColLock) return;            // the common case: nothing waiting, no lock taken
     IOLockLock(gColLock);
+    nmxColorDropDue();
     nmxColorSyncLocked(fb);
+    nmxColorDropDue();
     IOLockUnlock(gColLock);
 }
 static void nmxColorSyncLocked(IOService *fb)
