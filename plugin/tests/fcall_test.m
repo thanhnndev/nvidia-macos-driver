@@ -5,6 +5,9 @@
 //   FCALL_EXPECT=none    no surface carries NMXFencePending (every mark went through the call)  - SIM=ok
 //   FCALL_EXPECT=resume  surfaces 0-2 carry NMXFencePending (written while the gate read 0), the 20 of phase 2 none
 //                        (calls resumed)                                                       - SIM=gateoff=5:40
+// The runner also checks the plugin log (NVMTL_LOG_PATH) for the pause contract: every pause closes the (simulated)
+// connection, so NMXAccel would drop all of the process's rows: refuse=20 and gateoff=5:40 must log
+// "connection closed", and gateoff=5:40 must log "resumed" with a second open after it.
 // Phase 1: 3 surfaces, FCALL_FRAMES frames (one surface per command buffer); phase 2: one command buffer writing 20
 // surfaces (two calls: 16 + 4).
 //   xcrun clang -fobjc-arc -o fcall_test fcall_test.m -framework Foundation -framework Metal -framework IOSurface -framework IOKit
