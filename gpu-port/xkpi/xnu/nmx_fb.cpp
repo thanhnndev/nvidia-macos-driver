@@ -442,10 +442,13 @@ private:
      * the flag before the load) keeps no cursor window: no cursor until the next image. So once an image was accepted
      * in this WindowServer session, a failed conversion keeps the last accepted image on the plane and answers success
      * (debug.nmx_cur_kept_last): wrong shape at worst, never a lost cursor. The probe cannot be told from a real
-     * failure (testingCursor is IOFramebuffer-private, both return false untouched), but it only runs at postOpen,
-     * or at a connect change when the probe list is empty, which ours never is. A session ends at IOFramebuffer::close,
-     * which sets kIOWindowServerActiveAttribute to kIOWSAA_Unaccelerated (setAttribute below): the next open's probe
-     * then refuses and hides the plane as before.
+     * failure (testingCursor is IOFramebuffer-private, both return false untouched), but it runs once per framebuffer
+     * lifetime: IOFramebuffer::open returns early once `opened` is set and close() never clears it, so postOpen (the
+     * probe) never runs again, and shmem->hardwareCursorActive survives a WindowServer restart (the new WindowServer
+     * takes the hardware path at once). So fCurSession stays set from the first accepted image on, for the lifetime.
+     * At IOFramebuffer::close (logout, WindowServer exit or crash, shutdown: kIOWindowServerActiveAttribute =
+     * kIOWSAA_Unaccelerated, setAttribute below) the plane is hidden (visibility only, the image stays accepted), so
+     * no frozen arrow is left; the next setCursorState(visible) shows it again.
      */
     uint32_t fCurSide = 0;              // hardware cursor buffer side; 0 = no hardware cursor (or tearing down)
     uint32_t *fCurStage[2] = {};        // converted images (straight ARGB, rows of fCurW), written under IOFB's lock
@@ -456,7 +459,7 @@ private:
     volatile uint64_t fCurPos = 0;      // (uint32)x << 32 | (uint32)y: the image's top-left (setCursorState)
     volatile UInt32 fCurVis = 0;        // last setCursorState visibility
     volatile UInt32 fCurRefused = 1;    // the last setCursorImage was refused (the probe at open): plane hidden
-    volatile UInt32 fCurSession = 0;    // an image was accepted since WindowServer opened us: never refuse again
+    volatile UInt32 fCurSession = 0;    // an image was accepted (framebuffer lifetime): never refuse again
     volatile UInt32 fCurArmed = 0;      // fCurWork entered and not yet run
     volatile UInt32 fCurNeedImg = 1;    // upload the image on the next commit (first one, re-arm after a bridge commit)
     volatile SInt32 fCurBusy = 0;       // callers inside the cursor code (teardown waits them out)
@@ -568,7 +571,13 @@ private:
         uint32_t side = 0;
         int e;
         { NmxEntry entry; e = entry.err ? entry.err : nmx_fb_cursor_init(&side); }
-        if (e || !side) { CURLOG("no hardware cursor (bridge %d): software cursor", e); return false; }
+        if (e || !side) {
+            /* logged once, plainly: the framebuffer then has no hardware cursor for its whole lifetime (IOFramebuffer
+             * asks at open only); EAGAIN = the display bridge was not up yet at open */
+            FBLOG("cursor: NO HARDWARE CURSOR for this framebuffer's lifetime: nmx_fb_cursor_init errno %d%s, side %u",
+                  e, e == EAGAIN ? " (EAGAIN: display bridge not ready at open)" : "", side);
+            return false;
+        }
         const size_t bytes = (size_t)side * side * 4;
         fCurStage[0] = (uint32_t *)IOMallocZero(bytes);
         fCurStage[1] = (uint32_t *)IOMallocZero(bytes);
@@ -995,8 +1004,13 @@ public:
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         if (attribute == kIOWindowServerActiveAttribute) {
             trace("setAttribute wsrv", value);
-            /* IOFramebuffer::close (WindowServer gone): the cursor session ends; the next open's probe refuses again */
-            if ((value & kIOWSAA_StateMask) == kIOWSAA_Unaccelerated) __atomic_store_n(&fCurSession, 0u, __ATOMIC_RELEASE);
+            /* IOFramebuffer::close (WindowServer gone) or WindowServer itself going unaccelerated: hide the plane (no
+             * frozen arrow); the image stays accepted and the next setCursorState(visible) brings it back */
+            if ((value & kIOWSAA_StateMask) == kIOWSAA_Unaccelerated && curEnter()) {
+                __atomic_store_n(&fCurVis, 0u, __ATOMIC_RELEASE);
+                curArm(0);
+                curLeave();
+            }
             return kIOReturnSuccess;
         }
         if (attribute == kIOPowerAttribute) {
