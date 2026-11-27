@@ -169,6 +169,18 @@ int main(void)
               "side rounding");
     }
 
+    /* size classes: the smallest of 64 / 128 / 256 that holds the image, never above the buffer side */
+    for (uint32_t side = 64; side <= 256; side <<= 1)
+        for (uint32_t w = 1; w <= 300; w++)
+            for (uint32_t h = 1; h <= 300; h += 7) {
+                const int k = nmx_cur_size_class(w, h, side);
+                const uint32_t m = w > h ? w : h;
+                if (m > side) { CHECK(k == -1, "w %u h %u side %u: class %d, want -1", w, h, side, k); continue; }
+                CHECK(k >= 0 && (64u << k) >= m && (64u << k) <= side && (k == 0 || (32u << k) < m),
+                      "w %u h %u side %u: class %d", w, h, side, k);
+            }
+    CHECK(nmx_cur_size_class(32, 32, 256) == 0 && nmx_cur_size_class(64, 64, 256) == 0 &&
+          nmx_cur_size_class(65, 10, 256) == 1 && nmx_cur_size_class(200, 128, 256) == 2, "size class examples");
     printf("%s: %ld positions, %d failures\n", fails ? "FAIL" : "PASS", cases, fails);
     return fails != 0;
 }
