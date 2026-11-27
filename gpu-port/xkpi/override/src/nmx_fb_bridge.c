@@ -702,9 +702,9 @@ static void flip_refresh(void)
 }
 
 static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *set_ns);
-static uint64_t col_apply(struct drm_crtc_state *cs, bool *changed);     /* hardware colour stages (end of file) */
+static uint64_t col_apply(struct drm_crtc_state *cs, bool *changed, bool *bypass); /* hardware colour stages (end of file) */
 static void col_applied(uint64_t gen);
-static bool col_rejected(uint64_t gen, int e);
+static bool col_rejected(uint64_t gen, bool bypass, int e);
 /* errors that say nothing about the colour state (locks, signals, memory, a busy CRTC): never a refusal */
 static inline bool col_transient(int e)
 {
@@ -723,6 +723,7 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
     bool colchg = false, nocol = false; /* the commit changes the CRTC colour state; retrying without it */
     uint64_t colsus = 0;                /* the generation whose commit failed: refused only if the retry without it works */
     int colsus_e = 0;
+    bool colbyp = false, colsus_byp = false; /* the generation carried / that failed is the bypass (all stages off) */
     int e = -ENOMEM;
 
     if (!nfbp)
@@ -778,12 +779,13 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
             colgen = 0;
             colchg = false;
             if (!nocol)                 /* staged DEGAMMA_LUT / CTM / GAMMA_LUT ride this flip (no-op when unchanged) */
-                colgen = col_apply(cs, &colchg);
+                colgen = col_apply(cs, &colchg, &colbyp);
             e = drm_atomic_nonblocking_commit(state);
             if (e && colchg && !col_transient(e)) {
                 /* the flip with the new colour state failed: try it without. Only if that one goes through was the
                  * colour state the cause: then it is refused (never attached again); else it stays staged. */
                 colsus = colgen;
+                colsus_byp = colbyp;
                 colsus_e = e;
                 nocol = true;
                 drm_atomic_state_clear(state);
@@ -793,7 +795,7 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
                 if (colgen)
                     col_applied(colgen);
                 if (colsus)
-                    col_rejected(colsus, colsus_e);     /* NMXAccel sees it through nmxFlipColor's sync */
+                    col_rejected(colsus, colsus_byp, colsus_e);     /* NMXAccel sees it through nmxFlipColor's sync */
                 commit = cs->commit;    /* locks still held: nothing can swap the CRTC state yet */
                 if (commit)
                     drm_crtc_commit_get(commit);
@@ -2167,6 +2169,11 @@ static struct {
     int lock;                           /* hand-rolled like sf: usable before any init hook */
     uint64_t gen, applied;              /* staged generation; the last one a successful commit carried */
     uint64_t rejected;                  /* the last generation DM refused (never attached again) */
+    uint64_t bypass_failed;             /* a bypass generation whose commit failed: not attached again until the next
+                                         * stage (amdgpu_dm accepts NULL stages, so this is not a refusal of the state;
+                                         * without it every later flip would re-attach it: one failing commit, a retry
+                                         * and a log line per flip) */
+    uint32_t logs;                      /* colour log lines: rate-limited apart from flip.logs */
     int rejected_err;
     struct drm_property_blob *degamma, *ctm, *gamma;
 } col;
@@ -2222,6 +2229,7 @@ int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm,
     od = col.degamma; oc = col.ctm; og = col.gamma;
     col.degamma = nd; col.ctm = nc; col.gamma = ng;
     col.gen++;
+    col.bypass_failed = 0;              /* a new state: worth attaching again */
     col_unlock();
     drm_property_blob_put(od);
     drm_property_blob_put(oc);
@@ -2230,8 +2238,12 @@ int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm,
     return 0;
 }
 
-/* put the staged stages into a CRTC state being built; returns the generation carried, 0 = nothing staged */
-static uint64_t col_apply(struct drm_crtc_state *cs, bool *chg)
+/*
+ * put the staged stages into a CRTC state being built; returns the generation carried, 0 = nothing staged.
+ * *byp = that generation is the bypass (all stages NULL), read under the same lock as the blobs (col_rejected
+ * gets it from here, not from the current col blobs, which a stage may have replaced since).
+ */
+static uint64_t col_apply(struct drm_crtc_state *cs, bool *chg, bool *byp)
 {
     struct drm_property_blob *d, *c, *g;
     uint64_t gen;
@@ -2239,8 +2251,9 @@ static uint64_t col_apply(struct drm_crtc_state *cs, bool *chg)
 
     col_lock();
     gen = col.gen;
-    if (gen && gen == col.rejected)
-        gen = 0;                        /* refused once: the CRTC keeps its last accepted colour state */
+    if (gen && (gen == col.rejected || gen == col.bypass_failed))
+        gen = 0;                        /* refused (or a failed bypass): the CRTC keeps its last accepted state */
+    *byp = !col.degamma && !col.ctm && !col.gamma;
     d = col.degamma ? drm_property_blob_get(col.degamma) : NULL;
     c = col.ctm ? drm_property_blob_get(col.ctm) : NULL;
     g = col.gamma ? drm_property_blob_get(col.gamma) : NULL;
@@ -2261,30 +2274,42 @@ static uint64_t col_apply(struct drm_crtc_state *cs, bool *chg)
     return gen;
 }
 
+/* colour log lines: the first 8, then every 64th (a stuck state must not take flip.logs' whole budget) */
+static bool col_log_ok(void)
+{
+    uint32_t n = __atomic_add_fetch(&col.logs, 1, __ATOMIC_RELAXED);
+
+    return n <= 8 || (n & 63) == 0;
+}
+
 /*
  * a commit that changed the colour state failed and the same commit without it went through (or it changed nothing
- * else). The errno says why (e.g. -EINVAL from atomic check, -ERANGE, a bandwidth limit): logged. The all-stages-off
- * state (bypass) is never marked refused: amdgpu_dm always accepts NULL DEGAMMA_LUT / CTM / GAMMA_LUT, and a refused
- * bypass would leave col_apply nothing to attach (stale state). Returns whether it was marked.
+ * else). The errno says why (e.g. -EINVAL from atomic check, -ERANGE, a bandwidth limit): logged. bypass (from
+ * col_apply: that generation had all stages off) is never marked refused: amdgpu_dm always accepts NULL
+ * DEGAMMA_LUT / CTM / GAMMA_LUT, and a refused bypass would make a later re-stage of the same state look refused.
+ * It is marked bypass_failed instead: not attached again until the next stage. Returns whether it was refused.
  */
-static bool col_rejected(uint64_t gen, int e)
+static bool col_rejected(uint64_t gen, bool bypass, int e)
 {
-    bool bypass;
-
     col_lock();
-    bypass = gen == col.gen && !col.degamma && !col.ctm && !col.gamma;
-    if (!bypass && gen > col.rejected) {
+    if (bypass) {
+        if (gen == col.gen)
+            col.bypass_failed = gen;
+    } else if (gen > col.rejected) {
         col.rejected = gen;
         col.rejected_err = e;
     }
     col_unlock();
     if (bypass) {
-        FLIP_LOG("NMX flip: colour bypass (all stages off) failed (%d): left staged, not marked refused\n", e);
+        if (col_log_ok())
+            printf("NMX flip: colour bypass %llu (all stages off) failed (%d): not attached again until the next stage\n",
+                   (unsigned long long)gen, e);
         return false;
     }
     __atomic_add_fetch(&gNmxColorRejected, 1, __ATOMIC_RELAXED);
-    FLIP_LOG("NMX flip: colour state %llu refused (%d; the commit without it went through): kept the last accepted one\n",
-             (unsigned long long)gen, e);
+    if (col_log_ok())
+        printf("NMX flip: colour state %llu refused (%d; the commit without it went through): kept the last accepted one\n",
+               (unsigned long long)gen, e);
     return true;
 }
 
@@ -2319,11 +2344,15 @@ int nmx_fb_color_commit(void)
         gen = 0;
     else if (gen == col.rejected)
         gen = (uint64_t)-1;
+    else if (gen == col.bypass_failed)
+        gen = (uint64_t)-2;
     col_unlock();
     if (!gen)
         return 0;                       /* a flip already carried it */
     if (gen == (uint64_t)-1)
         return EINVAL;                  /* refused before: not tried again */
+    if (gen == (uint64_t)-2)
+        return EIO;                     /* this bypass failed before: not tried again until the next stage */
     drm_modeset_acquire_init(&ctx, 0);
     state = drm_atomic_state_alloc(flip.nfb->client.dev);
     if (state) {
@@ -2333,15 +2362,15 @@ int nmx_fb_color_commit(void)
             if (IS_ERR(cs)) {
                 e = PTR_ERR(cs);
             } else {
-                bool chg = false;
+                bool chg = false, byp = false;
 
-                gen = col_apply(cs, &chg);
+                gen = col_apply(cs, &chg, &byp);
                 e = drm_atomic_commit(state);
                 if (!e) {
                     col_applied(gen);
                     __atomic_add_fetch(&gNmxColorAlone, 1, __ATOMIC_RELAXED);
                 } else if (chg && !col_transient(e)) {
-                    refused = col_rejected(gen, e);   /* a commit of the colour state alone: it is the cause */
+                    refused = col_rejected(gen, byp, e);   /* a commit of the colour state alone: it is the cause */
                 }
             }
             if (e != -EDEADLK)
