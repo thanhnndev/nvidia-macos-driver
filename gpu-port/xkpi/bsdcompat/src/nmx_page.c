@@ -909,8 +909,8 @@ static struct user_pin *page_take_pin(vm_page_t m, struct user_pin *pin)
         *pp = r->next;
     bool others = m->nmx_pins != NULL;      /* the page is still pinned by another request */
     lck_spin_unlock(l);
-    if (others)
-        NMX_IMP_COUNT(NMX_IMPC_PIN_MULTI, 1);
+    if (NMX_IMP_ON() && others)
+        nmx_imp_count(NMX_IMPC_PIN_MULTI, 1);
     if (r == NULL)
         return NULL;
     struct user_pin *got = r->pin;

@@ -318,7 +318,7 @@
  static int amdgpu_vm_sdma_commit(struct amdgpu_vm_update_params *p,
  				 struct dma_fence **fence)
  {
-@@ -115,11 +122,17 @@
+@@ -115,11 +122,18 @@
  	WARN_ON(ib->length_dw == 0);
  	amdgpu_ring_pad_ib(ring, ib);
  
@@ -331,9 +331,10 @@
 +	NMX_IMP_COUNT(NMX_IMPC_SDMA_DW, ib->length_dw);
  
  	WARN_ON(ib->length_dw > p->num_dw_left);
++	uint32_t itv5dw = ib->length_dw;	/* read before the submit: the job (and its IB) may be freed once it is queued */
 +	NMX_IMP_T0(itv5);
  	f = amdgpu_job_submit(p->job);
-+	NMX_IMP_STAGE(NMX_IMP_V5_SDMA, itv5, ib->length_dw);
++	NMX_IMP_STAGE(NMX_IMP_V5_SDMA, itv5, itv5dw);
  
  	if (p->unlocked) {
  		struct dma_fence *tmp = dma_fence_get(f);
