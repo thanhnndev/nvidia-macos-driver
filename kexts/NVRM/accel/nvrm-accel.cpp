@@ -2686,6 +2686,154 @@ static void nmxColorSyncLocked(IOService *fb)
     static SInt32 logs; if (logs < 8) { OSIncrementAtomic(&logs); ALOG("iop: colour: sync -> %#x (errno %d): left to the next flip (%u in a row)", r, req.err, gColSyncFails); }
 }
 struct NMXColorSyncAfter { IOService *fb; ~NMXColorSyncAfter() { nmxColorSync(fb); } };
+
+/*
+ * Roadmap item 3 (b), measurement only (2026-11-27): how much of the screen does each present say changed?
+ * CoreDisplay hands IOAcceleratorFamily2 a dirty rect per plane with every display-pipe transaction
+ * (IOAccelDisplayPipeTransaction2::getPlaneDirtyRect); nothing in our present path uses it, and nothing here changes
+ * what we present: this only counts, per plane-0 present on head 0, the dirty area against the plane's source rect, so
+ * one boot can compare it with the area WindowServer actually draws (flip census) and tell swap-chain repaint from
+ * real damage.
+ *
+ * Why it does not call the getter: getPlaneDirtyRect / getPlaneSrcRect return their four floats in xmm0/xmm1. xnu
+ * keeps the calling thread's (WindowServer's) SSE registers live inside the kernel (see linux_fpu.c), so a call from
+ * here would clobber two of its registers unless wrapped in an FPU section. Instead, once, on Darwin 25.x only, both
+ * getters' code is checked to be exactly the leaf seen in 25G332 (IOAF2 0x14bb405c / 0x14bb4094):
+ *     push rbp; mov rbp,rsp; mov rax,[rdi+B]; mov ecx,esi; imul rcx,rcx,S; movsd xmm0,[rax+rcx+D]; movsd xmm1,
+ *     [rax+rcx+D+8]; pop rbp; ret
+ * and B (plane array), S (plane stride) and D (rect offset) are taken from those instructions, not assumed. If either
+ * getter is anything else (another 25.x layout, a non-leaf, a different return), the reader stays off for the boot:
+ * nothing is read, nothing counted, one log line. Reading the 16 bytes as integers is then exactly what the getter
+ * reads, without the FPU. Rect = {x, y, w, h} floats (IOPresentment's convention; the sample ring keeps the raw values
+ * so a different convention shows). getTransactionDirtyBits (an integer return, a plain call) is sampled with it.
+ * Read-out: debug.nmxaccel_dirty (one string: state, counts, area histogram, Mpx sums, 16 samples).
+ */
+class IOAccelDisplayPipeTransaction2;
+extern "C" const unsigned char nmx_iop_getPlaneSrcRect[] __asm("__ZNK30IOAccelDisplayPipeTransaction215getPlaneSrcRectEj");
+extern "C" const unsigned char nmx_iop_getPlaneDirtyRect[] __asm("__ZNK30IOAccelDisplayPipeTransaction217getPlaneDirtyRectEj");
+extern "C" unsigned long long nmx_iop_getTransactionDirtyBits(const IOAccelDisplayPipeTransaction2 *)
+    __asm("__ZNK30IOAccelDisplayPipeTransaction223getTransactionDirtyBitsEv");
+struct NMXRectGetter { unsigned base, stride, off; };
+static bool nmxRectGetterParse(const unsigned char *p, NMXRectGetter *g)
+{
+    static const unsigned char pat[28] = { 0x55, 0x48, 0x89, 0xe5, 0x48, 0x8b, 0x47, 0x00, 0x89, 0xf1, 0x48, 0x6b, 0xc9, 0x00,
+                                           0xf2, 0x0f, 0x10, 0x44, 0x08, 0x00, 0xf2, 0x0f, 0x10, 0x4c, 0x08, 0x00, 0x5d, 0xc3 };
+    for (int i = 0; i < 28; i++)
+        if (i != 7 && i != 13 && i != 19 && i != 25 && p[i] != pat[i]) return false;
+    // every disp8 positive (a negative one is never taken as an offset), base 8-aligned, rect inside the stride
+    if (p[7] >= 0x80 || p[7] & 7 || p[13] == 0 || p[13] >= 0x80 || p[19] > 0x77 || p[25] != p[19] + 8) return false;
+    g->base = p[7]; g->stride = p[13]; g->off = p[19];
+    return true;
+}
+static int gDrState = -1;              // -1 not checked yet, 0 off for this boot (not 25.x / getter mismatch), 1 reading
+static NMXRectGetter gDrSrc, gDrDirty;
+enum { NMX_DR_BUCKETS = 8, NMX_DR_RING = 16 };
+static SInt64 gDrN, gDrEmpty, gDrFull, gDrOdd, gDrNoPlanes, gDrHist[NMX_DR_BUCKETS], gDrPx, gDrSrcPx;
+static unsigned long long gDrBitsOr, gDrBitsLast;
+struct NMXDirtySample { unsigned long long seq, bits; unsigned src[4], dirty[4]; };
+static NMXDirtySample gDrRing[NMX_DR_RING];
+static unsigned gDrRingNext;
+static const char *const kDrBucket[NMX_DR_BUCKETS] = { "<1%", "1-5%", "5-10%", "10-25%", "25-50%", "50-75%", "75-99.9%", "full" };
+static bool nmxDirtyReady()
+{
+    if (gDrState >= 0) return gDrState == 1;
+    int st = 0;
+    if (version_major != 25) ALOG("iop: dirty rect: Darwin %d, not 25.x: not read", version_major);
+    else if (!nmxRectGetterParse(nmx_iop_getPlaneSrcRect, &gDrSrc) || !nmxRectGetterParse(nmx_iop_getPlaneDirtyRect, &gDrDirty)
+             || gDrSrc.base != gDrDirty.base || gDrSrc.stride != gDrDirty.stride)
+        ALOG("iop: dirty rect: IOAcceleratorFamily2 getters are not the 25G332 leaf loads: not read (state 0)");
+    else { st = 1; ALOG("iop: dirty rect: plane array +0x%x stride 0x%x src +0x%x dirty +0x%x", gDrSrc.base, gDrSrc.stride, gDrSrc.off, gDrDirty.off); }
+    gDrState = st;
+    return st == 1;
+}
+// fixed point with 4 fractional bits (1/16 px), from a float's bits
+static inline long long nmxDrFix(unsigned bits) { return (long long)nmx_color_f32_to_fix(bits, 4); }
+static void nmxDirtyCount(const IOAccelDisplayPipeTransaction2 *txn)
+{
+    if (!txn || !nmxDirtyReady()) return;
+    const unsigned char *planes = *(const unsigned char *const volatile *)((const unsigned char *)txn + gDrSrc.base);
+    if (!planes) { OSAddAtomic64(1, &gDrNoPlanes); return; }
+    unsigned src[4], dr[4];
+    for (int i = 0; i < 4; i++) {
+        src[i] = *(const volatile unsigned *)(planes + gDrSrc.off + 4 * i);      // plane 0: no stride
+        dr[i]  = *(const volatile unsigned *)(planes + gDrDirty.off + 4 * i);
+    }
+    const unsigned long long bits = nmx_iop_getTransactionDirtyBits(txn);
+    const SInt64 seq = OSAddAtomic64(1, &gDrN) + 1;
+    gDrBitsOr |= bits; gDrBitsLast = bits;
+    if (seq <= NMX_DR_RING || (seq & 63) == 0) {
+        NMXDirtySample &e = gDrRing[gDrRingNext++ % NMX_DR_RING];
+        e.seq = 0;
+        for (int i = 0; i < 4; i++) { e.src[i] = src[i]; e.dirty[i] = dr[i]; }
+        e.bits = bits;
+        __atomic_store_n(&e.seq, (unsigned long long)seq, __ATOMIC_RELEASE);
+    }
+    const long long sx = nmxDrFix(src[0]), sy = nmxDrFix(src[1]), sw = nmxDrFix(src[2]), sh = nmxDrFix(src[3]);
+    const long long dx = nmxDrFix(dr[0]), dy = nmxDrFix(dr[1]), dw = nmxDrFix(dr[2]), dh = nmxDrFix(dr[3]);
+    // 65536 px in 1/16 px: any real rect is far inside it. Every field is bounded first, so a saturated float (+-2^62)
+    // can never overflow the sums and products below: it is counted as odd
+    const long long lim = 1ll << 20;
+    const long long f[8] = { sx, sy, sw, sh, dx, dy, dw, dh };
+    for (int i = 0; i < 8; i++)
+        if (f[i] > lim || f[i] < -lim) { OSAddAtomic64(1, &gDrOdd); return; }
+    if (sw <= 0 || sh <= 0 || dx < sx - 16 || dy < sy - 16 || dw < 0 || dh < 0 ||
+        dx + dw > sx + sw + 16 || dy + dh > sy + sh + 16) { OSAddAtomic64(1, &gDrOdd); return; }
+    const long long sa = sw * sh, da = dw * dh;      // 1/256 px^2
+    OSAddAtomic64(sa >> 8, &gDrSrcPx);
+    OSAddAtomic64(da >> 8, &gDrPx);
+    if (dw == 0 || dh == 0) { OSAddAtomic64(1, &gDrEmpty); return; }
+    int b;
+    if (da >= sa - sa / 1024) { b = 7; OSAddAtomic64(1, &gDrFull); }
+    else if (da * 100 < sa) b = 0;
+    else if (da * 20 < sa) b = 1;
+    else if (da * 10 < sa) b = 2;
+    else if (da * 4 < sa) b = 3;
+    else if (da * 2 < sa) b = 4;
+    else if (da * 4 < sa * 3) b = 5;
+    else b = 6;
+    OSAddAtomic64(1, &gDrHist[b]);
+}
+static void nmxDrPrintFix(char *buf, size_t size, size_t *o, unsigned bits)
+{
+    const long long v = nmxDrFix(bits);
+    const long long a = v < 0 ? -v : v;
+    if (*o < size) *o += (size_t)snprintf(buf + *o, size - *o, " %s%lld.%02lld", v < 0 ? "-" : "", a >> 4, ((a & 15) * 100) >> 4);
+}
+static int nmx_dirty_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 4096;
+    if (req->oldptr == USER_ADDR_NULL)      // size probe: the fixed size, nothing formatted
+        return SYSCTL_OUT(req, NULL, size);
+    char *buf = (char *)IOMallocZeroData(size);
+    if (!buf) return ENOMEM;
+    size_t o = 0;
+#define DR_P(...) do { if (o < size) o += (size_t)snprintf(buf + o, size - o, __VA_ARGS__); } while (0)
+    DR_P("state %d plane_array +0x%x stride 0x%x src +0x%x dirty +0x%x\n", gDrState, gDrSrc.base, gDrSrc.stride, gDrSrc.off, gDrDirty.off);
+    DR_P("presents %lld empty %lld full %lld odd %lld no_planes %lld\n", (long long)gDrN, (long long)gDrEmpty,
+         (long long)gDrFull, (long long)gDrOdd, (long long)gDrNoPlanes);
+    DR_P("area");
+    for (int i = 0; i < NMX_DR_BUCKETS; i++) DR_P(" %s %lld", kDrBucket[i], (long long)gDrHist[i]);
+    DR_P("\ndirty_px %lld src_px %lld\n", (long long)gDrPx, (long long)gDrSrcPx);
+    DR_P("txn_dirty_bits or 0x%llx last 0x%llx\n", gDrBitsOr, gDrBitsLast);
+    DR_P("samples: seq | src x y w h | dirty x y w h | txn dirty bits | raw dirty bits\n");
+    for (int k = 0; k < NMX_DR_RING; k++) {
+        const NMXDirtySample &e = gDrRing[(gDrRingNext + k) % NMX_DR_RING];
+        const unsigned long long seq = __atomic_load_n(&e.seq, __ATOMIC_ACQUIRE);
+        if (!seq) continue;
+        DR_P("%llu |", seq);
+        for (int i = 0; i < 4; i++) nmxDrPrintFix(buf, size, &o, e.src[i]);
+        DR_P(" |");
+        for (int i = 0; i < 4; i++) nmxDrPrintFix(buf, size, &o, e.dirty[i]);
+        DR_P(" | 0x%llx | %08x %08x %08x %08x\n", e.bits, e.dirty[0], e.dirty[1], e.dirty[2], e.dirty[3]);
+    }
+#undef DR_P
+    if (o > size) o = size;
+    int err = SYSCTL_OUT(req, buf, o);
+    IOFreeData(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmxaccel_dirty, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nmx_dirty_sysctl, "A",
+            "roadmap 3 b: per present on head 0, plane 0's dirty rect against its source rect (read-only; never changes a present)");
 #endif
 
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
@@ -2708,6 +2856,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 #endif
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
 #ifdef NMX_ACCEL
+    if (head == 0) nmxDirtyCount(txn);      // roadmap 3 b: count only
     (void)nmxFtBegin(s);
     gCurTx = txn;
     gKfS = nullptr;
@@ -3082,6 +3231,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_color_degamma_n);
     sysctl_register_oid(&sysctl__debug_nmxaccel_color_gamma_n);
     sysctl_register_oid(&sysctl__debug_nmxaccel_color_ctm_raw);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_dirty);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_latched);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_fallback);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_refused);
