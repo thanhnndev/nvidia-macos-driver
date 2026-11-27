@@ -4888,6 +4888,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     return p;
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+    NVMTL_STAGE(ST_ENC);
     nvmtl_g79_flush(self);
     NVMTLRenderCommandEncoder *e = [NVMTLRenderCommandEncoder new];
     _nEnc++;
@@ -4992,6 +4993,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 // On the 890M NMXAccel orders the swap after the GPU work instead (NVMTLEventSync.m, NMXFencePending/Done): a command
 // buffer whose written surfaces all carry a fence only waits until it is submitted.
 - (BOOL)commitAndWaitUntilSubmitted {
+    NVMTL_STAGE(ST_CAWUS);
     nvmtl_vk_frame_census(NVC_CAWUS);
     static int ws = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
@@ -4999,7 +5001,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     if (ws && !_nmxFenced) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
-- (void)commit { nvmtl_vk_frame_census(NVC_COMMIT); [self nvmtlSubmitWithEvents]; }
+- (void)commit { NVMTL_STAGE(ST_COMMIT); nvmtl_vk_frame_census(NVC_COMMIT); [self nvmtlSubmitWithEvents]; }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
 }

@@ -7,6 +7,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>
 const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
 typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int htype; /* its memory type + 1 when known (0 = unknown) */ } nvk_buffer;
 #include "nvmtl_sample_positions.h"
@@ -96,6 +97,14 @@ int  nvmtl_vk_buffer_create(size_t size, int host_visible, nvk_buffer *out);
 enum { NVP_BEGIN, NVP_BUFNEW, NVP_BUFPOOL, NVP_BUFDEL, NVP_HEAP, NVP_SYNCIN, NVP_SYNCOUT, NVP_COPY, NVP_N };
 uint64_t nvmtl_perf_now(void);
 void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
+/* WS-CPU 9.8: per-stage CPU counters, on by default (NVMTL_STAGE_TIMERS=0 off), printed per present by the 30 s frame
+   census. NVMTL_STAGE(ST_x) at the top of a function times the whole call (every return). */
+enum { ST_ENC, ST_PASS, ST_DRAW, ST_SNAP, ST_CAWUS, ST_COMMIT, ST_N };
+typedef struct { uint64_t t0; int which; } nvmtl_stage_t;
+int nvmtl_stage_on(void);
+void nvmtl_stage_end(nvmtl_stage_t *s);
+#define NVMTL_STAGE(w) __attribute__((cleanup(nvmtl_stage_end), unused)) nvmtl_stage_t nvmtl_st_ = \
+    { nvmtl_stage_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0, (w) }
 int  nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out);
 size_t nvmtl_vk_host_import_align(void);
 #define NVMTL_MAX_GEOMS 256

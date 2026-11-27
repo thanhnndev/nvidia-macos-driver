@@ -213,13 +213,14 @@ static int nvmtl_dc_stale(const nvmtl_dc_ent *e)
  * "again" also says how many of those the old global epochs would have thrown away (img/buf moved).
  * Diagnostic only: it decides nothing. */
 #define NVMTL_DC_SEEN 8192
-/* Off unless NVMTL_DC_CLASSIFY=1 or the device-level cache is on: the seen table (192 KB) is not touched otherwise
-   (review of 921113d). The census then prints zeros for the classes. */
+/* On by default since WS-CPU 9.8 (2026-11-27: WindowServer's census printed zeros for every class, so its 5.6-5.9
+   misses per present had no cause). It runs only on a miss and on the insert after it. NVMTL_DC_CLASSIFY=0 turns it
+   off (the seen table, 192 KB, is then not touched; review of 921113d). */
 static int nvmtl_xdc_on(void);
 static int nvmtl_dc_classify_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_DC_CLASSIFY"); on = (e && *e == '1') || nvmtl_xdc_on(); }
+    if (on < 0) { const char *e = getenv("NVMTL_DC_CLASSIFY"); on = !(e && *e == '0') || nvmtl_xdc_on(); }
     return on;
 }
 typedef struct { uint64_t h, sig; uint32_t ie, be; } nvmtl_dc_seen_ent;

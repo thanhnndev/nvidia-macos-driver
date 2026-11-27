@@ -3481,23 +3481,50 @@ static int nvmtl_keep_verdict(uint32_t s)
 }
 static int g_perf_on = -1;
 static pthread_mutex_t g_perf_lock = PTHREAD_MUTEX_INITIALIZER;
+/* WS-CPU 9.8 (2026-11-27): the stage timers below were only usable with NVMTL_PERF_LOG (stderr), so never in
+   WindowServer. They now also feed relaxed atomic counters that the 30 s frame census prints per present (one
+   clock_gettime pair per timed call, ~40 ns). NVMTL_STAGE_TIMERS=0 turns the counters off. */
+static int g_stage_on = -1;
+int nvmtl_stage_on(void)
+{
+    if (__builtin_expect(g_stage_on < 0, 0)) { const char *e = getenv("NVMTL_STAGE_TIMERS"); g_stage_on = !(e && e[0] == '0'); }
+    return g_stage_on;
+}
+static _Atomic unsigned long long g_st_ns[ST_N], g_st_n[ST_N];
+void nvmtl_stage_end(nvmtl_stage_t *s)
+{
+    if (!s->t0 || s->which < 0 || s->which >= ST_N) return;
+    atomic_fetch_add_explicit(&g_st_ns[s->which], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - s->t0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_st_n[s->which], 1, memory_order_relaxed);
+}
+/* the NVP_* notes and the submit phases (pt[]): hook, end, fence, ioctl, wait, finish, retire */
+enum { SP_HOOK, SP_END, SP_FENCE, SP_IOCTL, SP_WAIT, SP_FINISH, SP_RETIRE, SP_N };
+static _Atomic unsigned long long g_sp_ns[SP_N], g_sp_n, g_nvp_ns[NVP_N], g_nvp_n[NVP_N];
 typedef struct { uint64_t n, ns, bytes; } nvmtl_perf_acc;
 static nvmtl_perf_acc g_perf[NVP_N]; static uint64_t g_perf_last;
 static __thread int g_perf_kind;
 uint64_t nvmtl_perf_now(void)
 {
     if (g_perf_on < 0) { const char *e = getenv("NVMTL_PERF_LOG"); g_perf_on = e && e[0] && e[0] != '0'; }
-    return g_perf_on ? clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) : 0;
+    return g_perf_on || nvmtl_stage_on() ? clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) : 0;
 }
 void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes)
 {
     if (!t0 || what < 0 || what >= NVP_N) return;
     const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    if (nvmtl_stage_on()) { atomic_fetch_add_explicit(&g_nvp_ns[what], dt, memory_order_relaxed); atomic_fetch_add_explicit(&g_nvp_n[what], 1, memory_order_relaxed); }
+    if (g_perf_on != 1) return;
     pthread_mutex_lock(&g_perf_lock); g_perf[what].n++; g_perf[what].ns += dt; g_perf[what].bytes += bytes; pthread_mutex_unlock(&g_perf_lock);
 }
 static void nvmtl_perf_submit(unsigned sets, const uint64_t *pt)
 {
     if (!pt[0]) return;
+    if (nvmtl_stage_on() && pt[7] >= pt[6] && pt[6] >= pt[5] && pt[5] >= pt[4] && pt[4] >= pt[3]) {
+        const uint64_t d[SP_N] = { pt[1] - pt[0], pt[2] - pt[1], pt[3] - pt[2], pt[4] - pt[3], pt[5] - pt[4], pt[6] - pt[5], pt[7] - pt[6] };
+        for (int i = 0; i < SP_N; i++) atomic_fetch_add_explicit(&g_sp_ns[i], d[i], memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_sp_n, 1, memory_order_relaxed);
+    }
+    if (g_perf_on != 1) return;
     static const char *const nm[NVP_N] = { "begin", "bufnew", "bufpool", "bufdel", "heap", "syncin", "syncout", "copy" };
     char s[640]; int k = 0; s[0] = 0;
     pthread_mutex_lock(&g_perf_lock);
@@ -3802,6 +3829,26 @@ void nvmtl_vk_frame_census(int what)
                  "%.2f address page, %.2f long/full; device-level cache: %.2f hits per present, %.2f stale, %.2f evicted, %.2f full, %u entries",
                  dc[0] / p, dc[1] / p, dc[2] / p, dc[3] / p, dc[4] / p, dc[5] / p, dc[6] / p, dc[7] / p,
                  dc[8] / p, dc[9] / p, dc[10] / p, dc[11] / p, g_xdc_n);
+    if (nvmtl_stage_on()) {   /* WS-CPU 9.8: CPU per present by stage (us; calls per present in brackets) */
+        static unsigned long long l1[ST_N], l2[ST_N], l3[SP_N], l4, l5[NVP_N], l6[NVP_N];
+        double ns[ST_N], cn[ST_N], sp[SP_N], vn[NVP_N], vc[NVP_N];
+        for (int i = 0; i < ST_N; i++) { const unsigned long long a1 = atomic_load(&g_st_ns[i]), a2 = atomic_load(&g_st_n[i]);
+            ns[i] = (double)(a1 - l1[i]) / 1e3 / p; cn[i] = (double)(a2 - l2[i]) / p; l1[i] = a1; l2[i] = a2; }
+        for (int i = 0; i < SP_N; i++) { const unsigned long long a1 = atomic_load(&g_sp_ns[i]); sp[i] = (double)(a1 - l3[i]) / 1e3 / p; l3[i] = a1; }
+        const unsigned long long sn = atomic_load(&g_sp_n); const double spn = (double)(sn - l4) / p; l4 = sn;
+        for (int i = 0; i < NVP_N; i++) { const unsigned long long a1 = atomic_load(&g_nvp_ns[i]), a2 = atomic_load(&g_nvp_n[i]);
+            vn[i] = (double)(a1 - l5[i]) / 1e3 / p; vc[i] = (double)(a2 - l6[i]) / p; l5[i] = a1; l6[i] = a2; }
+        nvlog_report("frame census stage CPU per present (us [calls]): committing thread: commitAndWaitUntilSubmitted %.1f [%.2f] "
+                     "(of it commit %.1f [%.2f]), command buffer begin %.1f [%.2f], render encoder create %.1f [%.2f], render pass begin %.1f [%.2f], "
+                     "draws %.1f [%.1f] (of them set snapshots %.1f [%.1f]); submit [%.2f]: pre-submit hook %.1f, end + prologue %.1f, fence %.1f, "
+                     "lock + vkQueueSubmit (CS ioctl) %.1f; completion thread: fence wait %.1f (wall, mostly asleep), finish %.1f, retire %.1f; "
+                     "buffers new %.1f [%.2f] pooled %.1f [%.2f] freed %.1f [%.2f], heaps %.1f [%.2f], copies %.1f [%.2f], sync in/out %.1f/%.1f",
+                     ns[ST_CAWUS], cn[ST_CAWUS], ns[ST_COMMIT], cn[ST_COMMIT], vn[NVP_BEGIN], vc[NVP_BEGIN], ns[ST_ENC], cn[ST_ENC],
+                     ns[ST_PASS], cn[ST_PASS], ns[ST_DRAW], cn[ST_DRAW], ns[ST_SNAP], cn[ST_SNAP], spn,
+                     sp[SP_HOOK], sp[SP_END], sp[SP_FENCE], sp[SP_IOCTL], sp[SP_WAIT], sp[SP_FINISH], sp[SP_RETIRE],
+                     vn[NVP_BUFNEW], vc[NVP_BUFNEW], vn[NVP_BUFPOOL], vc[NVP_BUFPOOL], vn[NVP_BUFDEL], vc[NVP_BUFDEL], vn[NVP_HEAP], vc[NVP_HEAP],
+                     vn[NVP_COPY], vc[NVP_COPY], vn[NVP_SYNCIN], vn[NVP_SYNCOUT]);
+    }
     if (g_snap_timing == 1) {
         static unsigned long long sl[2]; const unsigned long long sv[2] = { atomic_load(&g_snap_ns), atomic_load(&g_snap_n) };
         const unsigned long long dns = sv[0] - sl[0], dn = sv[1] - sl[1]; sl[0] = sv[0]; sl[1] = sv[1];
@@ -3839,7 +3886,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c_body(nvk_cmdbuf *c, uint32_t which, 
 static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p, uint32_t *dyn)
 {
     if (g_snap_timing < 0) { const char *e = getenv("NVMTL_SNAP_TIMING"); g_snap_timing = e && *e == '1'; }
-    if (!g_snap_timing) return nvmtl_snapshot_set_c_body(c, which, p, dyn);
+    if (!g_snap_timing) { NVMTL_STAGE(ST_SNAP); return nvmtl_snapshot_set_c_body(c, which, p, dyn); }
     const unsigned long long t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     VkDescriptorSet s = nvmtl_snapshot_set_c_body(c, which, p, dyn);
     atomic_fetch_add_explicit(&g_snap_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, memory_order_relaxed);
@@ -6009,6 +6056,7 @@ static void nvmtl_clear_colour(VkClearColorValue *cv, uint32_t fmt, const float 
 static void nvmtl_private_depth_layout(nvk_cmdbuf *, nvk_image *, VkImageLayout);
 int nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
 {
+    NVMTL_STAGE(ST_PASS);
     for (uint32_t i = 0; i < NVMTL_NCOL; i++) { nvmtl_btsh_note_img(c, ps->col[i]); nvmtl_btsh_note_img(c, ps->res[i]); }
     if (!p->rp || !ps->w || !ps->h) { nvlog("begin_render: apps2 no render pass or a %ux%u pass — pass REFUSED", ps->w, ps->h); return -1; }
     nvmtl_sample_pattern pattern = ps->sample_pattern;
@@ -6583,6 +6631,7 @@ int nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4]
 
 void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t instances, uint32_t baseInstance)
 {
+    NVMTL_STAGE(ST_DRAW);
     if (__builtin_expect(g_flc == 1, 0)) { atomic_fetch_add_explicit(&g_dr_n, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_dr_scpx, t_sc_px, memory_order_relaxed); }
     if (c->nobind) return;
     const uint32_t n = instances ? instances : 1;
@@ -6653,6 +6702,7 @@ static int nvmtl_index_range_ok(const nvk_buffer *idx, size_t offset)
 void nvmtl_vk_cmd_draw_indexed(nvk_cmdbuf *c, nvk_buffer *idx, size_t offset, uint32_t count, int is32,
                                uint32_t instances, int32_t baseVertex, uint32_t baseInstance)
 {
+    NVMTL_STAGE(ST_DRAW);
     if (__builtin_expect(g_flc == 1, 0)) { atomic_fetch_add_explicit(&g_dr_n, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_dr_scpx, t_sc_px, memory_order_relaxed); }
     if (!nvmtl_index_range_ok(idx, offset)) return;
     pvkCmdBindIndexBuffer(c->cb, (VkBuffer)idx->buf, offset, is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
