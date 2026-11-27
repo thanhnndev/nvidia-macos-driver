@@ -3780,6 +3780,7 @@ void nvmtl_vk_frame_census(int what)
     const unsigned long long hit = __atomic_load_n(&g_dc_hit, __ATOMIC_RELAXED), miss = __atomic_load_n(&g_dc_miss, __ATOMIC_RELAXED);
     const unsigned long long dh = hit - dclast[0], dm = miss - dclast[1]; dclast[0] = hit; dclast[1] = miss;
     const double p = d[NVC_CAWUS] ? (double)d[NVC_CAWUS] : 1.0;
+    const int flcWin = g_flc == 1;   /* the census window this report closes (a requested one switches off inside) */
     nvmtl_flc_report((double)(now - t0) / 1e9);
     nvlog_report("frame census %.0f s: %llu commits, %llu commitAndWaitUntilSubmitted (presents), waits: %llu scheduled %llu completed; "
                  "%llu vkQueueSubmit; per present: %.2f commits, %.2f submits, %.2f views made / %.2f destroyed, %.2f VkBuffers made / %.2f destroyed, "
@@ -3812,7 +3813,7 @@ void nvmtl_vk_frame_census(int what)
                  "in %u (watched IOSurface planes %llu MB), not in our allocations",
                  (unsigned long long)(g_alloc_bytes >> 20), (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
                  atomic_load(&g_btsh_bytes) >> 20, (unsigned)atomic_load(&g_btsh_live), atomic_load(&g_btsh_wbytes) >> 20);
-    if (g_flc == 1) {   static uint64_t l[6]; const uint64_t v[6] = { atomic_load(&g_rp_n), atomic_load(&g_rp_px), atomic_load(&g_rp_big_load),
+    if (flcWin) {   static uint64_t l[6]; const uint64_t v[6] = { atomic_load(&g_rp_n), atomic_load(&g_rp_px), atomic_load(&g_rp_big_load),
                                                        atomic_load(&g_rp_big_new), atomic_load(&g_dr_n), atomic_load(&g_dr_scpx) };
         uint64_t dv[6]; for (int i = 0; i < 6; i++) { dv[i] = v[i] - l[i]; l[i] = v[i]; }
         nvlog_report("frame census draw area per present: %.2f render passes on %.2f Mpx of attachments, %.2f passes on a >= 4 Mpx target "
