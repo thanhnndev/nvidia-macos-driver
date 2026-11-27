@@ -1858,8 +1858,10 @@ int nmx_gtt_format(char *buf, size_t size)
  * (dm_crtc_get_cursor_mode: the primary plane is 2880x1800 scanned 1:1, RGB, so native mode holds).
  *
  * Hidden = moved to x, y = -side (DM reports the cursor disabled there and programs it off), so hide and show stay
- * async. Two side x side ARGB8888 buffers in VRAM, pinned once and never unpinned (like the flip chain): an image is
- * written into the one not on screen and committed as the plane's new FB (async update swaps it).
+ * async. Two slots of ARGB8888 buffers in VRAM, one buffer per size class (64, 128, 256 up to side), pinned once and
+ * never unpinned (like the flip chain): an image is written into the smallest buffer that holds it in the slot not on
+ * screen and committed as the plane's new FB (async update swaps it; DM's async check does not look at the size, and
+ * DCN then fetches only that size every frame: power).
  *
  * The bridge's own commits (drm_client_modeset_commit: open, restore, hotplug, display power) disable every plane but
  * the primary (drm_client_modeset_commit_atomic), so each of them re-arms the cursor: the next apply is a full commit
@@ -1873,11 +1875,12 @@ static struct {
     struct mutex mtx;
     int ready, display_on, rearm, on_plane;
     uint32_t side, hide;                /* buffer side; DC max cursor (x/y <= -hide = cursor off in DM) */
-    struct drm_client_buffer *buf[2];
-    volatile uint32_t *va[2];
-    uint64_t gpu[2];
-    int cur;                            /* index of the FB on the plane, -1 none */
-    int back_ok;                        /* the buffer not on screen holds image back_seq */
+    int nsz;                            /* size classes made: 64 << (0 .. nsz - 1), up to side */
+    struct drm_client_buffer *buf[2][3];  /* [slot][size class] */
+    volatile uint32_t *va[2][3];
+    uint64_t gpu[2][3];
+    int cur, curk;                      /* slot and size class of the FB on the plane, cur -1 none */
+    int back_ok, back_k;                /* slot cur ^ 1 holds image back_seq in size class back_k */
     uint32_t back_seq, shown_seq;
     int32_t x, y;
     void (*kick)(void *);
@@ -1948,14 +1951,15 @@ static void cur_buf_drop(struct drm_client_buffer *b, int pinned, int mapped)
 
 static int cur_init_fail(int e)
 {
-    int i;
+    int i, k;
 
     for (i = 0; i < 2; i++)
-        if (cur.buf[i]) {
-            cur_buf_drop(cur.buf[i], 1, 1);
-            cur.buf[i] = NULL;
-            cur.va[i] = NULL;
-        }
+        for (k = 0; k < 3; k++)
+            if (cur.buf[i][k]) {
+                cur_buf_drop(cur.buf[i][k], 1, 1);
+                cur.buf[i][k] = NULL;
+                cur.va[i][k] = NULL;
+            }
     if (e != EAGAIN)
         cur.init_err = e;           /* getAttribute asks again on every mode set: do not rebuild buffers each time */
     return e;
@@ -1993,40 +1997,46 @@ int nmx_fb_cursor_init(uint32_t *side)
         mutex_init(&cur.mtx);
         cur.mtx_inited = 1;
     }
+    cur.nsz = cur.side >= 256 ? 3 : cur.side >= 128 ? 2 : 1;
     for (i = 0; i < 2; i++) {
-        struct drm_client_buffer *b = fb_create_vram(flip.nfb, cur.side, cur.side, DRM_FORMAT_ARGB8888);
-        struct iosys_map map;
+        int k;
 
-        if (IS_ERR_OR_NULL(b)) {
-            CUR_LOG("NMX cursor: buffer %d not created (%ld)\n", i, (long)PTR_ERR(b));
-            return cur_init_fail(ENOMEM);
+        for (k = 0; k < cur.nsz; k++) {
+            const uint32_t sz = 64u << k;
+            struct drm_client_buffer *b = fb_create_vram(flip.nfb, sz, sz, DRM_FORMAT_ARGB8888);
+            struct iosys_map map;
+
+            if (IS_ERR_OR_NULL(b)) {
+                CUR_LOG("NMX cursor: buffer %d/%u not created (%ld)\n", i, sz, (long)PTR_ERR(b));
+                return cur_init_fail(ENOMEM);
+            }
+            if (b->fb->pitches[0] != sz * 4) {          /* dm_check_cursor_fb: pitch in pixels must equal the width */
+                CUR_LOG("NMX cursor: buffer %d/%u pitch %u, need %u\n", i, sz, b->fb->pitches[0], sz * 4);
+                cur_buf_drop(b, 0, 0);
+                return cur_init_fail(ENODEV);
+            }
+            if ((e = flip_pin(b, &cur.gpu[i][k]))) {
+                CUR_LOG("NMX cursor: buffer %d/%u would not pin (%d)\n", i, sz, e);
+                cur_buf_drop(b, 0, 0);
+                return cur_init_fail(ENOMEM);
+            }
+            if ((e = drm_client_buffer_vmap(b, &map))) {  /* up: stays pinned, never freed, like the flip chain */
+                CUR_LOG("NMX cursor: buffer %d/%u would not map (%d)\n", i, sz, e);
+                cur_buf_drop(b, 1, 0);
+                return cur_init_fail(ENOMEM);
+            }
+            cur.buf[i][k] = b;
+            cur.va[i][k] = (volatile uint32_t *)(map.is_iomem ? (void *)map.vaddr_iomem : map.vaddr);
+            for (uint32_t n = 0; n < sz * sz; n++)
+                cur.va[i][k][n] = 0;
         }
-        if (b->fb->pitches[0] != cur.side * 4) {        /* dm_check_cursor_fb: pitch in pixels must equal the width */
-            CUR_LOG("NMX cursor: buffer %d pitch %u, need %u\n", i, b->fb->pitches[0], cur.side * 4);
-            cur_buf_drop(b, 0, 0);
-            return cur_init_fail(ENODEV);
-        }
-        if ((e = flip_pin(b, &cur.gpu[i]))) {
-            CUR_LOG("NMX cursor: buffer %d would not pin (%d)\n", i, e);
-            cur_buf_drop(b, 0, 0);
-            return cur_init_fail(ENOMEM);
-        }
-        if ((e = drm_client_buffer_vmap(b, &map))) {    /* up: stays pinned, never freed, like the flip chain */
-            CUR_LOG("NMX cursor: buffer %d would not map (%d)\n", i, e);
-            cur_buf_drop(b, 1, 0);
-            return cur_init_fail(ENOMEM);
-        }
-        cur.buf[i] = b;
-        cur.va[i] = (volatile uint32_t *)(map.is_iomem ? (void *)map.vaddr_iomem : map.vaddr);
-        for (uint32_t k = 0; k < cur.side * cur.side; k++)
-            cur.va[i][k] = 0;
     }
     cur.cur = -1;
     *side = cur.side;
     __atomic_store_n(&cur.ready, 1, __ATOMIC_RELEASE);
-    CUR_LOG("NMX cursor: up, plane %p on crtc %p, %ux%u buffers at gpu %llx / %llx (DC max %ux%u)\n", flip.crtc->cursor,
-            flip.crtc, cur.side, cur.side, (unsigned long long)cur.gpu[0], (unsigned long long)cur.gpu[1],
-            acrtc->max_cursor_width, acrtc->max_cursor_height);
+    CUR_LOG("NMX cursor: up, plane %p on crtc %p, 2 x %d buffers 64..%u (gpu %llx / %llx) (DC max %ux%u)\n",
+            flip.crtc->cursor, flip.crtc, cur.nsz, cur.side, (unsigned long long)cur.gpu[0][0],
+            (unsigned long long)cur.gpu[1][0], acrtc->max_cursor_width, acrtc->max_cursor_height);
     return 0;
 }
 
@@ -2070,7 +2080,7 @@ retry:
  */
 int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t seq, int32_t x, int32_t y, int visible)
 {
-    int full, b, ret;
+    int full, b, k, ret;
 
     if (!__atomic_load_n(&cur.ready, __ATOMIC_ACQUIRE))
         return ENODEV;
@@ -2083,17 +2093,25 @@ int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t se
     if (full)
         cur.back_ok = 0;                                            /* re-upload after a re-arm (VRAM may be lost) */
     b = cur.cur < 0 ? 0 : cur.cur ^ 1;
+    k = cur.curk;
     /* a new image, or the first commit after a re-arm (re-upload: the buffers are in VRAM, cheap, and a GPU reset
      * may have touched them) */
     if (img && (seq != cur.shown_seq || full || cur.cur < 0)) {
-        if (!cur.back_ok || cur.back_seq != seq) {
-            if (nmx_cur_fill(cur.va[b], cur.side, img, w, h)) {
+        k = nmx_cur_size_class(w, h, cur.side);
+        if (k < 0 || k >= cur.nsz) {
+            mutex_unlock(&cur.mtx);
+            __atomic_add_fetch(&gNmxCurErrors, 1, __ATOMIC_RELAXED);
+            return EINVAL;
+        }
+        if (!cur.back_ok || cur.back_seq != seq || cur.back_k != k) {
+            if (nmx_cur_fill(cur.va[b][k], 64u << k, img, w, h)) {
                 mutex_unlock(&cur.mtx);
                 __atomic_add_fetch(&gNmxCurErrors, 1, __ATOMIC_RELAXED);
                 return EINVAL;
             }
             cur.back_ok = 1;
             cur.back_seq = seq;
+            cur.back_k = k;
             __atomic_add_fetch(&gNmxCurImages, 1, __ATOMIC_RELAXED);
         }
     } else if (cur.cur < 0) {
@@ -2103,17 +2121,18 @@ int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t se
         b = cur.cur;
     if (!visible)
         x = y = nmx_cur_hidden_xy(cur.hide);
-    if (!full && b == cur.cur && x == cur.x && y == cur.y) {
+    if (!full && b == cur.cur && k == cur.curk && x == cur.x && y == cur.y) {
         mutex_unlock(&cur.mtx);
         return 0;
     }
-    ret = cur_commit(cur.buf[b]->fb, x, y);
+    ret = cur_commit(cur.buf[b][k]->fb, x, y);
     if (ret == 0) {
         if (b != cur.cur) {
             cur.back_ok = 0;                                        /* the old front is now the back: stale */
             cur.shown_seq = cur.back_seq;
         }
         cur.cur = b;
+        cur.curk = k;
         cur.on_plane = 1;
         cur.x = x;
         cur.y = y;

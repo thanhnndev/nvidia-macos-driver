@@ -56,6 +56,21 @@ static inline uint32_t nmx_cur_buf_side(uint32_t max_w, uint32_t max_h)
     return m >= 256 ? 256 : m >= 128 ? 128 : m >= 64 ? 64 : 0;
 }
 
+/*
+ * buffer size class for one image: 0 = 64, 1 = 128, 2 = 256 (the smallest that holds w x h, never above side).
+ * DCN fetches the cursor surface at the plane's size (amdgpu_dm_plane_handle_cursor_update: attributes.width/height =
+ * crtc_w/h), every frame while it is visible, so a 32x32 arrow in a 64x64 buffer reads 16 KB a frame, not 256 KB.
+ * -1 = the image does not fit side.
+ */
+static inline int nmx_cur_size_class(uint32_t w, uint32_t h, uint32_t side)
+{
+    const uint32_t m = w > h ? w : h;
+    for (int k = 0; k < 3; k++)
+        if ((64u << k) <= side && m <= (64u << k))
+            return k;
+    return -1;
+}
+
 /* position that hides the cursor without leaving the async path: amdgpu_dm_plane_get_cursor_position() reports
  * enable = false for crtc_x <= -max_cursor_width, and amdgpu_dm_plane_handle_cursor_update() then programs a disabled
  * cursor (its own "turn off cursor" branch); the plane keeps its CRTC and FB, so showing it again is async too */
