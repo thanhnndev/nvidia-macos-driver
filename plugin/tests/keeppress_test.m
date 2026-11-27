@@ -13,8 +13,10 @@
 //     a second CRITICAL then frees E (freed only after completion)
 //   D wrapped and released, idle 6 s, then NORMAL         -> still alive: NORMAL changes nothing
 // KEEPPRESS_SOURCE=1: the real dispatch source path instead. Wraps A (idle) and B (held), then waits up to 180 s for a
-// system memory-pressure event (main runs, as root: sysctl kern.memorypressure_manual_trigger=2, then =1 to end it).
-// Pass: A freed by the plugin's own source, B alive.
+// system memory-pressure event. NVMTL_KEEP_MS / NVMTL_KEEP_TIMER_MS are raised to 10 min so the idle expiry cannot free A
+// (d70ae280's first source run passed at 29.6 s after the wrap: that was the 30 s expiry, no event). The plugin's log
+// goes to the unified log and to NVMTL_LOG_PATH, set here to keeppress-source.log next to the binary's cwd; pass
+// = A freed, B alive, and a "memory pressure WARN|CRITICAL" line from this pid in that file.
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #import <IOKit/IOKitLib.h>
@@ -52,7 +54,7 @@ static id<MTLDevice> device(void) {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel")); if (!svc) return nil;
     return ((id(*)(id, SEL, mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc], NSSelectorFromString(@"initWithAcceleratorPort:"), svc);
 }
-static int sourceRun(id<MTLDevice> d) {
+static int sourceRun(id<MTLDevice> d, const char *logPath) {
     const IOSurfaceID a = wrapRelease(d);
     IOSurfaceRef bs = mk(0); const IOSurfaceID b = IOSurfaceGetID(bs); id<MTLTexture> bt = wrap(d, bs);
     usleep(6000000);
@@ -60,16 +62,25 @@ static int sourceRun(id<MTLDevice> d) {
     int i = 0; for (; i < 1800 && alive(a); i++) usleep(100000);
     settle();
     printf("after %.1f s: A %s, B %s\n", i / 10.0, st(a), st(b));
-    const int ok = !alive(a) && alive(b) && bt.width == 1024;
+    char line[512]; int ev = 0; FILE *f = fopen(logPath, "r");
+    while (f && fgets(line, sizeof line, f)) if (strstr(line, "memory pressure ")) { ev = 1; printf("plugin: %s", line); }
+    if (f) fclose(f);
+    if (!ev) printf("no memory pressure line in %s: %s\n", logPath, alive(a) ? "no event arrived" : "A went for another reason");
+    const int ok = ev && !alive(a) && alive(b) && bt.width == 1024;
     CFRelease(bs); bt = nil;
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 int main(void) { @autoreleasepool {
     const char *plugin = getenv("NM_TEST_PLUGIN");
+    const int src = getenv("KEEPPRESS_SOURCE") != NULL; char logPath[1100] = "";
+    if (src) {   // before the plugin's first keep call reads them
+        setenv("NVMTL_KEEP_MS", "600000", 1); setenv("NVMTL_KEEP_TIMER_MS", "600000", 1);
+        char cwd[1024]; snprintf(logPath, sizeof logPath, "%s/keeppress-source.log", getcwd(cwd, sizeof cwd) ? cwd : "/private/tmp");
+        unlink(logPath); setenv("NVMTL_LOG_PATH", logPath, 1); printf("plugin log: %s (and the unified log)\n", logPath); }
     void *h = plugin ? dlopen(plugin, RTLD_NOW | RTLD_LOCAL) : NULL; if (!h) return 3;
     id<MTLDevice> d = device(); if (!d) return 5;
-    if (getenv("KEEPPRESS_SOURCE")) return sourceRun(d);
+    if (src) return sourceRun(d, logPath);
     void (*press)(id, unsigned long) = (void (*)(id, unsigned long))dlsym(h, "nvmtl_test_keep_pressure"); if (!press) return 6;
     int fail = 0;
     const IOSurfaceID a = wrapRelease(d);
