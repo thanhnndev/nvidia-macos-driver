@@ -693,7 +693,7 @@ static void flip_refresh(void)
 static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *set_ns);
 static uint64_t col_apply(struct drm_crtc_state *cs, bool *changed);     /* hardware colour stages (end of file) */
 static void col_applied(uint64_t gen);
-static void col_rejected(uint64_t gen, int e);
+static bool col_rejected(uint64_t gen, int e);
 /* errors that say nothing about the colour state (locks, signals, memory, a busy CRTC): never a refusal */
 static inline bool col_transient(int e)
 {
@@ -1938,16 +1938,31 @@ static uint64_t col_apply(struct drm_crtc_state *cs, bool *chg)
     return gen;
 }
 
-static void col_rejected(uint64_t gen, int e)
+/*
+ * a commit that changed the colour state failed and the same commit without it went through (or it changed nothing
+ * else). The errno says why (e.g. -EINVAL from atomic check, -ERANGE, a bandwidth limit): logged. The all-stages-off
+ * state (bypass) is never marked refused: amdgpu_dm always accepts NULL DEGAMMA_LUT / CTM / GAMMA_LUT, and a refused
+ * bypass would leave col_apply nothing to attach (stale state). Returns whether it was marked.
+ */
+static bool col_rejected(uint64_t gen, int e)
 {
+    bool bypass;
+
     col_lock();
-    if (gen > col.rejected) {
+    bypass = gen == col.gen && !col.degamma && !col.ctm && !col.gamma;
+    if (!bypass && gen > col.rejected) {
         col.rejected = gen;
         col.rejected_err = e;
     }
     col_unlock();
+    if (bypass) {
+        FLIP_LOG("NMX flip: colour bypass (all stages off) failed (%d): left staged, not marked refused\n", e);
+        return false;
+    }
     __atomic_add_fetch(&gNmxColorRejected, 1, __ATOMIC_RELAXED);
-    FLIP_LOG("NMX flip: colour state %llu refused by DM (%d): kept the last accepted one\n", (unsigned long long)gen, e);
+    FLIP_LOG("NMX flip: colour state %llu refused (%d; the commit without it went through): kept the last accepted one\n",
+             (unsigned long long)gen, e);
+    return true;
 }
 
 static void col_applied(uint64_t gen)
@@ -2003,8 +2018,7 @@ int nmx_fb_color_commit(void)
                     col_applied(gen);
                     __atomic_add_fetch(&gNmxColorAlone, 1, __ATOMIC_RELAXED);
                 } else if (chg && !col_transient(e)) {
-                    col_rejected(gen, e);   /* a commit of the colour state alone: the colour state is the cause */
-                    refused = true;
+                    refused = col_rejected(gen, e);   /* a commit of the colour state alone: it is the cause */
                 }
             }
             if (e != -EDEADLK)
@@ -2059,5 +2073,6 @@ static long long col_call(void *req)
     if (!e && (r->flags & 8))
         e = nmx_fb_color_commit();
     r->err = e;
-    return e == 0 ? FLIP_R_OK : e == EAGAIN ? FLIP_R_NOTREADY : FLIP_R_ERROR;
+    /* ENOMEM (blob allocation) = not ready: memory pressure, try later, not a failure of the colour path */
+    return e == 0 ? FLIP_R_OK : (e == EAGAIN || e == ENOMEM) ? FLIP_R_NOTREADY : FLIP_R_ERROR;
 }
