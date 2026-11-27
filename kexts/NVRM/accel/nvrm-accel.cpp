@@ -2720,7 +2720,8 @@ static bool nmxRectGetterParse(const unsigned char *p, NMXRectGetter *g)
                                            0xf2, 0x0f, 0x10, 0x44, 0x08, 0x00, 0xf2, 0x0f, 0x10, 0x4c, 0x08, 0x00, 0x5d, 0xc3 };
     for (int i = 0; i < 28; i++)
         if (i != 7 && i != 13 && i != 19 && i != 25 && p[i] != pat[i]) return false;
-    if (p[7] & 7 || p[13] == 0 || p[13] > 0x7f || p[19] > 0x77 || p[25] != p[19] + 8) return false;   // disp8, positive
+    // every disp8 positive (a negative one is never taken as an offset), base 8-aligned, rect inside the stride
+    if (p[7] >= 0x80 || p[7] & 7 || p[13] == 0 || p[13] >= 0x80 || p[19] > 0x77 || p[25] != p[19] + 8) return false;
     g->base = p[7]; g->stride = p[13]; g->off = p[19];
     return true;
 }
@@ -2769,8 +2770,13 @@ static void nmxDirtyCount(const IOAccelDisplayPipeTransaction2 *txn)
     }
     const long long sx = nmxDrFix(src[0]), sy = nmxDrFix(src[1]), sw = nmxDrFix(src[2]), sh = nmxDrFix(src[3]);
     const long long dx = nmxDrFix(dr[0]), dy = nmxDrFix(dr[1]), dw = nmxDrFix(dr[2]), dh = nmxDrFix(dr[3]);
-    const long long lim = 1ll << 20;     // 65536 px in 1/16 px: any real rect is far inside it
-    if (sw <= 0 || sh <= 0 || sw > lim || sh > lim || dx < sx - 16 || dy < sy - 16 || dw < 0 || dh < 0 ||
+    // 65536 px in 1/16 px: any real rect is far inside it. Every field is bounded first, so a saturated float (+-2^62)
+    // can never overflow the sums and products below: it is counted as odd
+    const long long lim = 1ll << 20;
+    const long long f[8] = { sx, sy, sw, sh, dx, dy, dw, dh };
+    for (int i = 0; i < 8; i++)
+        if (f[i] > lim || f[i] < -lim) { OSAddAtomic64(1, &gDrOdd); return; }
+    if (sw <= 0 || sh <= 0 || dx < sx - 16 || dy < sy - 16 || dw < 0 || dh < 0 ||
         dx + dw > sx + sw + 16 || dy + dh > sy + sh + 16) { OSAddAtomic64(1, &gDrOdd); return; }
     const long long sa = sw * sh, da = dw * dh;      // 1/256 px^2
     OSAddAtomic64(sa >> 8, &gDrSrcPx);
@@ -2796,6 +2802,8 @@ static void nmxDrPrintFix(char *buf, size_t size, size_t *o, unsigned bits)
 static int nmx_dirty_sysctl SYSCTL_HANDLER_ARGS
 {
     const size_t size = 4096;
+    if (req->oldptr == USER_ADDR_NULL)      // size probe: the fixed size, nothing formatted
+        return SYSCTL_OUT(req, NULL, size);
     char *buf = (char *)IOMallocZeroData(size);
     if (!buf) return ENOMEM;
     size_t o = 0;
