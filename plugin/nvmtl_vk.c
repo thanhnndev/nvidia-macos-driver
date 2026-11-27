@@ -2615,6 +2615,36 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                     mask and storage-texture range it was keyed with, and the bindings changed since (kchg: every
                     kind/handle/offset change, which is all a UBO-mode key reads) */
                  void *fe[2]; uint64_t fpm[2][4]; uint32_t fhi[2]; uint64_t kchg[2][4]; } nvmtl_bindtable;
+/* WS-CPU cut 1 item 2 (2026-11-27 spindump): every command buffer freed its binding table and desc-cache block at retire
+   and the next one allocated them again; free_medium returned the pages (madvise) each time, ~0.06 ms/present on
+   WindowServer's completion thread, plus fresh zero-fill faults on the next calloc. NVMTL_CB_RECYCLE=1 keeps up to 8 of
+   each on a free list instead (a table is cleared like calloc on reuse; a desc-cache block is reset the way a new one is).
+   Default off. */
+#define NVMTL_BLKPOOL_N 8
+typedef struct { pthread_mutex_t lk; void *b[NVMTL_BLKPOOL_N]; unsigned n; } nvmtl_blkpool;
+static nvmtl_blkpool g_tab_pool = { PTHREAD_MUTEX_INITIALIZER }, g_dcb_pool = { PTHREAD_MUTEX_INITIALIZER };
+static _Atomic unsigned long long g_blk_reuse, g_blk_new, g_blk_kept, g_blk_freed;
+static _Atomic unsigned long long g_fence_batch_resets, g_fence_batch_fences;   /* cut 1 item 3, below */
+static int nvmtl_cb_recycle_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_CB_RECYCLE"); on = e && e[0] == '1';
+        nvlog("vk: command-buffer table / desc-cache block recycling %s (NVMTL_CB_RECYCLE)", on ? "ON" : "off"); }
+    return on;
+}
+static void *nvmtl_blk_get(nvmtl_blkpool *p) {
+    if (!nvmtl_cb_recycle_on()) return NULL;
+    pthread_mutex_lock(&p->lk); void *b = p->n ? p->b[--p->n] : NULL; pthread_mutex_unlock(&p->lk);
+    atomic_fetch_add(b ? &g_blk_reuse : &g_blk_new, 1);
+    return b;
+}
+static void nvmtl_blk_put(nvmtl_blkpool *p, void *b) {
+    if (!b) return;
+    int kept = 0;
+    if (nvmtl_cb_recycle_on()) { pthread_mutex_lock(&p->lk); if (p->n < NVMTL_BLKPOOL_N) { p->b[p->n++] = b; kept = 1; } pthread_mutex_unlock(&p->lk); }
+    if (kept) { atomic_fetch_add(&g_blk_kept, 1); return; }
+    if (nvmtl_cb_recycle_on()) atomic_fetch_add(&g_blk_freed, 1);
+    free(b);
+}
 
 static VkDescriptorSetLayout g_setLayout;
 #define NVMTL_MAX_POOLS 68          /* >= the old 64 x 4096 sets with the growing first pools */
@@ -3331,7 +3361,8 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
 {
     if (set > 1 || binding >= NVMTL_NBIND) return -1;
     if (!c->table) {
-        c->table = calloc(1, sizeof(nvmtl_bindtable));
+        c->table = nvmtl_blk_get(&g_tab_pool);
+        if (c->table) memset(c->table, 0, sizeof(nvmtl_bindtable)); else c->table = calloc(1, sizeof(nvmtl_bindtable));
         if (!c->table) { nvlog("vk: out of memory for the binding table"); return -1; }
     }
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
@@ -3858,6 +3889,13 @@ void nvmtl_vk_frame_census(int what)
                      sp[SP_HOOK], sp[SP_END], sp[SP_FENCE], sp[SP_IOCTL], sp[SP_WAIT], sp[SP_FINISH], sp[SP_RETIRE],
                      vn[NVP_BUFNEW], vc[NVP_BUFNEW], vn[NVP_BUFPOOL], vc[NVP_BUFPOOL], vn[NVP_BUFDEL], vc[NVP_BUFDEL], vn[NVP_HEAP], vc[NVP_HEAP],
                      vn[NVP_COPY], vc[NVP_COPY], vn[NVP_SYNCIN], vn[NVP_SYNCOUT]);
+        static unsigned long long lb[6]; const unsigned long long bv[6] = { atomic_load(&g_blk_reuse), atomic_load(&g_blk_new), atomic_load(&g_blk_kept),
+            atomic_load(&g_blk_freed), atomic_load(&g_fence_batch_resets), atomic_load(&g_fence_batch_fences) };
+        if (bv[0] + bv[1] + bv[4])
+            nvlog_report("frame census completion (cut 1) per present: table/desc-cache blocks reused %.2f, new %.2f, kept %.2f, freed %.2f; "
+                         "batched fence resets %.3f covering %.2f fences", (bv[0] - lb[0]) / p, (bv[1] - lb[1]) / p, (bv[2] - lb[2]) / p,
+                         (bv[3] - lb[3]) / p, (bv[4] - lb[4]) / p, (bv[5] - lb[5]) / p);
+        memcpy(lb, bv, sizeof lb);
     }
     if (g_snap_timing == 1) {
         static unsigned long long sl[2]; const unsigned long long sv[2] = { atomic_load(&g_snap_ns), atomic_load(&g_snap_n) };
@@ -6898,8 +6936,8 @@ static void nvmtl_cmd_retire(nvk_cmdbuf *c)
     free(c->sets); c->sets = NULL; c->nsets = c->capsets = 0; c->nobind = 0; c->skipped = 0;
     c->fetch_last_set = NULL;   // freed with the sets above
     if (c->table) { nvmtl_xdc_unpin((nvmtl_dcache *)((nvmtl_bindtable *)c->table)->dc);
-                    free(((nvmtl_bindtable *)c->table)->dc); ((nvmtl_bindtable *)c->table)->dc = NULL; }
-    free(c->table); c->table = NULL;
+                    nvmtl_blk_put(&g_dcb_pool, ((nvmtl_bindtable *)c->table)->dc); ((nvmtl_bindtable *)c->table)->dc = NULL; }
+    nvmtl_blk_put(&g_tab_pool, c->table); c->table = NULL;
     nvmtl_address_page *page = c->address_pages;
     const int keep = nvmtl_keep_verdict(c->wseq);
     while (page) { nvmtl_address_page *next = page->next;
@@ -7123,18 +7161,60 @@ static int nvmtl_fence_pool_on(void) {
     if (on < 0) { const char *e = getenv("NVMTL_FENCE_POOL"); on = !(e && e[0] == '0'); }
     return on;
 }
+/* WS-CPU cut 1 item 3 (2026-11-27 spindump: the reset ioctl ~0.03 ms/present on the completion thread). NVMTL_FENCE_BATCH=1:
+   a waited fence goes to a "signaled" list instead of being reset alone; 8 of them are reset in one vkResetFences (one
+   DRM syncobj reset ioctl for all) and then join the pool. Until 16 fences exist an empty pool creates one rather than
+   resetting a short list. A fence on the list was waited to VK_SUCCESS and is owned by nobody, as a pooled one is.
+   Default off. (A timeline semaphore would drop the reset altogether but needs the timelineSemaphore feature at device
+   creation and timeline syncobjs in NMXGPU's DRM port; not taken.) */
+#define NVMTL_FENCE_BATCH 8
+static VkFence g_fence_sig[NVMTL_FENCE_BATCH]; static unsigned g_fence_sig_n, g_fence_made;
+static int nvmtl_fence_batch_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_FENCE_BATCH"); on = nvmtl_fence_pool_on() && e && e[0] == '1';
+        nvlog("vk: batched fence resets %s (NVMTL_FENCE_BATCH)", on ? "ON (8 per reset)" : "off"); }
+    return on;
+}
+/* under g_fence_pool_lock: reset the signaled list in one call and move it to the pool (destroying what does not fit) */
+static void nvmtl_fence_sig_flush_locked(void) {
+    if (!g_fence_sig_n) return;
+    if (pvkResetFences(g_dev, g_fence_sig_n, g_fence_sig) == VK_SUCCESS) {
+        atomic_fetch_add(&g_fence_batch_resets, 1); atomic_fetch_add(&g_fence_batch_fences, g_fence_sig_n);
+        for (unsigned i = 0; i < g_fence_sig_n; i++) {
+            if (g_fence_pool_n < NVMTL_FENCE_POOL_MAX) g_fence_pool[g_fence_pool_n++] = g_fence_sig[i];
+            else { pvkDestroyFence(g_dev, g_fence_sig[i], NULL); g_fence_made--; }
+        }
+    } else for (unsigned i = 0; i < g_fence_sig_n; i++) { pvkDestroyFence(g_dev, g_fence_sig[i], NULL); g_fence_made--; }
+    g_fence_sig_n = 0;
+}
 static VkResult nvmtl_fence_get(VkFence *out) {
     if (nvmtl_fence_pool_on()) {
+        const int batch = nvmtl_fence_batch_on();
         pthread_mutex_lock(&g_fence_pool_lock);
+        if (batch && !g_fence_pool_n && g_fence_sig_n && g_fence_made >= 2 * NVMTL_FENCE_BATCH) nvmtl_fence_sig_flush_locked();
         const VkFence f = g_fence_pool_n ? g_fence_pool[--g_fence_pool_n] : VK_NULL_HANDLE;
+        if (!f && batch) g_fence_made++;   /* counted before the create; undone below if it fails */
         pthread_mutex_unlock(&g_fence_pool_lock);
         if (f) { *out = f; return VK_SUCCESS; }
+        if (batch) {
+            VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            const VkResult r = pvkCreateFence(g_dev, &fci, NULL, out);
+            if (r != VK_SUCCESS) { pthread_mutex_lock(&g_fence_pool_lock); g_fence_made--; pthread_mutex_unlock(&g_fence_pool_lock); }
+            return r;
+        }
     }
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     return pvkCreateFence(g_dev, &fci, NULL, out);
 }
 // Only for a fence whose wait returned VK_SUCCESS.
 static void nvmtl_fence_put(VkFence f) {
+    if (nvmtl_fence_batch_on()) {
+        pthread_mutex_lock(&g_fence_pool_lock);
+        g_fence_sig[g_fence_sig_n++] = f;
+        if (g_fence_sig_n == NVMTL_FENCE_BATCH) nvmtl_fence_sig_flush_locked();
+        pthread_mutex_unlock(&g_fence_pool_lock);
+        return;
+    }
     if (nvmtl_fence_pool_on() && pvkResetFences(g_dev, 1, &f) == VK_SUCCESS) {
         pthread_mutex_lock(&g_fence_pool_lock);
         const int kept = g_fence_pool_n < NVMTL_FENCE_POOL_MAX;

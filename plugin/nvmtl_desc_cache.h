@@ -263,7 +263,8 @@ static VkDescriptorSet nvmtl_dc_lookup(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32
         pr->dep = NVMTL_DC_DEP_IMG | NVMTL_DC_DEP_BUF; __atomic_add_fetch(&g_dc_long, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
     nvmtl_dcache *dc = (nvmtl_dcache *)t->dc;
     if (!dc) {
-        dc = (nvmtl_dcache *)malloc(sizeof *dc);
+        dc = (nvmtl_dcache *)nvmtl_blk_get(&g_dcb_pool);   /* cut 1 item 2: reset below as a new block is */
+        if (!dc) dc = (nvmtl_dcache *)malloc(sizeof *dc);
         if (!dc) return VK_NULL_HANDLE;
         dc->n = dc->an = 0; memset(dc->e, 0, sizeof dc->e); dc->pins = NULL; dc->npin = dc->cappin = 0; t->dc = dc;
     }
