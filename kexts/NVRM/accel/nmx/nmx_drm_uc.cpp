@@ -431,8 +431,9 @@ private:
             if (!c.e[j].surfaceID || !nmxFtFlagsOk(c.e[j].flags)) { OSAddAtomic64(1, &nmx_fence_table_bad); return kIOReturnBadArgument; }
         if (!nmxFtApply(c.e, c.n, this)) {
             /* Every row in flight. The caller writes these marks to IOSurface properties instead, so the rows of this
-             * call's surfaces are dropped: one left behind would shadow those property values. The caller's other rows
-             * stay (they are still the newest values for their surfaces). */
+             * call's surfaces are dropped now: one left behind would shadow those property values. The NVMTL plugin also
+             * pauses and closes its connection on this (clientClose then drops its other rows too, since all of its
+             * marks go to properties while paused); dropping these here keeps a client that does not close correct. */
             nmxFtClearSurfaces(c.e, c.n);
             const SInt64 k = OSAddAtomic64(1, &nmx_fence_table_refused);
             if (k < 4) NMX_DRM_LOG("pid %d: fence table full (%d rows in flight), call refused, the rows of its surfaces dropped", proc_selfpid(), NMX_FT_ROWS);
