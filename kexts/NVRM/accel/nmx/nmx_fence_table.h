@@ -8,7 +8,9 @@
  * kNmxDrmSelFence) instead of IOSurfaceSetValues on every surface (two to three IOSurface property writes per surface
  * per frame in WindowServer). nmxSurfValue looks the six keys up here first and falls back to the surface's properties.
  *
- * Gate: debug.nmxaccel_fence_table (default 0). While it is 0 the selector answers kIOReturnUnsupported and
+ * Gate: debug.nmxaccel_fence_table (default 0; 1 = WindowServer only: uid 88 and process name WindowServer, checked
+ * when the connection is opened, other callers get kIOReturnNotPrivileged; 2 = any process, own-process tests only).
+ * While it is 0 the selector answers kIOReturnUnsupported and
  * nmxSurfValue never looks here, so behaviour is exactly the property path. The plugin side is NVMTL_NMX_FENCE_CALL
  * (default off); it falls back to properties for the rest of the process on Unsupported and on a refused call
  * (kIOReturnNoSpace: every row in flight). A refused call writes nothing and drops every row of that client, so no
@@ -57,11 +59,12 @@ enum { kNmxFkPending = 0, kNmxFkPendingT, kNmxFkSubmitted, kNmxFkDone, kNmxFkDon
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern int nmx_fence_table_on;   /* debug.nmxaccel_fence_table (registered by nvrm-accel.cpp) */
+extern int nmx_fence_table_on;   /* debug.nmxaccel_fence_table 0/1/2 (registered by nvrm-accel.cpp) */
 /* counters (debug.nmxaccel_fence_table_*) */
 extern int64_t nmx_fence_table_calls, nmx_fence_table_entries, nmx_fence_table_refused, nmx_fence_table_bad,
-               nmx_fence_table_hits, nmx_fence_table_misses, nmx_fence_table_evicted, nmx_fence_table_cleared;
-/* debug.nmxaccel_fence_table write: set the gate, clear every row */
+               nmx_fence_table_hits, nmx_fence_table_misses, nmx_fence_table_evicted, nmx_fence_table_cleared,
+               nmx_fence_table_stale, nmx_fence_table_denied;
+/* debug.nmxaccel_fence_table write (0, 1 or 2): set the gate, clear every row */
 void nmx_fence_table_set(int on);
 /* -1 when key is not one of the six; else kNmxFk* */
 int nmx_fence_key_index(const char *key);

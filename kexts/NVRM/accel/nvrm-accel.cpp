@@ -1346,12 +1346,12 @@ static int nmxaccel_fence_table_sysctl SYSCTL_HANDLER_ARGS
     int v = nmx_fence_table_on;
     const int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr) return err;
-    if (v != 0 && v != 1) return EINVAL;
+    if (v < 0 || v > 2) return EINVAL;
     nmx_fence_table_set(v);
     return 0;
 }
 SYSCTL_PROC(_debug, OID_AUTO, nmxaccel_fence_table, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
-            nmxaccel_fence_table_sysctl, "I", "1 = NVMTL fence marks through NMXDrmClient selector 3 (table), 0 = IOSurface properties only (default); a write clears the table");
+            nmxaccel_fence_table_sysctl, "I", "1 = NVMTL fence marks of WindowServer through NMXDrmClient selector 3 (table), 2 = any process (tests), 0 = IOSurface properties only (default); a write clears the table");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_calls, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_calls, "selector 3 calls while the table was on");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_entries, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_entries, "surface marks written to the table");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_refused, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_refused, "calls refused: every row in flight (the caller's rows dropped)");
@@ -1359,6 +1359,8 @@ SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_bad, CTLFLAG_RD | CTLFLAG_LOC
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_hits, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_hits, "fence key reads answered by the table");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_misses, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_misses, "fence key reads that went to the IOSurface property");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_evicted, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_evicted, "rows (not in flight) reused for another surface");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_stale, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_stale, "in-flight rows not written for 2 s reused for another surface");
+SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_denied, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_denied, "calls refused: not WindowServer (gate 1)");
 SYSCTL_QUAD(_debug, OID_AUTO, nmxaccel_fence_table_cleared, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&nmx_fence_table_cleared, "rows dropped on client close or refusal");
 static unsigned long long nmxSurfValue(IOSurface *s, const char *key)
 {
@@ -3243,6 +3245,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_misses);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_evicted);
     sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_cleared);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_stale);
+    sysctl_register_oid(&sysctl__debug_nmxaccel_fence_table_denied);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_sync);
     sysctl_register_oid(&sysctl__debug_nmxaccel_flip_api);

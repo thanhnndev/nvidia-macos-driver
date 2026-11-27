@@ -24,6 +24,8 @@
 #include <sys/vnode.h>
 #include <sys/vnode_if.h>
 #include <sys/proc.h>
+#include <sys/kauth.h>
+#include <kern/clock.h>
 #include <string.h>
 #include <libkern/OSAtomic.h>
 #include "nmx_fence_table.h"
@@ -52,6 +54,7 @@ enum {
  * clears the rows it owns. A new surface takes a free row, else the least recently written row that is not in flight
  * (Done >= Pending, or no Pending); when every row is in flight the call is refused and nothing is written. */
 int nmx_fence_table_on = 0;
+int64_t nmx_fence_table_stale, nmx_fence_table_denied;
 int64_t nmx_fence_table_calls, nmx_fence_table_entries, nmx_fence_table_refused, nmx_fence_table_bad,
         nmx_fence_table_hits, nmx_fence_table_misses, nmx_fence_table_evicted, nmx_fence_table_cleared;
 #define NMX_FT_ROWS 64
@@ -60,6 +63,7 @@ struct NmxFenceRow {
     uint32_t valid;            /* bit k: v[k] was written through the table */
     const void *owner;
     uint64_t tick;             /* last write, for eviction */
+    uint64_t when;             /* mach_absolute_time of the last write: an in-flight row older than 2 s is stale */
     unsigned long long v[kNmxFkCount];
 };
 static NmxFenceRow gFt[NMX_FT_ROWS];
@@ -113,28 +117,44 @@ static bool nmxFtFlagsOk(uint32_t f)
            f == NMX_FENCE_F_DONE;
 }
 /* the call's entries, already validated and copied to kernel memory: all applied, or none (false = no row free).
- * Rows are chosen first without touching the table (a bitmap of the rows taken), then written. */
+ * Rows are chosen first without touching the table, then written:
+ *   1. every entry whose surface already has a row claims it (a bitmap of the rows taken),
+ *   2. then the others, in order, get a free row, else the least recently written row that is not in flight, else the
+ *      oldest in-flight row not written for 2 s (stale: its surface was freed, or its Done was lost), never a row
+ *      step 1 claimed. Claiming first matters: a new surface must not evict the row of a surface later in the same call
+ *      (that entry would then land on the new surface's row and overwrite it, losing its Pending). */
 static bool nmxFtApply(const nmx_fence_entry_v1 *e, uint32_t n, const void *owner)
 {
     IOSimpleLock *l = nmxFtLock();
     if (!l) return false;
+    static uint64_t staleAbs;
+    if (!staleAbs) nanoseconds_to_absolutetime(2000000000ull, &staleAbs);
+    const uint64_t now = mach_absolute_time();
     int slot[NMX_FENCE_CALL_MAX];
     uint64_t taken = 0;
-    uint32_t evicted = 0;
+    uint32_t evicted = 0, stale = 0;
     bool ok = true;
     IOSimpleLockLock(l);
-    for (uint32_t j = 0; j < n && ok; j++) {
-        int at = -1, freeAt = -1, evictAt = -1;
-        for (uint32_t p = 0; p < j && at < 0; p++) if (e[p].surfaceID == e[j].surfaceID) at = slot[p];
-        for (int i = 0; i < NMX_FT_ROWS && at < 0; i++) {
-            if (gFt[i].sid == e[j].surfaceID) at = i;
-            else if (taken & (1ull << i)) continue;
-            else if (!gFt[i].sid) { if (freeAt < 0) freeAt = i; }
-            else if (!nmxFtBusy(gFt[i]) && (evictAt < 0 || gFt[i].tick < gFt[evictAt].tick)) evictAt = i;
+    for (uint32_t j = 0; j < n; j++) {                       /* 1: surfaces that have a row */
+        slot[j] = -1;
+        for (int i = 0; i < NMX_FT_ROWS; i++)
+            if (gFt[i].sid == e[j].surfaceID) { slot[j] = i; taken |= 1ull << i; break; }
+    }
+    for (uint32_t j = 0; j < n && ok; j++) {                 /* 2: the others */
+        if (slot[j] >= 0) continue;
+        for (uint32_t p = 0; p < j && slot[j] < 0; p++) if (e[p].surfaceID == e[j].surfaceID) slot[j] = slot[p];
+        if (slot[j] >= 0) continue;
+        int freeAt = -1, evictAt = -1, staleAt = -1;
+        for (int i = 0; i < NMX_FT_ROWS; i++) {
+            if (taken & (1ull << i)) continue;
+            if (!gFt[i].sid) { freeAt = i; break; }
+            if (!nmxFtBusy(gFt[i])) { if (evictAt < 0 || gFt[i].tick < gFt[evictAt].tick) evictAt = i; }
+            else if (now - gFt[i].when > staleAbs && (staleAt < 0 || gFt[i].tick < gFt[staleAt].tick)) staleAt = i;
         }
-        if (at < 0) at = freeAt >= 0 ? freeAt : evictAt;
-        if (at < 0) ok = false;
-        else { slot[j] = at; taken |= 1ull << at; }
+        const int at = freeAt >= 0 ? freeAt : evictAt >= 0 ? evictAt : staleAt;
+        if (at < 0) { ok = false; break; }
+        if (at == staleAt && freeAt < 0 && evictAt < 0) stale++;
+        slot[j] = at; taken |= 1ull << at;
     }
     if (ok) {
         const uint64_t tick = ++gFtTick;
@@ -157,17 +177,21 @@ static bool nmxFtApply(const nmx_fence_entry_v1 *e, uint32_t n, const void *owne
             }
             r.owner = owner;
             r.tick = tick;
+            r.when = now;
         }
+    } else {
+        stale = 0;
     }
     IOSimpleLockUnlock(l);
     if (evicted) OSAddAtomic64(evicted, &nmx_fence_table_evicted);
+    if (stale) OSAddAtomic64(stale, &nmx_fence_table_stale);
     return ok;
 }
 extern "C" void nmx_fence_table_set(int on)
 {
     IOSimpleLock *l = nmxFtLock();
     if (l) IOSimpleLockLock(l);
-    nmx_fence_table_on = on ? 1 : 0;
+    nmx_fence_table_on = on;
     bzero(gFt, sizeof gFt);
     if (l) IOSimpleLockUnlock(l);
 }
@@ -188,12 +212,17 @@ class NMXDrmClient : public IOUserClient {
     vnode_t  fVp = nullptr;
     IORWLock *fLock = nullptr;
     int      fMajor = -1, fMinor = -1;
+    bool     fFenceWs = false;           /* opened by WindowServer (uid 88 _windowserver, name WindowServer) */
     static volatile SInt32 sOpens;
     static volatile SInt32 sMajor;           /* NMXGPU's devfs major, learnt from the first open (-1 = not yet) */
 public:
     bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE {
         if (!IOUserClient::initWithTask(owningTask, securityID, type)) return false;
         fTask = owningTask;
+        /* IOServiceOpen runs on the opening thread: current proc/cred are the client's */
+        char name[32] = "";
+        proc_selfname(name, (int)sizeof name);
+        fFenceWs = owningTask == current_task() && kauth_getuid() == 88 && strcmp(name, "WindowServer") == 0;
         fLock = IORWLockAlloc();
         return fLock != nullptr;
     }
@@ -366,6 +395,9 @@ private:
      * combinations only, no scalars, no struct output, no out-of-line input. */
     IOReturn selFence(IOExternalMethodArguments *a) {
         if (!nmx_fence_table_on) return kIOReturnUnsupported;
+        /* only WindowServer may write fence rows (any other process could make WindowServer's frames wait or flip
+         * early); gate 2 lets any process call, for own-process tests only */
+        if (nmx_fence_table_on != 2 && !fFenceWs) { OSAddAtomic64(1, &nmx_fence_table_denied); return kIOReturnNotPrivileged; }
         OSAddAtomic64(1, &nmx_fence_table_calls);
         const uint32_t sz = a->structureInputSize;
         if (a->scalarInputCount || a->scalarOutputCount || a->structureOutputSize || a->structureInputDescriptor ||

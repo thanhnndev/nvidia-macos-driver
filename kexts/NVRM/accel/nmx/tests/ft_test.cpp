@@ -12,6 +12,9 @@ static void IOSimpleLockFree(IOSimpleLock*l){ free(l); }
 static void IOSimpleLockLock(IOSimpleLock*l){ if(*l) {puts("LOCK REENTERED"); exit(2);} *l=1; }
 static void IOSimpleLockUnlock(IOSimpleLock*l){ *l=0; }
 static SInt64 OSAddAtomic64(SInt64 v, int64_t *p){ SInt64 o=*p; *p+=v; return o; }
+static uint64_t gNow = 1000;
+static uint64_t mach_absolute_time(void){ return gNow; }
+static void nanoseconds_to_absolutetime(uint64_t ns, uint64_t *a){ *a = ns; }   /* test clock: 1 unit = 1 ns */
 static bool OSCompareAndSwapPtr(void*o, void*n, void*volatile*p){ if(*p==o){*p=n;return true;} return false; }
 #include "nmx_fence_table.h"
 #include "ft_body.inc"
@@ -49,6 +52,30 @@ int main(){
   // gate write clears all; off -> no answers
   nmx_fence_table_set(0); G(101,kNmxFkPending,&hit); CHECK(!hit);
   nmx_fence_table_set(1); G(101,kNmxFkPending,&hit); CHECK(!hit);
+  // review 2026-11-27 (1): with a full table, [A new, B existing and the LRU row not in flight] must keep both.
+  // Before the fix A evicted B's row, B then landed on the same row and overwrote A (A's Pending lost).
+  {
+    nmx_fence_table_set(1);
+    for(uint32_t i=0;i<64;i++){ nmx_fence_entry_v1 e[]={E(1000+i,NMX_FENCE_F_PENDING,1)}; CHECK(nmxFtApply(e,1,&B)); }
+    { nmx_fence_entry_v1 e[]={E(1000,NMX_FENCE_F_DONE,1)}; CHECK(nmxFtApply(e,1,&B)); }      // 1000: oldest... now newest tick
+    for(uint32_t i=1;i<64;i++){ nmx_fence_entry_v1 e[]={E(1000+i,NMX_FENCE_F_PENDING,2)}; CHECK(nmxFtApply(e,1,&B)); }  // 1000 is the LRU, done
+    nmx_fence_entry_v1 e[]={E(2000,NMX_FENCE_F_PENDING,7), E(1000,NMX_FENCE_F_PENDING,8)};
+    CHECK(!nmxFtApply(e,2,&B));                         // 1000 is claimed by its own entry, no other row is free: refused
+    CHECK(G(1000,kNmxFkPending)==1); G(2000,kNmxFkPending,&hit); CHECK(!hit);
+    // same with a free-able row: one more surface done -> A takes that row, B keeps its own
+    { nmx_fence_entry_v1 d[]={E(1001,NMX_FENCE_F_DONE,2)}; CHECK(nmxFtApply(d,1,&B)); }
+    CHECK(nmxFtApply(e,2,&B));
+    CHECK(G(2000,kNmxFkPending)==7); CHECK(G(1000,kNmxFkPending)==8);
+    G(1001,kNmxFkPending,&hit); CHECK(!hit);            // 1001 was the one evicted
+    // stale (3): every row in flight, none written for 2 s -> the oldest in-flight row is reused
+    { nmx_fence_entry_v1 p[]={E(1000,NMX_FENCE_F_PENDING,9)}; CHECK(nmxFtApply(p,1,&B)); }   // 1000 in flight again
+    { nmx_fence_entry_v1 x[]={E(3000,NMX_FENCE_F_PENDING,1)}; CHECK(!nmxFtApply(x,1,&B)); }  // all in flight, fresh
+    gNow += 2000000001ull;
+    int64_t s0=nmx_fence_table_stale;
+    { nmx_fence_entry_v1 x[]={E(3000,NMX_FENCE_F_PENDING,1)}; CHECK(nmxFtApply(x,1,&B)); }
+    CHECK(nmx_fence_table_stale-s0==1); CHECK(G(3000,kNmxFkPending)==1);
+    nmx_fence_table_set(0); nmx_fence_table_set(1);
+  }
   CHECK(nmxFtFlagsOk(1)&&nmxFtFlagsOk(3)&&nmxFtFlagsOk(2)&&nmxFtFlagsOk(4)); CHECK(!nmxFtFlagsOk(0)&&!nmxFtFlagsOk(5)&&!nmxFtFlagsOk(6)&&!nmxFtFlagsOk(7)&&!nmxFtFlagsOk(8));
   printf("%s (%d failures)\n", fails?"FAIL":"PASS", fails); return fails!=0;
 }
