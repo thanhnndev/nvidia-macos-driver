@@ -463,6 +463,7 @@ private:
     volatile UInt32 fCurArmed = 0;      // fCurWork entered and not yet run
     volatile UInt32 fCurNeedImg = 1;    // upload the image on the next commit (first one, re-arm after a bridge commit)
     volatile SInt32 fCurBusy = 0;       // callers inside the cursor code (teardown waits them out)
+    volatile SInt32 fCurRun = 0;        // fCurWork callbacks running (whole body, curEnter included)
     volatile uint64_t fCurLastAt = 0;   // mach time of the last commit
     uint32_t fCurDone = 0;              // fCurWork: the image seq last committed
     uint32_t fCurFails = 0;             // fCurWork: commits failed in a row (retry bounded)
@@ -522,9 +523,19 @@ private:
     }
     static void curWorkFire(thread_call_param_t p, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p;
-        if (!me->curEnter()) return;
-        me->curWork();
-        me->curLeave();
+        OSIncrementAtomic(&me->fCurRun);
+        if (me->curEnter()) {
+            me->curWork();
+            me->curLeave();
+        }
+        OSDecrementAtomic(&me->fCurRun);
+    }
+    /* thread context: wait until *n is 0 (IOSleep: a commit can take a frame, DM's flip_done timeout on a hang) */
+    void curWaitZero(volatile SInt32 *n, const char *what) {
+        for (int i = 0; __atomic_load_n(n, __ATOMIC_SEQ_CST); i++) {
+            if (i == 1000) FBLOG("cursor: teardown still waiting for %d %s", (int)*n, what);
+            IOSleep(1);
+        }
     }
     void curWork() {
         __atomic_store_n(&fCurArmed, 0, __ATOMIC_SEQ_CST);     // changes from here on enter the call again (ONCE:
@@ -602,8 +613,13 @@ private:
     void curFree(uint32_t side) {
         const size_t bytes = (size_t)side * side * 4;
         if (fCurWork) {
-            thread_call_cancel_wait(fCurWork);              // cancels a pending run, or waits for the running one
-            while (!thread_call_free(fCurWork)) { thread_call_cancel_wait(fCurWork); IOSleep(1); }
+            /* thread_call_cancel_wait is kpi.private (not bound for third-party kexts): exported calls only.
+             * fCurSide is 0 here (or was never set), so a run that starts now leaves at curEnter without touching
+             * the buffers; thread_call_free fails while a run is queued or rescheduled (ONCE), and fCurRun covers a
+             * run still inside the callback. */
+            thread_call_cancel(fCurWork);
+            while (!thread_call_free(fCurWork)) { thread_call_cancel(fCurWork); IOSleep(1); }
+            curWaitZero(&fCurRun, "cursor callback(s)");
             fCurWork = nullptr;
         }
         uint32_t **bufs[3] = { &fCurStage[0], &fCurStage[1], &fCurCopy };
@@ -616,11 +632,10 @@ private:
         if (!side) return;
         __atomic_store_n(&sCurFb, (NMXAMDFB *)nullptr, __ATOMIC_SEQ_CST);
         nmx_fb_cursor_set_kick(nullptr, nullptr);           // returns when no re-arm is inside curKick
-        if (fCurWork) thread_call_cancel_wait(fCurWork);    // a run asleep in a commit finishes first
-        for (int n = 0; __atomic_load_n(&fCurBusy, __ATOMIC_SEQ_CST); n++) {
-            if (n == 100000) FBLOG("cursor: teardown still waiting for %d caller(s)", (int)fCurBusy);
-            IODelay(10);
-        }
+        if (fCurWork) thread_call_cancel(fCurWork);         // a pending run: gone (a running one is waited for below)
+        /* fCurSide is 0: no new entries. Every caller inside, including a run asleep in a commit (it is inside
+         * curEnter / curLeave), finishes before anything is freed or the plane is turned off. */
+        curWaitZero(&fCurBusy, "caller(s)");
         curFree(side);
         { NmxEntry entry; if (!entry.err) nmx_fb_cursor_off(); }
         nmx_hwcursor_avail = 0;
