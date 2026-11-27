@@ -343,13 +343,37 @@ private:
         }
         OSDecrementAtomic(&fDelivering);
     }
+    /*
+     * fVblRun counts the vblank thread-call runs entered and not finished (queued + running). thread_call_free does
+     * not wait for a running callback (this kernel waits only for a ONCE + SIGNAL call; ours are neither), so stop()
+     * waits for this count instead. Counted before the enter; an enter that replaced a queued run (TRUE), a cancel
+     * that removed one (TRUE) and the end of each callback take one off. After fStopping no new run is entered.
+     */
+    volatile SInt32 fVblRun = 0;
+    bool vblCount() {
+        OSIncrementAtomic(&fVblRun);
+        if (!__atomic_load_n(&fStopping, __ATOMIC_SEQ_CST)) return true;
+        OSDecrementAtomic(&fVblRun);
+        return false;
+    }
+    void vblEnter(thread_call_t tc) {                       // any context, never sleeps
+        if (tc && vblCount() && thread_call_enter(tc)) OSDecrementAtomic(&fVblRun);
+    }
+    void vblEnterAt(thread_call_t tc, uint64_t d) {
+        if (tc && vblCount() && thread_call_enter_delayed(tc, d)) OSDecrementAtomic(&fVblRun);
+    }
+    void vblCancel(thread_call_t tc) { if (tc && thread_call_cancel(tc)) OSDecrementAtomic(&fVblRun); }
     /* IH thread (dm_crtc_high_irq): no locks, no sleeping, only the hand-over */
     static void vblSink(void *p0, uint64_t now) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
         __atomic_store_n(&me->fHwVblAt, now, __ATOMIC_RELEASE);
-        if (!me->fStopping && me->fVblHw && vblIrqMode() && me->fRefHeld) thread_call_enter(me->fVblHw);
+        if (!me->fStopping && me->fVblHw && vblIrqMode() && me->fRefHeld) me->vblEnter(me->fVblHw);
     }
-    static void vblHwFire(thread_call_param_t p0, thread_call_param_t) {
+    static void vblHwFire(thread_call_param_t p0, thread_call_param_t p1) {
+        vblHwRun(p0, p1);
+        OSDecrementAtomic(&((NMXAMDFB *)p0)->fVblRun);    // the last access to the framebuffer in this run
+    }
+    static void vblHwRun(thread_call_param_t p0, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
         if (!me->fStopping && vblIrqMode() && me->fRefHeld) {
             me->vblDeliver();
@@ -361,11 +385,15 @@ private:
             uint64_t period;
             nanoseconds_to_absolutetime(fFrameNs, &period);
             fVblNext = mach_absolute_time() + period;
-            thread_call_enter_delayed(fVblTimer, fVblNext);
+            vblEnterAt(fVblTimer, fVblNext);
         }
     }
     /* thread call: take or drop the DRM vblank reference to match the registrations (drm_crtc_vblank_get may sleep) */
-    static void vblRefFire(thread_call_param_t p0, thread_call_param_t) {
+    static void vblRefFire(thread_call_param_t p0, thread_call_param_t p1) {
+        vblRefRun(p0, p1);
+        OSDecrementAtomic(&((NMXAMDFB *)p0)->fVblRun);
+    }
+    static void vblRefRun(thread_call_param_t p0, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
         if (me->fStopping || !me->fRefLock) return;
         IOLockLock(me->fRefLock);
@@ -380,7 +408,11 @@ private:
         IOLockUnlock(me->fRefLock);
         me->vblArmTimer();
     }
-    static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+    static void vblFire(thread_call_param_t p0, thread_call_param_t p1) {
+        vblRun(p0, p1);
+        OSDecrementAtomic(&((NMXAMDFB *)p0)->fVblRun);
+    }
+    static void vblRun(thread_call_param_t p0, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p0;
         if (me->fStopping) return;
         uint64_t period;
@@ -388,7 +420,7 @@ private:
         uint64_t now = mach_absolute_time();
         if (vblIrqMode()) {
             if (!me->vblWanted()) {
-                if (me->fRefHeld && me->fVblRef) thread_call_enter(me->fVblRef);
+                if (me->fRefHeld && me->fVblRef) me->vblEnter(me->fVblRef);
                 __atomic_store_n(&me->fTimerIdle, 1, __ATOMIC_RELEASE);   // vblRefFire re-arms when one turns on
                 if (me->vblWanted()) me->vblArmTimer();   // ... unless that happened between the check and the store
                 return;
@@ -402,18 +434,18 @@ private:
                 uint64_t watch;
                 nanoseconds_to_absolutetime(kVblWatchMs * 1000000ull, &watch);
                 me->fVblNext = now + watch;     // the CRTC delivers: only watch
-                thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
+                me->vblEnterAt(me->fVblTimer, me->fVblNext);
                 return;
             }
             /* fallback frame: no reference (CRTC off when asked) or the IRQ went quiet; ask again about once a second */
-            if (!me->fRefHeld && me->fVblRef && (++me->fRefRetry % 64) == 0) thread_call_enter(me->fVblRef);
+            if (!me->fRefHeld && me->fVblRef && (++me->fRefRetry % 64) == 0) me->vblEnter(me->fVblRef);
         } else if (me->fRefHeld && me->fVblRef) {
-            thread_call_enter(me->fVblRef);     // switched to the old path: drop the reference
+            me->vblEnter(me->fVblRef);          // switched to the old path: drop the reference
         }
         nmx_ft_vbl_timer(me->fFrameNs);
         me->vblDeliver();
         me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
-        thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
+        me->vblEnterAt(me->fVblTimer, me->fVblNext);
     }
 
 private:
@@ -463,7 +495,7 @@ private:
     volatile UInt32 fCurArmed = 0;      // fCurWork entered and not yet run
     volatile UInt32 fCurNeedImg = 1;    // upload the image on the next commit (first one, re-arm after a bridge commit)
     volatile SInt32 fCurBusy = 0;       // callers inside the cursor code (teardown waits them out)
-    volatile SInt32 fCurRun = 0;        // fCurWork callbacks running (whole body, curEnter included)
+    volatile SInt32 fCurRun = 0;        // fCurWork runs entered and not finished (queued, rescheduled or running)
     volatile uint64_t fCurLastAt = 0;   // mach time of the last commit
     uint32_t fCurDone = 0;              // fCurWork: the image seq last committed
     uint32_t fCurFails = 0;             // fCurWork: commits failed in a row (retry bounded)
@@ -492,7 +524,8 @@ private:
         d = __atomic_load_n(&fCurLastAt, __ATOMIC_RELAXED) + frame;
         if (d < now) d = now;
         if (afterNs) { uint64_t a; nanoseconds_to_absolutetime(afterNs, &a); if (d < now + a) d = now + a; }
-        thread_call_enter_delayed(fCurWork, d);
+        OSIncrementAtomic(&fCurRun);                        // counted before the enter (curFree waits for it)
+        if (thread_call_enter_delayed(fCurWork, d)) OSDecrementAtomic(&fCurRun);   // replaced a queued run
     }
     /* the bridge's re-arm (its own commits disabled the plane, the display came back): re-upload and re-commit.
      * The bridge holds its own busy count around this call (nmx_fb_cursor_set_kick(NULL) waits it out). */
@@ -523,12 +556,11 @@ private:
     }
     static void curWorkFire(thread_call_param_t p, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p;
-        OSIncrementAtomic(&me->fCurRun);
         if (me->curEnter()) {
             me->curWork();
             me->curLeave();
         }
-        OSDecrementAtomic(&me->fCurRun);
+        OSDecrementAtomic(&me->fCurRun);                   // counted in curArm; the last access to the framebuffer
     }
     /* thread context: wait until *n is 0 (IOSleep: a commit can take a frame, DM's flip_done timeout on a hang) */
     void curWaitZero(volatile SInt32 *n, const char *what) {
@@ -614,12 +646,18 @@ private:
         const size_t bytes = (size_t)side * side * 4;
         if (fCurWork) {
             /* thread_call_cancel_wait is kpi.private (not bound for third-party kexts): exported calls only.
-             * fCurSide is 0 here (or was never set), so a run that starts now leaves at curEnter without touching
-             * the buffers; thread_call_free fails while a run is queued or rescheduled (ONCE), and fCurRun covers a
-             * run still inside the callback. */
-            thread_call_cancel(fCurWork);
-            while (!thread_call_free(fCurWork)) { thread_call_cancel(fCurWork); IOSleep(1); }
-            curWaitZero(&fCurRun, "cursor callback(s)");
+             * thread_call_free does not wait for a running callback (this kernel, 25.x: it waits only for a ONCE call
+             * allocated with the private SIGNAL option), so fCurRun counts every run from its enter (curArm) to the
+             * end of its callback; thread_call_cancel returns TRUE for a queued run and for a ONCE reschedule (it
+             * clears it), and that run is taken off here. No run is entered any more: fCurSide is 0 and no caller is
+             * inside (curArm runs only inside curEnter, or from the callback itself, which this loop waits out). */
+            for (int n = 0;; n++) {
+                if (thread_call_cancel(fCurWork)) OSDecrementAtomic(&fCurRun);
+                if (!__atomic_load_n(&fCurRun, __ATOMIC_SEQ_CST)) break;
+                if (n == 1000) FBLOG("cursor: teardown still waiting for %d cursor run(s)", (int)fCurRun);
+                IOSleep(1);
+            }
+            while (!thread_call_free(fCurWork)) { thread_call_cancel(fCurWork); IOSleep(1); }   // not expected
             fCurWork = nullptr;
         }
         uint32_t **bufs[3] = { &fCurStage[0], &fCurStage[1], &fCurCopy };
@@ -632,7 +670,7 @@ private:
         if (!side) return;
         __atomic_store_n(&sCurFb, (NMXAMDFB *)nullptr, __ATOMIC_SEQ_CST);
         nmx_fb_cursor_set_kick(nullptr, nullptr);           // returns when no re-arm is inside curKick
-        if (fCurWork) thread_call_cancel(fCurWork);         // a pending run: gone (a running one is waited for below)
+        if (fCurWork && thread_call_cancel(fCurWork)) OSDecrementAtomic(&fCurRun);   // a queued run: gone
         /* fCurSide is 0: no new entries. Every caller inside, including a run asleep in a commit (it is inside
          * curEnter / curLeave), finishes before anything is freed or the plane is turned off. */
         curWaitZero(&fCurBusy, "caller(s)");
@@ -781,7 +819,7 @@ public:
             uint64_t d;
             clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
             fVblNext = d;
-            thread_call_enter_delayed(fVblTimer, d);
+            vblEnterAt(fVblTimer, d);
         }
         /* the power driver is registered in open(): see there */
         FBLOG("framebuffer %ux%u at %u.%02u Hz", fInfo.width, fInfo.height, fRefresh16 >> 16,
@@ -790,7 +828,7 @@ public:
     }
 
     void stop(IOService *provider) override {
-        fStopping = true;
+        __atomic_store_n(&fStopping, true, __ATOMIC_SEQ_CST);  // vblCount refuses new vblank runs from here
         fLcd = false;
         curTeardown();
         teardownWakeWork();
@@ -799,13 +837,20 @@ public:
             fBacklight->detach(this);
             OSSafeReleaseNULL(fBacklight);
         }
-        /* thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out */
+        /* thread_call_cancel_wait is kpi.private, and thread_call_free does not wait for a running callback: cancel
+         * what is queued and wait until fVblRun is 0 (no run queued or inside a callback; none can be entered after
+         * fStopping, and a running one may still enter another, which the next cancel removes). Only then free. */
         nmx_fb_vbl_set_sink(nullptr, nullptr);     // returns once no CRTC vblank is inside vblSink
         thread_call_t *tcs[3] = { &fVblTimer, &fVblHw, &fVblRef };
+        for (int n = 0;; n++) {
+            for (thread_call_t *tc : tcs) vblCancel(*tc);
+            if (!__atomic_load_n(&fVblRun, __ATOMIC_SEQ_CST)) break;
+            if (n == 1000) FBLOG("vblank: stop still waiting for %d thread-call run(s)", (int)fVblRun);
+            IOSleep(1);
+        }
         for (thread_call_t *tc : tcs) {
             if (!*tc) continue;
-            thread_call_cancel(*tc);
-            while (!thread_call_free(*tc)) { thread_call_cancel(*tc); IOSleep(5); }
+            while (!thread_call_free(*tc)) { thread_call_cancel(*tc); IOSleep(5); }   // not expected: nothing queued
             *tc = nullptr;
         }
         if (fRefHeld) { nmx_fb_vbl_ref(0); fRefHeld = 0; }
@@ -956,7 +1001,7 @@ public:
             __atomic_store_n(&slot->proc, proc, __ATOMIC_RELEASE);
             fVblLast = slot;
             if (iref) *iref = slot;
-            if (fVblRef) thread_call_enter(fVblRef);
+            vblEnter(fVblRef);
             return kIOReturnSuccess;
         }
         if (type == kIOFBConnectInterruptType) { fConnect = { proc, target, ref }; if (iref) *iref = &fConnect; return kIOReturnSuccess; }
@@ -978,7 +1023,7 @@ public:
             // the caller may free target/refcon on return: wait out a delivery that read the old proc (IOFramebuffer's
             // VBL handler is interrupt-safe and takes no gate, so this cannot wait on the caller)
             for (int n = 0; __atomic_load_n(&fDelivering, __ATOMIC_SEQ_CST) && n < 1000; n++) IODelay(10);
-            if (fVblRef) thread_call_enter(fVblRef);
+            vblEnter(fVblRef);
         } else if (iref == &fConnect) {
             fConnect.proc = nullptr;
         }
@@ -990,7 +1035,7 @@ public:
         const bool on = state == kEnabledInterruptState;
         if (q->on != on) {
             q->on = on;
-            if (fVblRef) thread_call_enter(fVblRef);
+            vblEnter(fVblRef);
         }
         return kIOReturnSuccess;
     }
