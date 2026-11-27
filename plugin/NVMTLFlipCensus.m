@@ -253,6 +253,7 @@ static void nvmtl_flc_trigger_poll(void)
     g_flc_pres = g_flc_pres_client = g_flc_pres_ownonly = g_flc_pres_none = g_flc_pres_nobig = 0;
     g_flc_same = g_flc_diff = g_flc_big_switch = 0; memset(g_flc_cls_pres, 0, sizeof g_flc_cls_pres);
     g_flc_cur_client = g_flc_cur_own = g_flc_cur_big = 0; g_flc_cur_cls = 0;
+    g_flc_prev_present_sid = g_flc_last_big_sid = 0;   // no same/switch compare against a present from before the window
     os_unfair_lock_unlock(&g_flc_lock);
     g_flc_trig = 1;
     __atomic_store_n(&g_flc, 1, __ATOMIC_RELEASE);

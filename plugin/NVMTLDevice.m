@@ -1416,7 +1416,10 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         }
         capFrom = i;
     }
-    {   // F2: what stays idle, per distinct surface, by age (read-only; the rules above do not use it)
+    // F2: what stays idle, per distinct surface, by age (read-only; the rules above do not use it). Only in the last 5 s
+    // before a 30 s report is due (the sweep runs on WindowServer's main thread under the device lock); the 5 s timer
+    // sweeps the table in that window whenever it has entries, so the report always has a recent value.
+    if (!nvmtl_sk.lastLogMs || now - nvmtl_sk.lastLogMs >= 25000) {
         CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL); uint64_t sb = 0, age[5] = { 0 }, ns = 0;
         for (NSUInteger j = capFrom; j < idle.count; j++) { NVMTLSurfKeep *e = keep[idle[j]]; NVMTLTexture *b = e->_tex;
             if (!b->_surf || CFSetContainsValue(seen, b->_surf)) continue;
@@ -1465,10 +1468,11 @@ static dispatch_queue_t nvmtl_sk_sweep_q(void) {
 // NVMTL_KEEP_PRESSURE=0: no source (the 1.x behaviour). One source per device, created with the device's first keep
 // entry, held by the device like its timer; the handler holds the device only for one sweep.
 static char nvmtl_surface_keep_press_key;
-static void nvmtl_surface_keep_pressure(id d, unsigned long ev) {
+// Fills msg with the event's log line (returns 1) for the caller to log after it leaves @synchronized(device).
+static int nvmtl_surface_keep_pressure(id d, unsigned long ev, char *msg, size_t msgLen) {
     const int lvl = (ev & DISPATCH_MEMORYPRESSURE_CRITICAL) ? 2 : (ev & DISPATCH_MEMORYPRESSURE_WARN) ? 1 : 0;
     pthread_mutex_lock(&g_sk_lock);
-    if (!lvl) { nvmtl_sk.pressNormal++; pthread_mutex_unlock(&g_sk_lock); return; }
+    if (!lvl) { nvmtl_sk.pressNormal++; pthread_mutex_unlock(&g_sk_lock); return 0; }
     const uint64_t now = nvmtl_keep_now_ms(), before = nvmtl_sk_cap_now(now);
     if (lvl == 2) nvmtl_sk.pressCrit++; else nvmtl_sk.pressWarn++;
     nvmtl_sk_capPress = lvl == 2 ? MIN(nvmtl_sk_capBase, 128ull << 20) : nvmtl_sk_capBase / 2;
@@ -1478,16 +1482,18 @@ static void nvmtl_surface_keep_pressure(id d, unsigned long ev) {
     NSMutableDictionary *keep = objc_getAssociatedObject(d, &nvmtl_surface_keep_key);
     const unsigned long n0 = keep.count;
     if (n0) nvmtl_surface_keep_locked(d, nil, nil, lvl);
-    nvlog_report("surface keep: memory pressure %s: dropped %llu idle entries (%llu MB, counted per surface) of %lu; idle cap %llu -> %llu MB for 60 s",
-                 lvl == 2 ? "CRITICAL" : "WARN", nvmtl_sk_pressN, nvmtl_sk_pressFreed >> 20, n0,
-                 (unsigned long long)(before >> 20), (unsigned long long)(nvmtl_sk_cap_now(now) >> 20));
+    snprintf(msg, msgLen, "surface keep: memory pressure %s: dropped %llu idle entries (%llu MB, counted per surface) of %lu; idle cap %llu -> %llu MB for 60 s",
+             lvl == 2 ? "CRITICAL" : "WARN", nvmtl_sk_pressN, nvmtl_sk_pressFreed >> 20, n0,
+             (unsigned long long)(before >> 20), (unsigned long long)(nvmtl_sk_cap_now(now) >> 20));
     pthread_mutex_unlock(&g_sk_lock);
+    return 1;
 }
 #if !NVMTL_RELEASE
 // tests/keeppress_test.m: runs the pressure handler exactly as the dispatch source does (same queue, same lock), so the
 // rules can be checked in one process without putting the whole machine under memory pressure. Not in release builds.
 __attribute__((visibility("default"))) void nvmtl_test_keep_pressure(id dev, unsigned long ev) {
-    dispatch_sync(nvmtl_sk_sweep_q(), ^{ @synchronized (dev) { nvmtl_surface_keep_pressure(dev, ev); } });
+    dispatch_sync(nvmtl_sk_sweep_q(), ^{ char m[256]; int lg; @synchronized (dev) { lg = nvmtl_surface_keep_pressure(dev, ev, m, sizeof m); }
+                                         if (lg) nvlog_report("%s", m); });
 }
 #endif
 static void nvmtl_surface_keep_pressure_source(id dev) {
@@ -1505,7 +1511,9 @@ static void nvmtl_surface_keep_pressure_source(id dev) {
         id d = wdev;
         if (!d) { if (me) dispatch_source_cancel(me); return; }
         const unsigned long ev = me ? dispatch_source_get_data(me) : 0;
-        @synchronized (d) { nvmtl_surface_keep_pressure(d, ev); }   // the insert path and the timer hold this lock too
+        char m[256]; int lg;
+        @synchronized (d) { lg = nvmtl_surface_keep_pressure(d, ev, m, sizeof m); }   // the insert path and the timer hold this lock too
+        if (lg) nvlog_report("%s", m);   // logged after the device lock is dropped
     });
     objc_setAssociatedObject(dev, &nvmtl_surface_keep_press_key, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     dispatch_resume(s);
