@@ -1075,9 +1075,13 @@ static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
 // ever touched after its keep entry went).
 // Miss accounting, so a boot log says why WindowServer imports a surface again (a new surface, the same surface
 // under another key, or a surface whose entry the sweep dropped, and why). Under @synchronized(device) like the rest.
-enum { NVMTL_GONE_UNHELD = 1, NVMTL_GONE_EXPIRED = 2, NVMTL_GONE_CAP = 3, NVMTL_GONE_DEAD = 4, NVMTL_GONE_SHADOW = 5 };
-static struct { uint64_t hits, misses, fresh, otherKey, gone[6], shadowDrops, shadowBytes, shadowBack[4], deadDrops, deadBytes, sweeps, sweepNsMax, sweepNsSum, logged, lastLogMs, drops, idleBytes, maxSweepDrops,
-                expBack[4], expLogged, heldRefresh, viewRefresh, useRefresh, capBack[4], capLogged, sweepSkips, okLogged; } nvmtl_sk;
+enum { NVMTL_GONE_UNHELD = 1, NVMTL_GONE_EXPIRED = 2, NVMTL_GONE_CAP = 3, NVMTL_GONE_DEAD = 4, NVMTL_GONE_SHADOW = 5, NVMTL_GONE_PRESSURE = 6 };
+static struct { uint64_t hits, misses, fresh, otherKey, gone[8], shadowDrops, shadowBytes, shadowBack[4], deadDrops, deadBytes, sweeps, sweepNsMax, sweepNsSum, logged, lastLogMs, drops, idleBytes, maxSweepDrops,
+                expBack[4], expLogged, heldRefresh, viewRefresh, useRefresh, capBack[4], capLogged, sweepSkips, okLogged;
+                // roadmap 4 F2 (2026-11-27): idle memory per distinct IOSurface (idleBytes above sums every entry: two planes or
+                // two keys of one surface count it twice), its age by MB, and when expired surfaces came back, finer
+                // F1: memory-pressure events and their drops
+                uint64_t idleSurfaces, idleSurfBytes, idleAgeBytes[5], expBack7[7], pressWarn, pressCrit, pressNormal, pressDrops, pressBytes, pressBack[2]; } nvmtl_sk;
 // surface ID -> (drop time ms << 20) | idle ms at the drop (clamped), so an expired miss says how long the entry had been
 // idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
 static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropAt;
@@ -1086,6 +1090,11 @@ static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropTab; // surface
                                                                       // return counts toward that table's raise only)
 static NSCountedSet<NSNumber *> *nvmtl_sk_live;                      // surface IDs with an entry in keep
 static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull; }
+// roadmap 4 F1: the idle byte cap (NVMTL_KEEP_IDLE_MB) and its temporary value after a memory-pressure event. Under
+// g_sk_lock. nvmtl_sk_capBase is set with the other knobs at the first keep call.
+static uint64_t nvmtl_sk_capBase = 1024ull << 20, nvmtl_sk_capPress, nvmtl_sk_capUntil;
+static uint64_t nvmtl_sk_pressFreed, nvmtl_sk_pressN;   // the last pressure sweep's drops (its log line)
+static uint64_t nvmtl_sk_cap_now(uint64_t now) { return now < nvmtl_sk_capUntil && nvmtl_sk_capPress < nvmtl_sk_capBase ? nvmtl_sk_capPress : nvmtl_sk_capBase; }
 static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
     if (!nvmtl_sk.lastLogMs) { nvmtl_sk.lastLogMs = now; return; }
     if (now - nvmtl_sk.lastLogMs < 30000) return;
@@ -1103,6 +1112,15 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
           nvmtl_sk.capBack[0], nvmtl_sk.capBack[1], nvmtl_sk.capBack[2], nvmtl_sk.capBack[3], nvmtl_sk.sweepSkips, nvmtl_sk.deadDrops, nvmtl_sk.deadBytes >> 20,
           nvmtl_sk.shadowDrops, nvmtl_sk.shadowBytes >> 20, nvmtl_sk.shadowBack[0], nvmtl_sk.shadowBack[1], nvmtl_sk.shadowBack[2], nvmtl_sk.shadowBack[3],
           ((NVMTLShadowState *)objc_getAssociatedObject(keep, &nvmtl_shadow_state_key)) ? ((NVMTLShadowState *)objc_getAssociatedObject(keep, &nvmtl_shadow_state_key))->effMs : 0L);
+    nvlog_report("surface keep: %llu s by surface: idle %llu surfaces %llu MB (the per-entry sum above: %llu MB); idle age 0-5 s %llu MB, "
+          "5-15 s %llu MB, 15-30 s %llu MB, 30-120 s %llu MB, > 120 s %llu MB; expired came back < 250 ms %llu, < 1 s %llu, < 3 s %llu, "
+          "< 10 s %llu, < 30 s %llu, < 60 s %llu, later %llu; memory pressure events: warn %llu, critical %llu, normal %llu; "
+          "dropped by pressure %llu (%llu MB), came back < 10 s %llu, later %llu; idle cap now %llu MB",
+          (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.idleSurfaces, nvmtl_sk.idleSurfBytes >> 20, nvmtl_sk.idleBytes >> 20,
+          nvmtl_sk.idleAgeBytes[0] >> 20, nvmtl_sk.idleAgeBytes[1] >> 20, nvmtl_sk.idleAgeBytes[2] >> 20, nvmtl_sk.idleAgeBytes[3] >> 20,
+          nvmtl_sk.idleAgeBytes[4] >> 20, nvmtl_sk.expBack7[0], nvmtl_sk.expBack7[1], nvmtl_sk.expBack7[2], nvmtl_sk.expBack7[3],
+          nvmtl_sk.expBack7[4], nvmtl_sk.expBack7[5], nvmtl_sk.expBack7[6], nvmtl_sk.pressWarn, nvmtl_sk.pressCrit, nvmtl_sk.pressNormal,
+          nvmtl_sk.pressDrops, nvmtl_sk.pressBytes >> 20, nvmtl_sk.pressBack[0], nvmtl_sk.pressBack[1], (unsigned long long)(nvmtl_sk_cap_now(now) >> 20));
     const uint64_t logged = nvmtl_sk.logged;
     memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
 }
@@ -1122,8 +1140,8 @@ static void nvmtl_sk_miss(NSDictionary *keep, NVMTLSurfKey *key) {
                 break; } }
     else {
         const unsigned g = [nvmtl_sk_gone[sid] unsignedIntValue];
-        if (g >= 1 && g <= 5) { nvmtl_sk.gone[g]++; why = g == NVMTL_GONE_UNHELD ? "dropped: unheld" : g == NVMTL_GONE_EXPIRED ? "dropped: expired" : g == NVMTL_GONE_DEAD ? "dropped: dead"
-                                     : g == NVMTL_GONE_SHADOW ? "dropped: unused plane shadow" : "dropped: idle cap";
+        if (g >= 1 && g <= 6) { nvmtl_sk.gone[g]++; why = g == NVMTL_GONE_UNHELD ? "dropped: unheld" : g == NVMTL_GONE_EXPIRED ? "dropped: expired" : g == NVMTL_GONE_DEAD ? "dropped: dead"
+                                     : g == NVMTL_GONE_SHADOW ? "dropped: unused plane shadow" : g == NVMTL_GONE_PRESSURE ? "dropped: memory pressure" : "dropped: idle cap";
             const uint64_t at = [nvmtl_sk_dropAt[sid] unsignedLongLongValue], now = nvmtl_keep_now_ms();
             const uint64_t back = at ? now - (at >> 20) : 0, idleAtDrop = at & 0xfffff;
             if (g == NVMTL_GONE_SHADOW) {
@@ -1137,10 +1155,13 @@ static void nvmtl_sk_miss(NSDictionary *keep, NVMTLSurfKey *key) {
             }
             if (g == NVMTL_GONE_EXPIRED) {
                 nvmtl_sk.expBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
+                nvmtl_sk.expBack7[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : back < 10000 ? 3 : back < 30000 ? 4 : back < 60000 ? 5 : 6]++;
                 if (nvmtl_sk.expLogged++ < 6)   // per 30 s report: which surfaces come back after expiring
                     nvlog("surface keep: expired miss: surface %u plane %u %llux%llu fmt %llu fbo %llu, idle %llu ms at the drop, back after %llu ms",
                           key->_sid, key->_plane, (unsigned long long)key->_w, (unsigned long long)key->_h, (unsigned long long)key->_fmt,
                           (unsigned long long)key->_fbo, (unsigned long long)idleAtDrop, (unsigned long long)back);
+            } else if (g == NVMTL_GONE_PRESSURE) {
+                nvmtl_sk.pressBack[back < 10000 ? 0 : 1]++;
             } else if (g == NVMTL_GONE_CAP) {
                 nvmtl_sk.capBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
                 if (nvmtl_sk.capLogged++ < 6)   // per 30 s report: which surfaces the idle cap pushed out and got back
@@ -1214,19 +1235,21 @@ static size_t nvmtl_sk_bytes(NVMTLTexture *b) { return b->_surf ? IOSurfaceGetAl
 // 2026-11-08 YouTube spindump: 46 % of the WS main thread was re-imports of entries idle 4-9 s at the drop (mostly
 // 2880x1800 layers) that came back right after; NVMTL_KEEP_MS is now 30 s, NVMTL_KEEP_IDLE_MAX / _MB still bound it.
 static void nvmtl_surface_keep_timer(id dev);
-static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t);
+static void nvmtl_surface_keep_pressure_source(id dev);
+static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t, int press);
 // key == nil: a sweep only (the idle timer below), nothing inserted and no miss counted. Called under @synchronized(dev).
 static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
     pthread_mutex_lock(&g_sk_lock);
-    nvmtl_surface_keep_locked(dev, key, t);
+    nvmtl_surface_keep_locked(dev, key, t, 0);
     pthread_mutex_unlock(&g_sk_lock);
 }
-static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
+// press: 0 = a normal insert or timer sweep; 1 / 2 = the sweep a memory-pressure WARN / CRITICAL event runs (F1 below)
+static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t, int press) {
     static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1, sweepMs = -1, keepSmallMs = -1, smallBytes = -1, keepShadowMs = 0; static uint64_t keepIdleBytes, lastSweep; static int dropDead = -1; static long keepShadowMaxMs = 0;
     if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 30000;
                       e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48;
                       e = getenv("NVMTL_KEEP_IDLE_MAX"); keepIdleMax = e ? atol(e) : 2048; if (keepIdleMax < keepIdle) keepIdleMax = keepIdle;
-                      e = getenv("NVMTL_KEEP_IDLE_MB"); keepIdleBytes = (uint64_t)(e ? atol(e) : 1024) << 20;
+                      e = getenv("NVMTL_KEEP_IDLE_MB"); keepIdleBytes = (uint64_t)(e ? atol(e) : 1024) << 20; nvmtl_sk_capBase = keepIdleBytes;
                       e = getenv("NVMTL_KEEP_VIEW_MS"); keepViewMs = e ? atol(e) : 60000;
                       e = getenv("NVMTL_KEEP_SWEEP_MS"); sweepMs = e ? atol(e) : 100;
                       e = getenv("NVMTL_KEEP_SMALL_MS"); keepSmallMs = e ? atol(e) : 120000;
@@ -1248,10 +1271,11 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     if (!nvmtl_sk_live) { nvmtl_sk_live = [NSCountedSet new]; nvmtl_sk_gone = [NSMutableDictionary new]; }
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), now = t0 / 1000000ull;
     nvmtl_surface_keep_timer(dev);
+    nvmtl_surface_keep_pressure_source(dev);
     if (key) nvmtl_sk_miss(keep, key);
     // The sweep walks every entry (849 us average at 600 entries, YouTube 2026-11-08). Once per NVMTL_KEEP_SWEEP_MS
     // (100 ms) is enough for 30 s idle times; a table well over the cap sweeps at once.
-    if (key && now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8) {
+    if (!press && key && now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8) {
         nvmtl_sk.sweepSkips++;
         NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
         nvmtl_sk_put(keep, key, e);
@@ -1260,7 +1284,8 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         return;
     }
     lastSweep = now;
-    NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new], *dead = [NSMutableArray new], *unshadow = [NSMutableArray new];
+    NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new], *dead = [NSMutableArray new], *unshadow = [NSMutableArray new],
+                                  *pressed = [NSMutableArray new];
     // Unused plane shadows (2026-11-23, working load: Edge 4K 10-bit video): an x420 plane starts at +64 in its surface, so
     // each read-only plane texture carries a full GPU copy of the plane (nvmtl_btsh; a 4K frame's two planes = 25 MB of
     // GTT pages, wired). The entries below that a held surface keeps alive for NVMTL_KEEP_VIEW_MS after their last wrap
@@ -1334,11 +1359,24 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         // Small surfaces (Electron / CoreAnimation tiles, <= NVMTL_KEEP_SMALL_KB) stay NVMTL_KEEP_SMALL_MS (120 s): on
         // 2026-11-08 1472x256 / 768x64 / 320x64 tiles came back 40-200 ms after a drop at ~28 s idle (CPU-THERMALS.md).
         if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)((long)nvmtl_sk_bytes(b) <= smallBytes ? MAX(keepMs, keepSmallMs) : keepMs)) {
+            // F1: under memory pressure an idle entry goes now (WARN: idle >= 5 s; CRITICAL: any idle one), but only one
+            // that nothing else holds: retain count 1 on the texture = no live wrapper or view, and no command buffer in
+            // flight (each retains its resources until it completes), so the BO cannot go under a CS or a present.
+            // Everything above this rule (held, live wrapper, in use, dead, shadow) is untouched.
+            if (press && CFGetRetainCount((__bridge CFTypeRef)b) == 1 && (press >= 2 || now - e->_last >= 5000)) { [pressed addObject:k]; return; }
             [idle addObject:k]; return; }
         [gone addObject:k];
     }];
     CFRelease(own);
     for (NVMTLSurfKey *k in dead) nvmtl_sk_drop(keep, k, NVMTL_GONE_DEAD);
+    if (pressed.count) {   // memory counted once per surface (planes / keys of one surface share its memory)
+        CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL); uint64_t pb = 0;
+        for (NVMTLSurfKey *k in pressed) { NVMTLTexture *b = keep[k]->_tex;
+            if (b->_surf && !CFSetContainsValue(seen, b->_surf)) { CFSetAddValue(seen, b->_surf); pb += nvmtl_sk_bytes(b); } }
+        CFRelease(seen);
+        for (NVMTLSurfKey *k in pressed) nvmtl_sk_drop(keep, k, NVMTL_GONE_PRESSURE);
+        nvmtl_sk.pressDrops += pressed.count; nvmtl_sk.pressBytes += pb; nvmtl_sk_pressFreed = pb; nvmtl_sk_pressN = pressed.count;
+    }
     for (NVMTLSurfKey *k in unshadow) nvmtl_sk_drop(keep, k, NVMTL_GONE_SHADOW);
     for (NVMTLSurfKey *k in gone) {
         NVMTLTexture *b = keep[k]->_tex;
@@ -1347,7 +1385,9 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     const uint64_t drops0 = nvmtl_sk.drops;
     uint64_t idleBytes = 0;
     for (NVMTLSurfKey *k in idle) idleBytes += nvmtl_sk_bytes(keep[k]->_tex);
-    if ((long)idle.count > keepIdle && ((long)idle.count > keepIdleMax || idleBytes > keepIdleBytes)) {
+    const uint64_t capB = nvmtl_sk_cap_now(now);   // NVMTL_KEEP_IDLE_MB, or its pressure value for 60 s after an event
+    NSUInteger capFrom = 0;
+    if ((long)idle.count > keepIdle && ((long)idle.count > keepIdleMax || idleBytes > capB)) {
         // Drop order. Large surfaces (> NVMTL_KEEP_SMALL_KB) go before small tiles: plain LRU dropped tiles idle ~28 s (back
         // in 40-200 ms) while the byte cap was full of 20 MB display-size surfaces, and re-importing a tile costs as much
         // fixed overhead as a big one. Small tiles among themselves: idle age x bytes, costliest first.
@@ -1370,10 +1410,24 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
                          cb = (double)(now - keep[b]->_last + 1) * (double)(bb + 65536);
             return ca > cb ? NSOrderedAscending : ca < cb ? NSOrderedDescending : NSOrderedSame; }];
         NSUInteger i = 0, n = idle.count;   // costliest first, until both the count and the bytes fit (never below keepIdle)
-        while (n - i > (NSUInteger)keepIdle && ((long)(n - i) > keepIdleMax || idleBytes > keepIdleBytes)) {
+        while (n - i > (NSUInteger)keepIdle && ((long)(n - i) > keepIdleMax || idleBytes > capB)) {
             idleBytes -= MIN(idleBytes, (uint64_t)nvmtl_sk_bytes(keep[idle[i]]->_tex));
             nvmtl_sk_drop(keep, idle[i], NVMTL_GONE_CAP); i++;
         }
+        capFrom = i;
+    }
+    // F2: what stays idle, per distinct surface, by age (read-only; the rules above do not use it). Only in the last 5 s
+    // before a 30 s report is due (the sweep runs on WindowServer's main thread under the device lock); the 5 s timer
+    // sweeps the table in that window whenever it has entries, so the report always has a recent value.
+    if (!nvmtl_sk.lastLogMs || now - nvmtl_sk.lastLogMs >= 25000) {
+        CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL); uint64_t sb = 0, age[5] = { 0 }, ns = 0;
+        for (NSUInteger j = capFrom; j < idle.count; j++) { NVMTLSurfKeep *e = keep[idle[j]]; NVMTLTexture *b = e->_tex;
+            if (!b->_surf || CFSetContainsValue(seen, b->_surf)) continue;
+            CFSetAddValue(seen, b->_surf); ns++;
+            const uint64_t by = nvmtl_sk_bytes(b), a = now - e->_last; sb += by;
+            age[a < 5000 ? 0 : a < 15000 ? 1 : a < 30000 ? 2 : a < 120000 ? 3 : 4] += by; }
+        CFRelease(seen);
+        nvmtl_sk.idleSurfaces = ns; nvmtl_sk.idleSurfBytes = sb; memcpy(nvmtl_sk.idleAgeBytes, age, sizeof age);
     }
     nvmtl_sk.idleBytes = idleBytes;
     if (nvmtl_sk.drops - drops0 > nvmtl_sk.maxSweepDrops) nvmtl_sk.maxSweepDrops = nvmtl_sk.drops - drops0;
@@ -1398,12 +1452,77 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
 // The handler holds the device strongly only for one sweep; if that is the last reference the device is released on
 // this utility queue (dealloc is queue-agnostic).
 static char nvmtl_surface_keep_timer_key;
+static dispatch_queue_t nvmtl_sk_sweep_q(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.surface-keep.sweep", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    return q;
+}
+// Roadmap 4 F1 (2026-11-27): memory-pressure eviction. The keep is a cache of pinned imports: under the daily load
+// WindowServer holds 0.6-1 GB of idle surfaces in it (wired, so the compressor cannot take them; a large idle entry
+// leaves at NVMTL_KEEP_MS 30 s, before the kernel's 60 s park would unwire it). At the normal pressure level nothing
+// here changes. On a WARN event the sweep drops idle entries (the timed idle rule only) idle >= 5 s and the idle byte
+// cap halves for 60 s; on CRITICAL every idle entry goes and the cap is 128 MB for 60 s. Each window restarts at the
+// next event; NORMAL does not shorten it (no oscillation). Only entries nothing else holds are dropped (see the sweep),
+// released off this queue's caller like every drop, so the BO is freed only when its last reference goes: no page
+// table work, no window for a late GPU access (unlike parking it). One log line per WARN / CRITICAL event.
+// NVMTL_KEEP_PRESSURE=0: no source (the 1.x behaviour). One source per device, created with the device's first keep
+// entry, held by the device like its timer; the handler holds the device only for one sweep.
+static char nvmtl_surface_keep_press_key;
+// Fills msg with the event's log line (returns 1) for the caller to log after it leaves @synchronized(device).
+static int nvmtl_surface_keep_pressure(id d, unsigned long ev, char *msg, size_t msgLen) {
+    const int lvl = (ev & DISPATCH_MEMORYPRESSURE_CRITICAL) ? 2 : (ev & DISPATCH_MEMORYPRESSURE_WARN) ? 1 : 0;
+    pthread_mutex_lock(&g_sk_lock);
+    if (!lvl) { nvmtl_sk.pressNormal++; pthread_mutex_unlock(&g_sk_lock); return 0; }
+    const uint64_t now = nvmtl_keep_now_ms(), before = nvmtl_sk_cap_now(now);
+    if (lvl == 2) nvmtl_sk.pressCrit++; else nvmtl_sk.pressWarn++;
+    nvmtl_sk_capPress = lvl == 2 ? MIN(nvmtl_sk_capBase, 128ull << 20) : nvmtl_sk_capBase / 2;
+    if (lvl == 1 && now < nvmtl_sk_capUntil && before < nvmtl_sk_capPress) nvmtl_sk_capPress = before;   // a WARN inside a CRITICAL window keeps the lower cap
+    nvmtl_sk_capUntil = now + 60000;
+    nvmtl_sk_pressFreed = nvmtl_sk_pressN = 0;
+    NSMutableDictionary *keep = objc_getAssociatedObject(d, &nvmtl_surface_keep_key);
+    const unsigned long n0 = keep.count;
+    if (n0) nvmtl_surface_keep_locked(d, nil, nil, lvl);
+    snprintf(msg, msgLen, "surface keep: memory pressure %s: dropped %llu idle entries (%llu MB, counted per surface) of %lu; idle cap %llu -> %llu MB for 60 s",
+             lvl == 2 ? "CRITICAL" : "WARN", nvmtl_sk_pressN, nvmtl_sk_pressFreed >> 20, n0,
+             (unsigned long long)(before >> 20), (unsigned long long)(nvmtl_sk_cap_now(now) >> 20));
+    pthread_mutex_unlock(&g_sk_lock);
+    return 1;
+}
+#if !NVMTL_RELEASE
+// tests/keeppress_test.m: runs the pressure handler exactly as the dispatch source does (same queue, same lock), so the
+// rules can be checked in one process without putting the whole machine under memory pressure. Not in release builds.
+__attribute__((visibility("default"))) void nvmtl_test_keep_pressure(id dev, unsigned long ev) {
+    dispatch_sync(nvmtl_sk_sweep_q(), ^{ char m[256]; int lg; @synchronized (dev) { lg = nvmtl_surface_keep_pressure(dev, ev, m, sizeof m); }
+                                         if (lg) nvlog_report("%s", m); });
+}
+#endif
+static void nvmtl_surface_keep_pressure_source(id dev) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_KEEP_PRESSURE"); on = !(e && e[0] == '0'); }
+    if (!on || objc_getAssociatedObject(dev, &nvmtl_surface_keep_press_key)) return;
+    __weak id wdev = dev;
+    dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                                                 DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+                                                 nvmtl_sk_sweep_q());
+    if (!s) return;
+    __weak dispatch_source_t ws = s;
+    dispatch_source_set_event_handler(s, ^{
+        dispatch_source_t me = ws;
+        id d = wdev;
+        if (!d) { if (me) dispatch_source_cancel(me); return; }
+        const unsigned long ev = me ? dispatch_source_get_data(me) : 0;
+        char m[256]; int lg;
+        @synchronized (d) { lg = nvmtl_surface_keep_pressure(d, ev, m, sizeof m); }   // the insert path and the timer hold this lock too
+        if (lg) nvlog_report("%s", m);   // logged after the device lock is dropped
+    });
+    objc_setAssociatedObject(dev, &nvmtl_surface_keep_press_key, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_resume(s);
+}
 static void nvmtl_surface_keep_timer(id dev) {
     static long periodMs = -1;
     if (periodMs < 0) { const char *e = getenv("NVMTL_KEEP_TIMER_MS"); periodMs = e ? atol(e) : 5000; }
     if (periodMs <= 0 || objc_getAssociatedObject(dev, &nvmtl_surface_keep_timer_key)) return;
-    static dispatch_queue_t q; static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.surface-keep.sweep", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    dispatch_queue_t q = nvmtl_sk_sweep_q();
     __weak id wdev = dev;
     dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     dispatch_source_set_timer(s, dispatch_time(DISPATCH_TIME_NOW, (int64_t)periodMs * NSEC_PER_MSEC), (uint64_t)periodMs * NSEC_PER_MSEC,

@@ -223,9 +223,47 @@ static void nvmtl_flc_print(void *ctx)
 // Called from the 30 s frame census (nvmtl_vk_frame_census, inline in -commit) with the window's length in seconds.
 // Under the lock: copy what is printed, reset the counts, age the surface table. The printing runs on a utility queue.
 // A window with no present prints nothing.
+// Roadmap 3 a1 (2026-11-27): one census window without a restart. NVMTL_FLIP_CENSUS is read once, at the first present,
+// so turning it on meant restarting WindowServer and leaving it on. Now, where the knob is off, the 30 s frame census
+// looks (one access(2) per 30 s, nothing per present) for a request file in this process's own per-user temp dir,
+// named after the process (nvmtl-flipcensus-request.WindowServer; the path is logged once). If it is there: delete it,
+// switch the census on for exactly one 30 s window (counters start clean here), print that window, switch it off again.
+// WindowServer only unless NVMTL_FLIP_CENSUS_ALL=1, like the knob; compiled out of release builds. While the census is
+// off its hooks stay the single predictable branch; the switch is a plain int the hooks already test (a present that
+// straddles the switch is counted partly: census only).
+static int g_flc_trig;                 // 1 = this window was armed by the request file
+static void nvmtl_flc_trigger_poll(void)
+{
+#if !NVMTL_RELEASE
+    static int st = -1; static char req[600];
+    if (st < 0) {
+        const char *me = getprogname(); char td[512] = "";
+        st = 0;
+        if (((me && !strcmp(me, "WindowServer")) || flc_knob("NVMTL_FLIP_CENSUS_ALL")) &&
+            confstr(_CS_DARWIN_USER_TEMP_DIR, td, sizeof td) > 1 && td[0] == '/') {
+            snprintf(req, sizeof req, "%s%snvmtl-flipcensus-request.%s", td, td[strlen(td) - 1] == '/' ? "" : "/", me ?: "unknown");
+            nvlog("flip census: off; touch %s to record one 30 s window", req);
+            st = 1;
+        }
+    }
+    if (st != 1 || access(req, F_OK) != 0) return;
+    unlink(req);
+    os_unfair_lock_lock(&g_flc_lock);   // a clean window: nothing from before the switch
+    g_flc_tn = g_flc_t_over = g_flc_fn = g_flc_f_over = g_flc_fs_full = 0;
+    g_flc_pres = g_flc_pres_client = g_flc_pres_ownonly = g_flc_pres_none = g_flc_pres_nobig = 0;
+    g_flc_same = g_flc_diff = g_flc_big_switch = 0; memset(g_flc_cls_pres, 0, sizeof g_flc_cls_pres);
+    g_flc_cur_client = g_flc_cur_own = g_flc_cur_big = 0; g_flc_cur_cls = 0;
+    g_flc_prev_present_sid = g_flc_last_big_sid = 0;   // no same/switch compare against a present from before the window
+    os_unfair_lock_unlock(&g_flc_lock);
+    g_flc_trig = 1;
+    __atomic_store_n(&g_flc, 1, __ATOMIC_RELEASE);
+    nvlog("flip census: request file seen: on for one 30 s window");
+#endif
+}
 static void nvmtl_flc_report(double secs)
 {
-    if (g_flc != 1) return;
+    if (__builtin_expect(g_flc < 0, 0)) (void)nvmtl_flc_on();
+    if (g_flc != 1) { nvmtl_flc_trigger_poll(); return; }
     if (secs <= 0) secs = 1;
     flc_snap *s = NULL;
     os_unfair_lock_lock(&g_flc_lock);
@@ -272,6 +310,11 @@ static void nvmtl_flc_report(double secs)
     g_flc_same = g_flc_diff = g_flc_big_switch = 0; memset(g_flc_cls_pres, 0, sizeof g_flc_cls_pres);
     os_unfair_lock_unlock(&g_flc_lock);
     if (s) dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), s, nvmtl_flc_print);
+    if (g_flc_trig) {   // a window armed by the request file: printed above, census off again
+        g_flc_trig = 0;
+        __atomic_store_n(&g_flc, 0, __ATOMIC_RELEASE);
+        nvlog("flip census: requested window done, off again");
+    }
 }
 
 // SPIR-V (and its function constants) of a hashed shader, for the flip census (NVMTL_FLIP_CENSUS_SPV=1) or the pass
