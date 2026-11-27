@@ -69,11 +69,19 @@ class NMXFBBacklight : public IODisplayParameterHandler {
     OSDeclareDefaultStructors(NMXFBBacklight)
     IOService *fFb = nullptr;
     thread_call_t fApply = nullptr;
+    /* fApplyRun counts fApply runs from the enter (doIntegerSet) to the end of the callback: thread_call_free does
+     * not wait for a running callback (25.x), so quiesce waits for this count; fApplyDown refuses new enters first */
+    volatile SInt32 fApplyRun = 0;
+    volatile bool fApplyDown = false;
     volatile SInt32 fPending = -1;
     SInt32 fLevel = 80;
     UInt32 fWrites = 0, fFailures = 0, fRaw = 0;
 
-    static void applyFire(thread_call_param_t p, thread_call_param_t) {
+    static void applyFire(thread_call_param_t p, thread_call_param_t p1) {
+        applyRun(p, p1);
+        OSDecrementAtomic(&((NMXFBBacklight *)p)->fApplyRun);   // the last access to the handler in this run
+    }
+    static void applyRun(thread_call_param_t p, thread_call_param_t) {
         NMXFBBacklight *me = (NMXFBBacklight *)p;
         SInt32 v;
         do { v = me->fPending; } while (!OSCompareAndSwap((UInt32)v, (UInt32)-1, (volatile UInt32 *)&me->fPending));
@@ -104,10 +112,16 @@ public:
     }
     SInt32 level() const { return fLevel; }
     void quiesce() {
+        __atomic_store_n(&fApplyDown, true, __ATOMIC_SEQ_CST);   // no new runs from here
         fFb = nullptr;
         if (fApply) {
-            thread_call_cancel(fApply);
-            while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); }
+            for (int n = 0;; n++) {
+                if (thread_call_cancel(fApply)) OSDecrementAtomic(&fApplyRun);   // a queued run: gone
+                if (!__atomic_load_n(&fApplyRun, __ATOMIC_SEQ_CST)) break;
+                if (n == 1000) FBLOG("backlight: quiesce still waiting for %d run(s)", (int)fApplyRun);
+                IOSleep(1);
+            }
+            while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); }   // not expected
             fApply = nullptr;
         }
     }
@@ -135,7 +149,12 @@ public:
         if (fRaw < 20) { fRaw++; FBLOG("backlight set %s = %u", name ? name->getCStringNoCopy() : "?", (unsigned)value); }
         if (name != gIODisplayBrightnessKey && name != gIODisplayLinearBrightnessKey) return false;
         fPending = value > 100 ? 100 : (SInt32)value;
-        if (fApply) thread_call_enter(fApply);
+        if (fApply) {
+            /* counted first, then checked: quiesce never sees 0 while an enter is in flight */
+            OSIncrementAtomic(&fApplyRun);
+            if (__atomic_load_n(&fApplyDown, __ATOMIC_SEQ_CST) || thread_call_enter(fApply))
+                OSDecrementAtomic(&fApplyRun);              // refused, or it replaced a queued run
+        }
         return true;
     }
     bool doDataSet(const OSSymbol *, OSData *) override { return false; }
@@ -204,6 +223,10 @@ class NMXAMDFB : public IOFramebuffer {
     IONotifier *fSysNote = nullptr;
     IOCommandGate *fWakeGate = nullptr;
     thread_call_t fWakeLate = nullptr;
+    /* fWakeLate runs from the enter (sysPower) to the end of the callback; teardownWakeWork sets fWakeDown, then waits
+     * for 0 before it frees the call and releases fWakeGate (a run can be inside fWakeGate->runAction) */
+    volatile SInt32 fWakeRun = 0;
+    volatile bool fWakeDown = false;
     volatile UInt32 fSysSlept = 0;
     volatile SInt32 fWillSleepOff = 0;
     UInt32 fWakeWorks = 0;
@@ -237,7 +260,11 @@ class NMXAMDFB : public IOFramebuffer {
         if (pagingState) { FBLOG("%s: paging already on, nothing to do", why); return; }
         fWakeGate->runAction(&wakeGated, const_cast<char *>(why));
     }
-    static void wakeLateFire(thread_call_param_t p, thread_call_param_t) {
+    static void wakeLateFire(thread_call_param_t p, thread_call_param_t p1) {
+        wakeLateRun(p, p1);
+        OSDecrementAtomic(&((NMXAMDFB *)p)->fWakeRun);    // the last access to the framebuffer in this run
+    }
+    static void wakeLateRun(thread_call_param_t p, thread_call_param_t) {
         NMXAMDFB *me = (NMXAMDFB *)p;
         /* a dark wake leaves the framebuffer off: its own power-on does the work later */
         if (!me->fStopping && me->getPowerState() > 0) me->wakeWork("3 s after system power-on");
@@ -250,7 +277,9 @@ class NMXAMDFB : public IOFramebuffer {
         if ((type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn) && me->fWakeLate && !me->fStopping) {
             uint64_t d;
             clock_interval_to_deadline(3, kSecondScale, &d);
-            thread_call_enter_delayed(me->fWakeLate, d);
+            OSIncrementAtomic(&me->fWakeRun);
+            if (__atomic_load_n(&me->fWakeDown, __ATOMIC_SEQ_CST) || thread_call_enter_delayed(me->fWakeLate, d))
+                OSDecrementAtomic(&me->fWakeRun);           // refused (teardown), or it replaced a queued run
         }
         return kIOReturnSuccess;
     }
@@ -278,9 +307,15 @@ class NMXAMDFB : public IOFramebuffer {
     void teardownWakeWork() {
         if (fSysNote) { fSysNote->remove(); fSysNote = nullptr; }
         if (fSleepTap) { fSleepTap->remove(); fSleepTap = nullptr; }
+        __atomic_store_n(&fWakeDown, true, __ATOMIC_SEQ_CST);  // also on the setup-failure path (fStopping false)
         if (fWakeLate) {
-            thread_call_cancel(fWakeLate);
-            while (!thread_call_free(fWakeLate)) { thread_call_cancel(fWakeLate); IOSleep(1); }
+            for (int n = 0;; n++) {
+                if (thread_call_cancel(fWakeLate)) OSDecrementAtomic(&fWakeRun);   // a queued run: gone
+                if (!__atomic_load_n(&fWakeRun, __ATOMIC_SEQ_CST)) break;
+                if (n == 1000) FBLOG("paging wake: teardown still waiting for %d run(s)", (int)fWakeRun);
+                IOSleep(1);
+            }
+            while (!thread_call_free(fWakeLate)) { thread_call_cancel(fWakeLate); IOSleep(1); }   // not expected
             fWakeLate = nullptr;
         }
         if (fWakeGate) {
