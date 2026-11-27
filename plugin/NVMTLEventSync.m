@@ -151,6 +151,91 @@ static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
     cb->_nmxFenced = cb->_nmxFence.count != 0;
     cb->_nmxPendSent = NO;
 }
+// WS-CPU cut 1 item 1 (NVMTL_NMX_FENCE_CALL=1, default off): the marks go to NMXAccel's fence table in ONE call on an
+// NMXDrmClient connection (selector 3, kexts/NVRM/accel/nmx/nmx_fence_table.h; the ABI below must stay identical)
+// instead of one IOSurfaceSetValues per surface. NMXAccel reads the table first and the properties otherwise.
+// Any failure turns the call off for the rest of the process and the marks go to the properties again, starting
+// with the ones of the failing call: kIOReturnUnsupported (debug.nmxaccel_fence_table 0), an NMXAccel without
+// selector 3 (kIOReturnBadArgument), no connection, or kIOReturnNoSpace (every table row in flight; NMXAccel then
+// drops this process's rows, so none can shadow the property values written from here on).
+// NVMTL_NMX_FENCE_CALL_SIM (tests only, no kernel call): "ok" = every call succeeds, "refuse=N" = call N fails.
+#include <IOKit/IOKitLib.h>
+enum { NVMTL_FCALL_SEL = 3, NVMTL_FCALL_MAX = 16 };
+enum { NVMTL_FCALL_PENDING = 1, NVMTL_FCALL_SUBMITTED = 2, NVMTL_FCALL_DONE = 4 };
+struct nvmtl_fcall_entry { uint32_t surfaceID, flags; uint64_t seq, tNs, gpuEndNs; };
+struct nvmtl_fcall { uint32_t version, n; struct nvmtl_fcall_entry e[NVMTL_FCALL_MAX]; };
+_Static_assert(sizeof(struct nvmtl_fcall_entry) == 32, "NMXAccel fence call ABI");
+static int gNmxFcall = -1;            /* -1 unread, 0 off, 1 on, 2 fell back */
+static io_connect_t gNmxFcallConn;
+static int gNmxFcallSim;              /* 0 kernel, 1 ok, 2 refuse at call gNmxFcallSimAt */
+static unsigned long long gNmxFcallSimAt;
+static _Atomic unsigned long long gNmxFcallCalls, gNmxFcallEntries, gNmxFcallMarks;
+static BOOL nvmtl_nmx_fcall_on(void) {
+    if (gNmxFcall < 0) {
+        const char *e = getenv("NVMTL_NMX_FENCE_CALL");
+        gNmxFcall = (e && e[0] == '1') ? 1 : 0;
+        const char *sim = getenv("NVMTL_NMX_FENCE_CALL_SIM");
+        if (sim && !strcmp(sim, "ok")) gNmxFcallSim = 1;
+        else if (sim && !strncmp(sim, "refuse=", 7)) { gNmxFcallSim = 2; gNmxFcallSimAt = strtoull(sim + 7, NULL, 10); }
+        if (gNmxFcall) nvlog("commit: fence marks through NMXAccel's fence table (NVMTL_NMX_FENCE_CALL=1%s%s)",
+                             sim ? ", simulated: " : "", sim ?: "");
+    }
+    return gNmxFcall == 1;
+}
+static void nvmtl_nmx_fcall_off(const char *why, kern_return_t kr) {
+    gNmxFcall = 2;
+    nvlog("commit: fence table call off for this process (%s, 0x%08x) - the marks go to IOSurface properties "
+          "(%llu calls, %llu surface marks sent before)", why, kr, (unsigned long long)gNmxFcallCalls,
+          (unsigned long long)gNmxFcallEntries);
+}
+/* caller holds @synchronized([NVMTLCommandBuffer class]); YES = the kernel has every entry */
+static BOOL nvmtl_nmx_fcall_send(struct nvmtl_fcall *c) {
+    if (!nvmtl_nmx_fcall_on() || !c->n) return NO;
+    const unsigned long long k = atomic_fetch_add(&gNmxFcallCalls, 1) + 1;
+    kern_return_t kr;
+    if (gNmxFcallSim) {
+        kr = (gNmxFcallSim == 2 && k >= gNmxFcallSimAt) ? kIOReturnNoSpace : KERN_SUCCESS;
+    } else {
+        if (!gNmxFcallConn) {
+            io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
+            kr = svc ? IOServiceOpen(svc, mach_task_self(), 0x4E4D4452u /* 'NMDR' */, &gNmxFcallConn) : kIOReturnNotFound;
+            if (svc) IOObjectRelease(svc);
+            if (kr != KERN_SUCCESS) { gNmxFcallConn = 0; nvmtl_nmx_fcall_off("no NMDR connection", kr); return NO; }
+        }
+        c->version = 1;
+        kr = IOConnectCallStructMethod(gNmxFcallConn, NVMTL_FCALL_SEL, c, 8 + 32 * (size_t)c->n, NULL, NULL);
+    }
+    if (kr != KERN_SUCCESS) {
+        nvmtl_nmx_fcall_off(kr == kIOReturnUnsupported ? "debug.nmxaccel_fence_table is 0"
+                            : kr == kIOReturnNoSpace ? "table full, NMXAccel dropped this process's rows"
+                            : kr == kIOReturnBadArgument ? "NMXAccel has no selector 3 (or refused the call)" : "call failed", kr);
+        if (gNmxFcallConn) { IOServiceClose(gNmxFcallConn); gNmxFcallConn = 0; }
+        return NO;
+    }
+    atomic_fetch_add(&gNmxFcallEntries, c->n);
+    if (k == 1 || !(k & (k - 1)) || !(k & 0xFFFF))
+        nvlog("commit: fence table: %llu calls, %llu surface marks (%llu IOSurfaceSetValues saved)", k,
+              (unsigned long long)gNmxFcallEntries, (unsigned long long)gNmxFcallEntries);
+    return YES;
+}
+/* marks = [surface, seq, time] arrays; YES when the table took all of them (else the caller writes properties) */
+static BOOL nvmtl_nmx_fcall_marks(NSArray *marks, uint32_t flags, const uint64_t *tOverride, uint64_t gpuEnd) {
+    if (!nvmtl_nmx_fcall_on()) return NO;
+    struct nvmtl_fcall c; memset(&c, 0, sizeof c);
+    for (NSArray *m in marks) {
+        struct nvmtl_fcall_entry *e = &c.e[c.n++];
+        e->surfaceID = IOSurfaceGetID((__bridge IOSurfaceRef)m[0]);
+        e->flags = flags;
+        e->seq = [m[1] unsignedLongLongValue];
+        e->tNs = tOverride ? *tOverride : (flags & NVMTL_FCALL_PENDING) ? [m[2] unsignedLongLongValue] : 0;
+        e->gpuEndNs = gpuEnd;
+        if (!e->surfaceID) return NO;
+        if (c.n == NVMTL_FCALL_MAX) { if (!nvmtl_nmx_fcall_send(&c)) return NO; c.n = 0; }
+    }
+    if (c.n && !nvmtl_nmx_fcall_send(&c)) return NO;
+    atomic_fetch_add(&gNmxFcallMarks, marks.count);
+    return YES;
+}
 static _Atomic unsigned long long gNmxPendMerged, gNmxPendAlone;
 /* Writes NMXFencePending (once per command buffer) and, with submitted, NMXFenceSubmitted in the same call. */
 static void nvmtl_nmx_fence_publish(NVMTLCommandBuffer *cb, BOOL submitted) {
@@ -158,6 +243,7 @@ static void nvmtl_nmx_fence_publish(NVMTLCommandBuffer *cb, BOOL submitted) {
         NSArray *marks = cb->_nmxFence;
         if (!marks.count || (cb->_nmxPendSent && (!submitted || cb->_nmxSubSent))) return;
         const BOOL pend = !cb->_nmxPendSent;
+        if (!nvmtl_nmx_fcall_marks(marks, (pend ? NVMTL_FCALL_PENDING : 0) | (submitted ? NVMTL_FCALL_SUBMITTED : 0), NULL, 0))
         for (NSArray *m in marks) {
             NSDictionary *v = pend && submitted ? @{ @"NMXFencePending": m[1], @"NMXFencePendingT": m[2], @"NMXFenceSubmitted": m[1] }
                             : pend ? @{ @"NMXFencePending": m[1], @"NMXFencePendingT": m[2] }
@@ -191,11 +277,19 @@ static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb, double gpuEndSecond
     if (!marks.count) return;
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_nmx_fence_done) nvmtl_nmx_fence_done = [NSMapTable weakToStrongObjectsMapTable];
+        NSMutableArray *fresh = [NSMutableArray arrayWithCapacity:marks.count];
         for (NSArray *m in marks) {
             id surf = m[0]; NSNumber *n = m[1];
             NSNumber *was = [nvmtl_nmx_fence_done objectForKey:surf];
             if (was && was.unsignedLongLongValue >= n.unsignedLongLongValue) continue;
             [nvmtl_nmx_fence_done setObject:n forKey:surf];
+            [fresh addObject:m];
+        }
+        const uint64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (fresh.count && nvmtl_nmx_fcall_marks(fresh, NVMTL_FCALL_DONE, &nowNs,
+                                                 gpuEndSeconds > 0 ? (unsigned long long)(gpuEndSeconds * 1e9) : 0ull)) return;
+        for (NSArray *m in fresh) {
+            id surf = m[0]; NSNumber *n = m[1];
             // frame-path trace: when this thread saw the fence, and the GPU's own end time (CLOCK_UPTIME_RAW ns, 0 = none)
             IOSurfaceSetValues((__bridge IOSurfaceRef)surf, (__bridge CFDictionaryRef)@{ @"NMXFenceDone": n,
                 @"NMXFenceDoneT": @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)),
