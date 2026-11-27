@@ -102,7 +102,7 @@ void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
 enum { ST_ENC, ST_PASS, ST_DRAW, ST_SNAP, ST_CAWUS, ST_COMMIT, ST_ADDR, ST_WRITE, ST_N };
 typedef struct { uint64_t t0; int which; } nvmtl_stage_t;
 int nvmtl_stage_on(void);
-void nvmtl_stage_end(nvmtl_stage_t *s);
+__attribute__((nothrow)) void nvmtl_stage_end(nvmtl_stage_t *s);   /* nothrow: no unwind landing pad (and no _objc_terminate import) */
 #define NVMTL_STAGE(w) __attribute__((cleanup(nvmtl_stage_end), unused)) nvmtl_stage_t nvmtl_st_ = \
     { nvmtl_stage_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0, (w) }
 int  nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out);
@@ -252,7 +252,10 @@ typedef struct { uint32_t ncol, cfmts[NVMTL_NCOL], has_depth, dfmt, samples; } n
 @class NSData;
 /* the immutable NSData objects the next pipeline's two stages come from, for this thread (nil, nil after it): lets the
    lowering memo keep its content key on them (nvmtl_vk.c, WS-CPU 9.9) */
-void nvmtl_lower_src_hint(NSData *vs, NSData *fs);
+int nvmtl_lower_src_hint(NSData *vs, NSData *fs);
+void nvmtl_lower_src_clear(int *unused);
+/* scoped: the hint is cleared when the enclosing block is left, whatever way */
+#define NVMTL_LOWER_SRC_SCOPE(vs, fs) __attribute__((cleanup(nvmtl_lower_src_clear), unused)) int nvmtl_lower_src_g_ = nvmtl_lower_src_hint((vs), (fs))
 #endif
 int  nvmtl_vk_pipeline_create_rt(const void *vs, size_t vn, const void *fs, size_t fn, const nvk_rt *rt, const void *vin, uint32_t samples,
                                  const nvk_tess_desc *td, void *out);

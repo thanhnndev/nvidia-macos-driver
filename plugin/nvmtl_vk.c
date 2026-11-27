@@ -4499,18 +4499,28 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
 static char g_lower_key_assoc[2];
 static _Atomic unsigned long long g_lower_key_reuse, g_lower_key_ver, g_lower_key_bad;
 static __thread __unsafe_unretained NSData *t_lower_src[2];
+static __thread const void *t_lower_src_ptr[2];   /* their bytes and lengths, compared before the object is messaged */
+static __thread size_t t_lower_src_len[2];
 static int nvmtl_lower_keymemo_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_LOWER_KEYMEMO"); on = !e ? 1 : *e == '0' ? 0 : *e == '2' ? 2 : 1;
         nvlog("lowering key memo %s (NVMTL_LOWER_KEYMEMO)", on == 2 ? "ON, every reuse checked against the hash" : on ? "ON" : "OFF"); }
     return on;
 }
-void nvmtl_lower_src_hint(NSData *vs, NSData *fs) {
+int nvmtl_lower_src_hint(NSData *vs, NSData *fs) {
     const int on = nvmtl_lower_keymemo_on();
-    t_lower_src[0] = on ? vs : nil; t_lower_src[1] = on ? fs : nil;
+    NSData *v[2] = { on ? vs : nil, on ? fs : nil };
+    for (int i = 0; i < 2; i++) { t_lower_src[i] = v[i]; t_lower_src_ptr[i] = v[i] ? v[i].bytes : NULL; t_lower_src_len[i] = v[i] ? v[i].length : 0; }
+    return 1;
+}
+void nvmtl_lower_src_clear(int *unused) {
+    (void)unused;
+    for (int i = 0; i < 2; i++) { t_lower_src[i] = nil; t_lower_src_ptr[i] = NULL; t_lower_src_len[i] = 0; }
 }
 static NSData *nvmtl_lower_src_of(const void *data, size_t len) {
-    for (int i = 0; i < 2; i++) { NSData *s = t_lower_src[i];
+    for (int i = 0; i < 2; i++) {
+        if (!data || t_lower_src_ptr[i] != data || t_lower_src_len[i] != len) continue;   /* raw match first: no message to a stale object */
+        NSData *s = t_lower_src[i];
         if (s && s.length == len && s.bytes == data && ![s isKindOfClass:[NSMutableData class]]) return s; }
     return nil;
 }
@@ -4556,7 +4566,8 @@ static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_
         key = [NSData dataWithBytes:kb length:sizeof kb];
         if (kept) {   /* verify mode: the kept key must be the content key of the bytes the module has now */
             atomic_fetch_add(&g_lower_key_ver, 1);
-            if (![kept isEqualToData:key]) { atomic_fetch_add(&g_lower_key_bad, 1); nvlog_report("lowering key memo: MISMATCH (%zu B module, flags %u)", len, flags); }
+            if (![kept isEqualToData:key]) { const unsigned long long b = atomic_fetch_add(&g_lower_key_bad, 1) + 1;
+                if (b <= 8 || !(b & 1023)) nvlog_report("lowering key memo: MISMATCH #%llu (%zu B module, flags %u)", b, len, flags); }
         }
         if (src && !kept) objc_setAssociatedObject(src, &g_lower_key_assoc[flags], key, OBJC_ASSOCIATION_RETAIN);
     }

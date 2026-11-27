@@ -1093,6 +1093,12 @@ static struct { uint64_t hits, misses, fresh, otherKey, gone[8], shadowDrops, sh
 // past the base timeout (one only the raise kept) halves it back toward NVMTL_KEEP_MS. A WARN / CRITICAL memory-pressure
 // event puts it back at the base at once (before its F1 sweep). NVMTL_KEEP_IDLE_MB / _MAX still bound the idle memory and
 // entry count exactly as before. NVMTL_KEEP_ADAPT=0: the fixed NVMTL_KEEP_MS. Under g_sk_lock.
+// F1 overrides the adaptive window at once: back to the base. Called by the pressure handler whether or not the table
+// has entries (review of c53ab829 F3: an empty table skipped the sweep and kept a raised timeout). Under g_sk_lock.
+static void nvmtl_ka_press_reset(uint64_t now);
+// NVMTL_KEEP_SMALL_KB in bytes, at file scope: the touch path below counts only entries above it as kept by the raise
+// (small tiles stay NVMTL_KEEP_SMALL_MS, 120 s, whatever the adaptive timeout; review of c53ab829 F1)
+static long nvmtl_sk_smallBytes = 2048 * 1024;
 static struct { int on; long base, ceil, eff; uint64_t winStart, winBack, winDrops, winSaved, winNeed, lastAct; } nvmtl_ka = { .eff = 30000, .base = 30000, .ceil = 30000 };
 // surface ID -> (drop time ms << 20) | idle ms at the drop (clamped), so an expired miss says how long the entry had been
 // idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
@@ -1107,6 +1113,11 @@ static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MON
 static uint64_t nvmtl_sk_capBase = 1024ull << 20, nvmtl_sk_capPress, nvmtl_sk_capUntil;
 static uint64_t nvmtl_sk_pressFreed, nvmtl_sk_pressN;   // the last pressure sweep's drops (its log line)
 static uint64_t nvmtl_sk_cap_now(uint64_t now) { return now < nvmtl_sk_capUntil && nvmtl_sk_capPress < nvmtl_sk_capBase ? nvmtl_sk_capPress : nvmtl_sk_capBase; }
+static void nvmtl_ka_press_reset(uint64_t now) {
+    if (!nvmtl_ka.on) return;
+    if (nvmtl_ka.eff != nvmtl_ka.base) { nvlog_report("surface keep: idle timeout %ld -> %ld ms (memory pressure)", nvmtl_ka.eff, nvmtl_ka.base); nvmtl_sk.kaPress++; }
+    nvmtl_ka.eff = nvmtl_ka.base; nvmtl_ka.winStart = now; nvmtl_ka.winBack = nvmtl_ka.winDrops = nvmtl_ka.winSaved = nvmtl_ka.winNeed = 0;
+}
 static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
     if (!nvmtl_sk.lastLogMs) { nvmtl_sk.lastLogMs = now; return; }
     if (now - nvmtl_sk.lastLogMs < 30000) return;
@@ -1135,7 +1146,7 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
           nvmtl_sk.pressDrops, nvmtl_sk.pressBytes >> 20, nvmtl_sk.pressBack[0], nvmtl_sk.pressBack[1], (unsigned long long)(nvmtl_sk_cap_now(now) >> 20));
     nvlog_report("surface keep: adaptive timeout: keep_ms %ld (base %ld, ceiling %ld, %s); last %llu s: expired drops %llu, expired returns "
           "within the ceiling %llu, hits on entries only the raise kept %llu, raises %llu, decays %llu, pressure resets %llu; idle kept %llu MB "
-          "at the last sweep, of it idle past the base %llu MB",
+          "at the last sweep, of it large entries idle past the base (kept only by the raise) %llu MB",
           nvmtl_ka.eff, nvmtl_ka.base, nvmtl_ka.ceil, nvmtl_ka.on ? "adaptive" : "fixed (NVMTL_KEEP_ADAPT=0)",
           (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.kaDrops, nvmtl_sk.kaBack, nvmtl_sk.kaSaved, nvmtl_sk.kaRaise,
           nvmtl_sk.kaDecay, nvmtl_sk.kaPress, nvmtl_sk.idleBytes >> 20, nvmtl_sk.kaBeyondBytes >> 20);
@@ -1238,7 +1249,10 @@ static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     NVMTLSurfKeep *e = keep[key];
     if (e) { const uint64_t tn = nvmtl_keep_now_ms();
-             if (nvmtl_ka.eff > nvmtl_ka.base && tn - e->_last >= (uint64_t)nvmtl_ka.base) { nvmtl_ka.winSaved++; nvmtl_sk.kaSaved++; nvmtl_ka.lastAct = tn; }
+             // only a large entry counts: a small tile idle past the base was kept by the 120 s small rule, not the raise,
+             // and counting it held a raised timeout up forever (review of c53ab829 F1)
+             if (nvmtl_ka.eff > nvmtl_ka.base && tn - e->_last >= (uint64_t)nvmtl_ka.base && e->_tex->_surf
+                 && (long)IOSurfaceGetAllocSize(e->_tex->_surf) > nvmtl_sk_smallBytes) { nvmtl_ka.winSaved++; nvmtl_sk.kaSaved++; nvmtl_ka.lastAct = tn; }
              e->_last = e->_wrap = tn; }
     nvmtl_sk.hits++;
     if (keep) nvmtl_sk_report(keep, e ? e->_last : nvmtl_keep_now_ms());
@@ -1280,7 +1294,7 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
                       e = getenv("NVMTL_KEEP_VIEW_MS"); keepViewMs = e ? atol(e) : 60000;
                       e = getenv("NVMTL_KEEP_SWEEP_MS"); sweepMs = e ? atol(e) : 100;
                       e = getenv("NVMTL_KEEP_SMALL_MS"); keepSmallMs = e ? atol(e) : 120000;
-                      e = getenv("NVMTL_KEEP_SMALL_KB"); smallBytes = (e ? atol(e) : 2048) * 1024;
+                      e = getenv("NVMTL_KEEP_SMALL_KB"); smallBytes = (e ? atol(e) : 2048) * 1024; nvmtl_sk_smallBytes = smallBytes;
                       // Dead entries (see the sweep) go at once outside WindowServer; NVMTL_KEEP_DEAD=0/1 overrides.
                       e = getenv("NVMTL_KEEP_DEAD"); dropDead = e ? e[0] == '1' : strcmp(getprogname(), "WindowServer") != 0;
                       e = getenv("NVMTL_KEEP_SHADOW_MS"); keepShadowMs = e ? atol(e) : 3000;
@@ -1318,13 +1332,12 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     }
     lastSweep = now;
     if (nvmtl_ka.on) {
-        if (press) {   // F1 overrides the adaptive window at once: back to the base before this pressure sweep
-            if (nvmtl_ka.eff != nvmtl_ka.base) { nvlog_report("surface keep: idle timeout %ld -> %ld ms (memory pressure)", nvmtl_ka.eff, nvmtl_ka.base); nvmtl_sk.kaPress++; }
-            nvmtl_ka.eff = nvmtl_ka.base; nvmtl_ka.winStart = now; nvmtl_ka.winBack = nvmtl_ka.winDrops = nvmtl_ka.winSaved = nvmtl_ka.winNeed = 0;
-        } else if (!nvmtl_ka.winStart) nvmtl_ka.winStart = now;
+        if (press) nvmtl_ka_press_reset(now);   // the pressure handler already did; again here for a direct caller
+        else if (!nvmtl_ka.winStart) nvmtl_ka.winStart = now;
         else if (now - nvmtl_ka.winStart >= 10000) {
             const long old = nvmtl_ka.eff;
-            if (nvmtl_ka.winBack >= 4 && nvmtl_ka.winBack * 4 >= nvmtl_ka.winDrops)
+            // no raise inside a pressure window (60 s after a WARN / CRITICAL event; review of c53ab829 F2)
+            if (now >= nvmtl_sk_capUntil && nvmtl_ka.winBack >= 4 && nvmtl_ka.winBack * 4 >= nvmtl_ka.winDrops)
                 nvmtl_ka.eff = (long)MIN((uint64_t)nvmtl_ka.ceil, MAX((uint64_t)old * 2, nvmtl_ka.winNeed));
             // halved once per 10 s with no counted return and no hit only the raise kept, also for time no sweep saw (an
             // empty table has no timer sweeps, so the window that held the last such event may be evaluated late)
@@ -1339,7 +1352,6 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         }
     }
     const long effMs = nvmtl_ka.on ? nvmtl_ka.eff : keepMs;
-    __block uint64_t beyondBytes = 0;   // idle entries past the base timeout (kept by the raise, or small)
     NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new], *dead = [NSMutableArray new], *unshadow = [NSMutableArray new],
                                   *pressed = [NSMutableArray new];
     // Unused plane shadows (2026-11-23, working load: Edge 4K 10-bit video): an x420 plane starts at +64 in its surface, so
@@ -1420,7 +1432,6 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
             // flight (each retains its resources until it completes), so the BO cannot go under a CS or a present.
             // Everything above this rule (held, live wrapper, in use, dead, shadow) is untouched.
             if (press && CFGetRetainCount((__bridge CFTypeRef)b) == 1 && (press >= 2 || now - e->_last >= 5000)) { [pressed addObject:k]; return; }
-            if (now - e->_last >= (uint64_t)keepMs) beyondBytes += nvmtl_sk_bytes(b);
             [idle addObject:k]; return; }
         [gone addObject:k];
     }];
@@ -1486,6 +1497,11 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         CFRelease(seen);
         nvmtl_sk.idleSurfaces = ns; nvmtl_sk.idleSurfBytes = sb; memcpy(nvmtl_sk.idleAgeBytes, age, sizeof age);
     }
+    // large idle entries past the base timeout that survived the cap: what only the raise keeps (review of c53ab829 F4)
+    uint64_t beyondBytes = 0;
+    for (NSUInteger j = capFrom; j < idle.count; j++) { NVMTLSurfKeep *e = keep[idle[j]]; if (!e) continue;
+        const uint64_t by = nvmtl_sk_bytes(e->_tex);
+        if ((long)by > smallBytes && now - e->_last >= (uint64_t)keepMs) beyondBytes += by; }
     nvmtl_sk.idleBytes = idleBytes; nvmtl_sk.kaBeyondBytes = beyondBytes;
     if (nvmtl_sk.drops - drops0 > nvmtl_sk.maxSweepDrops) nvmtl_sk.maxSweepDrops = nvmtl_sk.drops - drops0;
     if (key) {
@@ -1535,6 +1551,7 @@ static int nvmtl_surface_keep_pressure(id d, unsigned long ev, char *msg, size_t
     nvmtl_sk_capPress = lvl == 2 ? MIN(nvmtl_sk_capBase, 128ull << 20) : nvmtl_sk_capBase / 2;
     if (lvl == 1 && now < nvmtl_sk_capUntil && before < nvmtl_sk_capPress) nvmtl_sk_capPress = before;   // a WARN inside a CRITICAL window keeps the lower cap
     nvmtl_sk_capUntil = now + 60000;
+    nvmtl_ka_press_reset(now);
     nvmtl_sk_pressFreed = nvmtl_sk_pressN = 0;
     NSMutableDictionary *keep = objc_getAssociatedObject(d, &nvmtl_surface_keep_key);
     const unsigned long n0 = keep.count;
@@ -2239,9 +2256,9 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
         nvk_tess_desc td = { tpt, n, (uint32_t)d.tessellationPartitionMode, (uint32_t)d.tessellationOutputWindingOrder,
             (uint32_t)d.tessellationFactorStepFunction, d.isTessellationFactorScaleEnabled ? 1u : 0u, (uint32_t)d.tessellationControlPointIndexType,
             mf, rl ? rl.intValue : -1 };
-        { nvmtl_lower_src_hint(vf->_spirv, flk ?: ff->_spirv); prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, &td, &ps->_p); nvmtl_lower_src_hint(nil, nil); }
+        { NVMTL_LOWER_SRC_SCOPE(vf->_spirv, flk ?: ff->_spirv); prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, &td, &ps->_p); }
     } else
-        { nvmtl_lower_src_hint(vf->_spirv, flk ?: ff->_spirv); prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, NULL, &ps->_p); nvmtl_lower_src_hint(nil, nil); }
+        { NVMTL_LOWER_SRC_SCOPE(vf->_spirv, flk ?: ff->_spirv); prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, NULL, &ps->_p); }
     if (prc) {
         nvlog("pipeline FAILED: %s / %s — see the vk: line above for the VkResult", vf->_fname.UTF8String ?: "?", ff->_fname.UTF8String ?: "?");
         return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: vkCreateGraphicsPipelines FAILED (%@ / %@)", vf->_fname, ff->_fname]); }
