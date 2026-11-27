@@ -694,6 +694,11 @@ static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *
 static uint64_t col_apply(struct drm_crtc_state *cs, bool *changed);     /* hardware colour stages (end of file) */
 static void col_applied(uint64_t gen);
 static void col_rejected(uint64_t gen, int e);
+/* errors that say nothing about the colour state (locks, signals, memory, a busy CRTC): never a refusal */
+static inline bool col_transient(int e)
+{
+    return e == -EDEADLK || e == -EBUSY || e == -EINTR || e == -ERESTARTSYS || e == -ENOMEM || e == -EAGAIN;
+}
 
 static uint32_t flip_submit(struct nmx_flipreq *r)
 {
@@ -705,6 +710,8 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
     struct dma_fence *kf = NULL;        /* out-31 row 1: the surface's last GPU job, waited in the commit */
     uint64_t colgen = 0;                /* colour state generation this commit carries (0 = none staged) */
     bool colchg = false, nocol = false; /* the commit changes the CRTC colour state; retrying without it */
+    uint64_t colsus = 0;                /* the generation whose commit failed: refused only if the retry without it works */
+    int colsus_e = 0;
     int e = -ENOMEM;
 
     if (!nfbp)
@@ -762,10 +769,11 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
             if (!nocol)                 /* staged DEGAMMA_LUT / CTM / GAMMA_LUT ride this flip (no-op when unchanged) */
                 colgen = col_apply(cs, &colchg);
             e = drm_atomic_nonblocking_commit(state);
-            if (e && e != -EDEADLK && e != -EBUSY && colchg) {
-                /* DM refused the flip with the new colour state: mark that generation refused (never attached again)
-                 * and put the frame up without it. NMXAccel sees the refusal through nmxFlipColor's sync. */
-                col_rejected(colgen, e);
+            if (e && colchg && !col_transient(e)) {
+                /* the flip with the new colour state failed: try it without. Only if that one goes through was the
+                 * colour state the cause: then it is refused (never attached again); else it stays staged. */
+                colsus = colgen;
+                colsus_e = e;
                 nocol = true;
                 drm_atomic_state_clear(state);
                 continue;
@@ -773,6 +781,8 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
             if (!e) {
                 if (colgen)
                     col_applied(colgen);
+                if (colsus)
+                    col_rejected(colsus, colsus_e);     /* NMXAccel sees it through nmxFlipColor's sync */
                 commit = cs->commit;    /* locks still held: nothing can swap the CRTC state yet */
                 if (commit)
                     drm_crtc_commit_get(commit);
@@ -1948,7 +1958,12 @@ static void col_applied(uint64_t gen)
     col_unlock();
 }
 
-/* a transaction with colour stages and no plane: commit them on their own (blocking). Thread context. */
+/*
+ * a transaction with colour stages and no plane, or the sync after a present: commit them on their own (blocking:
+ * drm_atomic_commit waits for a flip in flight, so up to about a frame). Thread context. 0 = on screen (or a flip
+ * already carried it), EINVAL = this state was refused (DM failed a commit that changed only it), EAGAIN = not ready /
+ * transient, EIO = failed for another reason (the state stays staged).
+ */
 int nmx_fb_color_commit(void)
 {
     struct drm_modeset_acquire_ctx ctx;
@@ -1956,6 +1971,7 @@ int nmx_fb_color_commit(void)
     struct drm_crtc_state *cs;
     uint64_t gen = 0;
     int e = -ENOMEM;
+    bool refused = false;
 
     if (!flip_init())
         return EAGAIN;
@@ -1986,9 +2002,9 @@ int nmx_fb_color_commit(void)
                 if (!e) {
                     col_applied(gen);
                     __atomic_add_fetch(&gNmxColorAlone, 1, __ATOMIC_RELAXED);
-                } else if (e != -EDEADLK && e != -EINTR && e != -ERESTARTSYS && e != -ENOMEM && chg) {
-                    col_rejected(gen, e);
-                    e = -EINVAL;
+                } else if (chg && !col_transient(e)) {
+                    col_rejected(gen, e);   /* a commit of the colour state alone: the colour state is the cause */
+                    refused = true;
                 }
             }
             if (e != -EDEADLK)
@@ -2002,7 +2018,8 @@ int nmx_fb_color_commit(void)
     drm_modeset_acquire_fini(&ctx);
     if (e)
         __atomic_add_fetch(&gNmxColorErrors, 1, __ATOMIC_RELAXED);
-    return e < 0 ? -e : e;
+    /* EINVAL only for a refusal; a transient error = EAGAIN (try again later); anything else = EIO */
+    return !e ? 0 : refused ? EINVAL : col_transient(e) ? EAGAIN : EIO;
 }
 
 /*
