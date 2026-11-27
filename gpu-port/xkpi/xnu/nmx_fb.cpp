@@ -52,7 +52,7 @@ extern "C" int nmx_vbl_irq;
 extern "C" {
 int nmx_hwcursor;                   // 1 = boot-arg nmxhwcur=1 (read-only)
 int nmx_hwcursor_avail;             // 1 = the plane came up and the framebuffer advertises it
-volatile SInt64 gNmxCurStates, gNmxCurAccepted, gNmxCurSwFallback, gNmxCurCopyRetry;
+volatile SInt64 gNmxCurStates, gNmxCurAccepted, gNmxCurSwFallback, gNmxCurCopyRetry, gNmxCurKeptLast;
 }
 
 /* override/src/linux_pci.c: the panel brightness in percent through amdgpu's backlight ops (set 0 = read) */
@@ -435,6 +435,17 @@ private:
      * oversized images never arrive (WindowServer checks MPMaxCursorSize first, and IOFramebuffer checks maxCursorSize
      * in extSetNewCursor), inverting pixels are accepted (NMX_CUR_INVERT_PIXEL), and there is no run-time off switch.
      * The only refusal left is IOFramebuffer's own descriptor probe at open (convertCursorImage fails by design there).
+     *
+     * Refusal after accept (self-check, IOGraphics IOFramebuffer.cpp): _setCursorImage turns our return value into
+     * shmem->hardwareCursorActive, and resetCursor / showCursor / extSetNewCursor reload through it. A refusal there,
+     * after an image was on the plane, makes IOFramebuffer stop calling setCursorState while WindowServer (which read
+     * the flag before the load) keeps no cursor window: no cursor until the next image. So once an image was accepted
+     * in this WindowServer session, a failed conversion keeps the last accepted image on the plane and answers success
+     * (debug.nmx_cur_kept_last): wrong shape at worst, never a lost cursor. The probe cannot be told from a real
+     * failure (testingCursor is IOFramebuffer-private, both return false untouched), but it only runs at postOpen,
+     * or at a connect change when the probe list is empty, which ours never is. A session ends at IOFramebuffer::close,
+     * which sets kIOWindowServerActiveAttribute to kIOWSAA_Unaccelerated (setAttribute below): the next open's probe
+     * then refuses and hides the plane as before.
      */
     uint32_t fCurSide = 0;              // hardware cursor buffer side; 0 = no hardware cursor (or tearing down)
     uint32_t *fCurStage[2] = {};        // converted images (straight ARGB, rows of fCurW), written under IOFB's lock
@@ -445,6 +456,7 @@ private:
     volatile uint64_t fCurPos = 0;      // (uint32)x << 32 | (uint32)y: the image's top-left (setCursorState)
     volatile UInt32 fCurVis = 0;        // last setCursorState visibility
     volatile UInt32 fCurRefused = 1;    // the last setCursorImage was refused (the probe at open): plane hidden
+    volatile UInt32 fCurSession = 0;    // an image was accepted since WindowServer opened us: never refuse again
     volatile UInt32 fCurArmed = 0;      // fCurWork entered and not yet run
     volatile UInt32 fCurNeedImg = 1;    // upload the image on the next commit (first one, re-arm after a bridge commit)
     volatile SInt32 fCurBusy = 0;       // callers inside the cursor code (teardown waits them out)
@@ -569,6 +581,7 @@ private:
             return false;
         }
         fCurRefused = 1;                                    // nothing accepted yet: the probe at open comes first
+        fCurSession = 0;
         __atomic_store_n(&fCurSide, side, __ATOMIC_SEQ_CST);
         nmx_fb_cursor_set_kick(curKick, this);
         __atomic_store_n(&sCurFb, this, __ATOMIC_SEQ_CST);
@@ -630,7 +643,13 @@ public:
         if (ok && info.cursorWidth <= fCurSide && info.cursorHeight <= fCurSide) {
             __atomic_store_n(&fCurSeq, next, __ATOMIC_RELEASE);
             __atomic_store_n(&fCurRefused, 0u, __ATOMIC_RELEASE);  // S2: visibility comes back with the image
+            __atomic_store_n(&fCurSession, 1u, __ATOMIC_RELEASE);
             OSIncrementAtomic64(&gNmxCurAccepted);
+        } else if (__atomic_load_n(&fCurSession, __ATOMIC_ACQUIRE)) {
+            /* refusal after accept: keep the last accepted image (published seq and visibility untouched) and say
+             * yes, so IOFramebuffer keeps the hardware path and keeps sending positions (see the contract above) */
+            OSIncrementAtomic64(&gNmxCurKeptLast);
+            CURLOG("image not converted after an accepted one: last image kept on the plane");
         } else {
             /* IOFramebuffer's descriptor probe at open (by design), or a conversion failure: hide the plane; with
              * hardwareCursorActive 0 WindowServer draws its cursor window from its next reload on */
@@ -974,7 +993,12 @@ public:
         return IOFramebuffer::getAppleSense(idx, senseType, primary, extended, displayType);
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
-        if (attribute == kIOWindowServerActiveAttribute) { trace("setAttribute wsrv", value); return kIOReturnSuccess; }
+        if (attribute == kIOWindowServerActiveAttribute) {
+            trace("setAttribute wsrv", value);
+            /* IOFramebuffer::close (WindowServer gone): the cursor session ends; the next open's probe refuses again */
+            if ((value & kIOWSAA_StateMask) == kIOWSAA_Unaccelerated) __atomic_store_n(&fCurSession, 0u, __ATOMIC_RELEASE);
+            return kIOReturnSuccess;
+        }
         if (attribute == kIOPowerAttribute) {
             /* display sleep turns the outputs off; wake lights them again with the same buffer */
             if (fDev) { NmxEntry entry; if (!entry.err) nmx_fb_power(fDev, value != 0); }     /* stopping: outputs go with the driver */

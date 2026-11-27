@@ -341,7 +341,7 @@ SYSCTL_INT(_debug, OID_AUTO, nmx_hwcursor, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG
            "hardware cursor: 1 = boot-arg nmxhwcur=1 was given (read-only)");
 SYSCTL_INT(_debug, OID_AUTO, nmx_hwcursor_avail, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_hwcursor_avail, 0,
            "hardware cursor: 1 = the plane is up and the framebuffer advertises it");
-extern "C" volatile SInt64 gNmxCurStates, gNmxCurAccepted, gNmxCurSwFallback, gNmxCurCopyRetry;
+extern "C" volatile SInt64 gNmxCurStates, gNmxCurAccepted, gNmxCurSwFallback, gNmxCurCopyRetry, gNmxCurKeptLast;
 NMX_CNT(nmx_cur_commits, gNmxCurCommits, "hw cursor: cursor plane commits (async + full)");
 NMX_CNT(nmx_cur_full, gNmxCurFull, "hw cursor: of those, commits asked for as full (first, after a re-arm); DM picks async or full itself");
 NMX_CNT(nmx_cur_images, gNmxCurImages, "hw cursor: images uploaded to the cursor buffers");
@@ -351,6 +351,7 @@ NMX_CNT(nmx_cur_off, gNmxCurOff, "hw cursor: plane turned off (framebuffer stop)
 NMX_CNT(nmx_cur_states, gNmxCurStates, "hw cursor: setCursorState calls from IOFramebuffer");
 NMX_CNT(nmx_cur_accepted, gNmxCurAccepted, "hw cursor: setCursorImage calls taken by the plane");
 NMX_CNT(nmx_cur_sw_fallback, gNmxCurSwFallback, "hw cursor: setCursorImage refusals (the descriptor probe at open; anything more is a bug)");
+NMX_CNT(nmx_cur_kept_last, gNmxCurKeptLast, "hw cursor: images not converted after an accepted one (last image kept, answered yes)");
 NMX_CNT(nmx_cur_copy_retry, gNmxCurCopyRetry, "hw cursor: image copies retried because a new image was being written");
 extern "C" int nmx_gtt_format(char *buf, size_t size);
 static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
@@ -559,6 +560,7 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_cur_states,
     &sysctl__debug_nmx_cur_accepted,
     &sysctl__debug_nmx_cur_sw_fallback,
+    &sysctl__debug_nmx_cur_kept_last,
     &sysctl__debug_nmx_cur_copy_retry,
     &sysctl__debug_nmx_gtt,
     &sysctl__debug_nmx_gpu_metrics,
