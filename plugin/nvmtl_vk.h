@@ -99,7 +99,7 @@ uint64_t nvmtl_perf_now(void);
 void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
 /* WS-CPU 9.8: per-stage CPU counters, on by default (NVMTL_STAGE_TIMERS=0 off), printed per present by the 30 s frame
    census. NVMTL_STAGE(ST_x) at the top of a function times the whole call (every return). */
-enum { ST_ENC, ST_PASS, ST_DRAW, ST_SNAP, ST_CAWUS, ST_COMMIT, ST_N };
+enum { ST_ENC, ST_PASS, ST_DRAW, ST_SNAP, ST_CAWUS, ST_COMMIT, ST_ADDR, ST_WRITE, ST_N };
 typedef struct { uint64_t t0; int which; } nvmtl_stage_t;
 int nvmtl_stage_on(void);
 void nvmtl_stage_end(nvmtl_stage_t *s);

@@ -2609,7 +2609,11 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
                  uint32_t dyn[2];  /* dynamic offset of binding 640 that goes with last[] (desc-cache reuse moves it) */
                  uint32_t last_ie[2], last_be[2]; uint8_t last_dep[2];   /* desc-cache: handle epochs last[] was built at */
-                 void *dc; } nvmtl_bindtable;
+                 void *dc;
+                 /* WS-CPU 9.8 cut 2: the desc-cache entry the last lookup hit or inserted (nvmtl_dc_ent *), the pipeline
+                    mask and storage-texture range it was keyed with, and the bindings changed since (kchg: every
+                    kind/handle/offset change, which is all a UBO-mode key reads) */
+                 void *fe[2]; uint64_t fpm[2][4]; uint32_t fhi[2]; uint64_t kchg[2][4]; } nvmtl_bindtable;
 
 static VkDescriptorSetLayout g_setLayout;
 #define NVMTL_MAX_POOLS 68          /* >= the old 64 x 4096 sets with the growing first pools */
@@ -3335,6 +3339,7 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
     if (sl->kind != kind || sl->h != h || sl->off != off) {
         t->dirty[set] = 1;
         t->chg[set][binding >> 6] |= 1ull << (binding & 63);
+        t->kchg[set][binding >> 6] |= 1ull << (binding & 63);
         if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) t->texgen[set]++;
     }
     sl->kind = kind; sl->h = h; sl->off = off;
@@ -3360,7 +3365,7 @@ int nvmtl_vk_bind_buffer_offset(nvk_cmdbuf *c, uint32_t set, uint32_t index, siz
     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
     if (t->s[set][index].kind != NVMTL_SLOT_BUF) return -1;
     if (offset >= t->s[set][index].size) { nvlog("buffer offset %zu exceeds buffer length %zu", offset, t->s[set][index].size); return -1; }
-    if (t->s[set][index].off != offset) t->dirty[set] = 1;
+    if (t->s[set][index].off != offset) { t->dirty[set] = 1; t->kchg[set][index >> 6] |= 1ull << (index & 63); }
     t->s[set][index].off = offset;
     return 0;
 }
@@ -3542,6 +3547,7 @@ static void nvmtl_perf_submit(unsigned sets, const uint64_t *pt)
             (unsigned long long)g_wit_blind, (unsigned long long)g_wit_ctl_fired, (unsigned long long)g_wit_ctl_run, s);
 }
 static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBufferInfo *out) {
+    NVMTL_STAGE(ST_ADDR);
     unsigned slot = c->address_count % NVMTL_TABLES_PER_PAGE;
     nvmtl_address_page *page = c->address_pages;
     if (slot == 0) {
@@ -3640,6 +3646,7 @@ static __thread const VkDescriptorBufferInfo *g_addr_pre; static __thread int g_
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym)
 {
+    NVMTL_STAGE(ST_WRITE);
     VkDescriptorSet set = VK_NULL_HANDLE; VkDescriptorPool pool = VK_NULL_HANDLE;
     VkResult r = VK_ERROR_OUT_OF_POOL_MEMORY;
     if (c->ndcache) {
@@ -3834,17 +3841,19 @@ void nvmtl_vk_frame_census(int what)
         double ns[ST_N], cn[ST_N], sp[SP_N], vn[NVP_N], vc[NVP_N];
         for (int i = 0; i < ST_N; i++) { const unsigned long long a1 = atomic_load(&g_st_ns[i]), a2 = atomic_load(&g_st_n[i]);
             ns[i] = (double)(a1 - l1[i]) / 1e3 / p; cn[i] = (double)(a2 - l2[i]) / p; l1[i] = a1; l2[i] = a2; }
+        static unsigned long long lf[2]; const unsigned long long fv[2] = { __atomic_load_n(&g_dc_fast, __ATOMIC_RELAXED), __atomic_load_n(&g_dc_fast_no, __ATOMIC_RELAXED) };
+        const double fh = (double)(fv[0] - lf[0]) / p, fr = (double)(fv[1] - lf[1]) / p; lf[0] = fv[0]; lf[1] = fv[1];
         for (int i = 0; i < SP_N; i++) { const unsigned long long a1 = atomic_load(&g_sp_ns[i]); sp[i] = (double)(a1 - l3[i]) / 1e3 / p; l3[i] = a1; }
         const unsigned long long sn = atomic_load(&g_sp_n); const double spn = (double)(sn - l4) / p; l4 = sn;
         for (int i = 0; i < NVP_N; i++) { const unsigned long long a1 = atomic_load(&g_nvp_ns[i]), a2 = atomic_load(&g_nvp_n[i]);
             vn[i] = (double)(a1 - l5[i]) / 1e3 / p; vc[i] = (double)(a2 - l6[i]) / p; l5[i] = a1; l6[i] = a2; }
         nvlog_report("frame census stage CPU per present (us [calls]): committing thread: commitAndWaitUntilSubmitted %.1f [%.2f] "
                      "(of it commit %.1f [%.2f]), command buffer begin %.1f [%.2f], render encoder create %.1f [%.2f], render pass begin %.1f [%.2f], "
-                     "draws %.1f [%.1f] (of them set snapshots %.1f [%.1f]); submit [%.2f]: pre-submit hook %.1f, end + prologue %.1f, fence %.1f, "
+                     "draws %.1f [%.1f] (of them set snapshots %.1f [%.1f], fast-path set reuses %.1f, fast path refused %.2f, verified %llu mismatched %llu; address tables %.1f [%.1f], set writes %.1f [%.1f]); submit [%.2f]: pre-submit hook %.1f, end + prologue %.1f, fence %.1f, "
                      "lock + vkQueueSubmit (CS ioctl) %.1f; completion thread: fence wait %.1f (wall, mostly asleep), finish %.1f, retire %.1f; "
                      "buffers new %.1f [%.2f] pooled %.1f [%.2f] freed %.1f [%.2f], heaps %.1f [%.2f], copies %.1f [%.2f], sync in/out %.1f/%.1f",
                      ns[ST_CAWUS], cn[ST_CAWUS], ns[ST_COMMIT], cn[ST_COMMIT], vn[NVP_BEGIN], vc[NVP_BEGIN], ns[ST_ENC], cn[ST_ENC],
-                     ns[ST_PASS], cn[ST_PASS], ns[ST_DRAW], cn[ST_DRAW], ns[ST_SNAP], cn[ST_SNAP], spn,
+                     ns[ST_PASS], cn[ST_PASS], ns[ST_DRAW], cn[ST_DRAW], ns[ST_SNAP], cn[ST_SNAP], fh, fr, (unsigned long long)__atomic_load_n(&g_dc_fast_ver, __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&g_dc_fast_bad, __ATOMIC_RELAXED), ns[ST_ADDR], cn[ST_ADDR], ns[ST_WRITE], cn[ST_WRITE], spn,
                      sp[SP_HOOK], sp[SP_END], sp[SP_FENCE], sp[SP_IOCTL], sp[SP_WAIT], sp[SP_FINISH], sp[SP_RETIRE],
                      vn[NVP_BUFNEW], vc[NVP_BUFNEW], vn[NVP_BUFPOOL], vc[NVP_BUFPOOL], vn[NVP_BUFDEL], vc[NVP_BUFDEL], vn[NVP_HEAP], vc[NVP_HEAP],
                      vn[NVP_COPY], vc[NVP_COPY], vn[NVP_SYNCIN], vn[NVP_SYNCOUT]);
@@ -3911,6 +3920,23 @@ static VkDescriptorSet nvmtl_snapshot_set_c_body(nvk_cmdbuf *c, uint32_t which, 
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
         if (covered) { nvmtl_enc78_count(E78C_SETREUSE, 1); *dyn = t->dyn[which]; return t->last[which]; }
+    }
+    /* WS-CPU 9.8 cut 2: in WindowServer every draw moves a setBytes ring offset, so the table is dirty at every draw and
+       each draw built and hashed the whole key only to hit the entry the previous draw used. When none of the bindings
+       that key reads changed since that entry was hit or written (same pipeline mask and storage-texture range, UBO
+       table mode, no device-level cache), the key is the same: use the entry directly, through the same validity and
+       address-slot checks as a hit. A refusal falls through to the full lookup. NVMTL_DC_FAST=0 turns it off. */
+    if (dcon && t->fe[which] && nvmtl_dc_fast_on() && nvmtl_table_ubo() && !nvmtl_xdc_on()) {
+        const uint32_t lhi = hi > NVMTL_NSTEX ? NVMTL_NSTEX : hi;
+        uint64_t km[4] = { pm[0], pm[1], pm[2], pm[3] };
+        for (uint32_t j = 0; j < lhi && NVMTL_STEX_BASE + j < 256; j++) { const uint32_t i = NVMTL_STEX_BASE + j; km[i >> 6] |= 1ull << (i & 63); }
+        int same = t->fhi[which] == lhi;
+        for (int k = 0; same && k < 4; k++) same = t->fpm[which][k] == pm[k] && !(t->kchg[which][k] & km[k]);
+        if (same) {
+            VkDescriptorSet fs = nvmtl_dc_use(c, t, which, pm, (nvmtl_dc_ent *)t->fe[which], dyn);
+            if (fs) { nvmtl_enc78_count(E78C_SETREUSE, 1); return fs; }
+        }
+        __atomic_add_fetch(&g_dc_fast_no, 1, __ATOMIC_RELAXED);
     }
     nvmtl_dc_probe pr;
     { VkDescriptorSet hit = nvmtl_dc_lookup(c, t, which, pm, hi > NVMTL_NSTEX ? NVMTL_NSTEX : hi, dcon, dyn, &pr);

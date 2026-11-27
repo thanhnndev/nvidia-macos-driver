@@ -244,6 +244,9 @@ static void nvmtl_dc_seen_note(uint64_t h, uint64_t sig, uint32_t ie, uint32_t b
 /* A lookup in flight between the key and the insert after a miss. */
 typedef struct { nvmtl_dcache *dc; uint64_t h, sig; unsigned n, slot; uint8_t dep, plain; uint32_t ie, be; uint64_t k[NVMTL_DC_KEYMAX]; } nvmtl_dc_probe;
 
+static VkDescriptorSet nvmtl_dc_hit(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], nvmtl_dc_ent *e,
+                                    uint32_t ie, uint32_t be, uint32_t *dyn);
+static void nvmtl_dc_arm(nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], uint32_t hi, nvmtl_dc_ent *e);
 /* Returns a reusable set (and its dynamic offset for binding 640 in *dyn), or VK_NULL_HANDLE with pr filled in for
  * nvmtl_dc_insert. The caller has already updated nothing. */
 static VkDescriptorSet nvmtl_dc_lookup(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], uint32_t hi,
@@ -269,27 +272,72 @@ static VkDescriptorSet nvmtl_dc_lookup(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32
     if (!e) { __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); pr->plain = 1; return VK_NULL_HANDLE; }
     if (nvmtl_dc_stale(e) || e->idx >= c->nsets || (VkDescriptorSet)c->sets[e->idx].set != e->set) {
         __atomic_add_fetch(&g_dc_stale, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
+    VkDescriptorSet s = nvmtl_dc_hit(c, t, which, pm, e, pr->ie, pr->be, dyn);
+    if (s) { nvmtl_dc_arm(t, which, pm, hi, e); __atomic_add_fetch(&g_dc_hit, 1, __ATOMIC_RELAXED); }
+    else __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED);
+    return s;
+}
+/* The hit tail, shared by the lookup and the cut-2 fast path: a fresh address-table slot in the entry's page (UBO mode),
+   the dynamic offset, and the bind table's last-set state. VK_NULL_HANDLE when the slot cannot be placed (counted). */
+static VkDescriptorSet nvmtl_dc_hit(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], nvmtl_dc_ent *e,
+                                    uint32_t ie, uint32_t be, uint32_t *dyn)
+{
+    const int ubo = nvmtl_table_ubo();
     uint32_t d = 0;
     if (e->addr && ubo) {
         /* The set's binding 640 points at its own table slot. The next slot must land in the same page, after it. */
         const unsigned at = c->address_count % NVMTL_TABLES_PER_PAGE;
         const nvmtl_address_page *pg = (const nvmtl_address_page *)c->address_pages;
         if (at == 0 || !pg || (VkBuffer)pg->buffer.buf != e->pbuf || at * NVMTL_TABLE_BYTES < e->poff) {
-            __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
+            __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
         VkDescriptorBufferInfo ai;
         if (nvmtl_address_snapshot(c, which, &ai) || (VkBuffer)ai.buffer != e->pbuf || ai.offset < e->poff) {   /* the fresh slot is always past the set's own one */
-            __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
+            __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
         d = (uint32_t)(ai.offset - e->poff);
         const VkDeviceSize al = g_lim.minUniformBufferOffsetAlignment ? g_lim.minUniformBufferOffsetAlignment : 1;
-        if (d % al) { __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_miss, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
+        if (d % al) { __atomic_add_fetch(&g_dc_page, 1, __ATOMIC_RELAXED); return VK_NULL_HANDLE; }
     }
     t->last[which] = e->set; t->last_idx[which] = e->idx; t->last_hi[which] = e->hi; t->dirty[which] = 0;
     memset(t->chg[which], 0, sizeof t->chg[which]);
     memcpy(t->lastw[which], pm, sizeof t->lastw[which]);
     t->dyn[which] = d; *dyn = d;
-    t->last_dep[which] = e->dep; t->last_ie[which] = pr->ie; t->last_be[which] = pr->be;
-    __atomic_add_fetch(&g_dc_hit, 1, __ATOMIC_RELAXED);
+    t->last_dep[which] = e->dep; t->last_ie[which] = ie; t->last_be[which] = be;
     return e->set;
+}
+/* Cut 2: remember entry e as the one whose key the current bindings have (kchg restarts). */
+static void nvmtl_dc_arm(nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], uint32_t hi, nvmtl_dc_ent *e)
+{
+    t->fe[which] = e; memcpy(t->fpm[which], pm, sizeof t->fpm[which]); t->fhi[which] = hi;
+    memset(t->kchg[which], 0, sizeof t->kchg[which]);
+}
+static uint64_t g_dc_fast, g_dc_fast_no, g_dc_fast_ver, g_dc_fast_bad;
+static int nvmtl_dc_fast_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_DC_FAST"); on = !(e && *e == '0');
+        const char *v = getenv("NVMTL_DC_FAST_VERIFY"); if (on && v && *v == '1') on = 2;
+        nvlog("vk: desc-cache fast path %s (NVMTL_DC_FAST, NVMTL_DC_FAST_VERIFY)", on == 2 ? "ON, every use checked against the full key" : on ? "ON" : "OFF"); }
+    return on;
+}
+/* Cut 2 fast path: entry e, whose key the bindings still have (the caller checked kchg), as a lookup hit would use it. */
+static VkDescriptorSet nvmtl_dc_use(nvk_cmdbuf *c, nvmtl_bindtable *t, uint32_t which, const uint64_t pm[4], nvmtl_dc_ent *e, uint32_t *dyn)
+{
+    const uint32_t ie = __atomic_load_n(&g_dc_epoch_img, __ATOMIC_ACQUIRE), be = __atomic_load_n(&g_dc_epoch_buf, __ATOMIC_ACQUIRE);
+    *dyn = 0;
+    if (!e->used || !e->set || nvmtl_dc_stale(e) || e->idx >= c->nsets || (VkDescriptorSet)c->sets[e->idx].set != e->set) return VK_NULL_HANDLE;
+    if (nvmtl_dc_fast_on() == 2) {   /* verify: the full key of the current bindings must be the entry's key */
+        const nvmtl_dcache *dc = (const nvmtl_dcache *)t->dc; uint64_t k[NVMTL_DC_KEYMAX]; uint8_t dep; uint64_t sig;
+        const unsigned n = nvmtl_dc_key(t, which, pm, t->fhi[which], nvmtl_table_ubo(), k, &dep, &sig);
+        __atomic_add_fetch(&g_dc_fast_ver, 1, __ATOMIC_RELAXED);
+        if (!dc || !n || n != e->klen || memcmp(dc->arena + e->koff, k, (size_t)n * sizeof *k)) {
+            if (__atomic_add_fetch(&g_dc_fast_bad, 1, __ATOMIC_RELAXED) <= 8)
+                nvlog("vk: desc-cache fast path MISMATCH: key %u words vs entry %u (stage %u) - full lookup used", n, e->klen, which);
+            return VK_NULL_HANDLE;
+        }
+    }
+    VkDescriptorSet s = nvmtl_dc_hit(c, t, which, pm, e, ie, be, dyn);
+    if (s) { __atomic_add_fetch(&g_dc_hit, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_dc_fast, 1, __ATOMIC_RELAXED); }
+    return s;
 }
 /* After a miss: remember set s (just written, at c->sets[c->nsets - 1]) under the probe's key. */
 static void nvmtl_dc_insert(nvk_cmdbuf *c, const nvmtl_dc_probe *pr, VkDescriptorSet s, uint32_t hi, int addr, int base0)
@@ -312,6 +360,8 @@ static void nvmtl_dc_insert(nvk_cmdbuf *c, const nvmtl_dc_probe *pr, VkDescripto
         e->pbuf = (VkBuffer)pg->buffer.buf; e->poff = base0 ? 0 : (uint32_t)(((c->address_count - 1) % NVMTL_TABLES_PER_PAGE) * NVMTL_TABLE_BYTES);
     }
     __atomic_add_fetch(&g_dc_ins, 1, __ATOMIC_RELAXED);
+    /* the key was built from the bindings this set was just written from: arm the cut-2 fast path on it */
+    if (c->table) nvmtl_dc_arm((nvmtl_bindtable *)c->table, (uint32_t)(pr->k[0] & 0xff), &pr->k[1], (uint32_t)(pr->k[0] >> 8 & 0xffffffffu), e);
 }
 
 /* ---- Device-level desc-cache (WS-CPU 8.9) -------------------------------------------------------------------------
