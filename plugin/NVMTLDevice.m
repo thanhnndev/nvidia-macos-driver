@@ -1296,8 +1296,9 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
                       e = getenv("NVMTL_KEEP_MAX_MS"); long mx = e ? atol(e) : 120000; if (mx > 120000) mx = 120000;   // hard ceiling
                       e = getenv("NVMTL_KEEP_ADAPT");
                       nvmtl_ka.base = nvmtl_ka.eff = keepMs; nvmtl_ka.ceil = MAX(keepMs, mx); nvmtl_ka.on = !(e && e[0] == '0') && nvmtl_ka.ceil > keepMs;
-                      nvlog("surface keep: idle timeout %s: %ld ms, raised up to %ld ms while expired surfaces come back (NVMTL_KEEP_ADAPT, NVMTL_KEEP_MAX_MS)",
-                            nvmtl_ka.on ? "adaptive" : "fixed", keepMs, nvmtl_ka.ceil); }
+                      if (nvmtl_ka.on) nvlog("surface keep: idle timeout adaptive: %ld ms, raised up to %ld ms while expired surfaces come back "
+                                             "(NVMTL_KEEP_ADAPT, NVMTL_KEEP_MAX_MS)", keepMs, nvmtl_ka.ceil);
+                      else nvlog("surface keep: idle timeout fixed: %ld ms (NVMTL_KEEP_ADAPT=0, or NVMTL_KEEP_MAX_MS not above it)", keepMs); }
     NSMutableDictionary<NVMTLSurfKey *, NVMTLSurfKeep *> *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     if (!nvmtl_sk_live) { nvmtl_sk_live = [NSCountedSet new]; nvmtl_sk_gone = [NSMutableDictionary new]; }
