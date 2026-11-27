@@ -1,0 +1,32 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c	2026-11-07 15:04:11
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c	2026-11-07 15:04:22
+@@ -1088,9 +1088,17 @@
+ 	unsigned int i;
+ 	int r;
+ 
+-	r = nmx_cs_prepare_ibs(p, job);
+-	if (r)
+-		return r;
++	/* ga403wm Step93: the b15 prepare (kmap + clflush + snapshot + printf per GFX IB, ~80 lines/s on the
++	 * desktop) is opt-in, bit 1 of debug.nmx_wbinvd. Its causes are fixed at the source (Step84, Step88). */
++	{
++		extern int nmx_wbinvd_before_submit;
++
++		if (nmx_wbinvd_before_submit & 2) {
++			r = nmx_cs_prepare_ibs(p, job);
++			if (r)
++				return r;
++		}
++	}
+ 
+ 	/* Only for UVD/VCE VM emulation */
+ 	if (!ring->funcs->parse_cs && !ring->funcs->patch_cs_in_place)
+@@ -1165,7 +1173,7 @@
+ 		extern int nmx_wbinvd_before_submit;
+ 		extern void pmap_invalidate_cache(void);
+ 
+-		if (nmx_wbinvd_before_submit)
++		if (nmx_wbinvd_before_submit & 1)
+ 			pmap_invalidate_cache();
+ 	}
+ 	return 0;

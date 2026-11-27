@@ -1,0 +1,115 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-08 16:42:45
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-08 16:42:45
+@@ -804,8 +804,88 @@
+ 						 flags & AMDGPU_VM_MTYPE_MASK);
+ 
+ 	return pte_flag;
++}
++
++#ifdef NMXKPI
++/*
++ * ga403wm Step135: a ring of the GPU VA ranges each process mapped without write permission: read-only userptr BOs
++ * (Step96 fallback: the pages are pinned read-only, so the PTEs drop WRITEABLE) and mappings asked without
++ * AMDGPU_VM_PAGE_WRITEABLE. A PERMISSION fault (gmc_v11_0.c) looks its address up here and says which mapping it hit,
++ * so a GPU write into read-only memory is tied to a process and a BO kind (the 15:17 fault named neither).
++ */
++#define NMX_ROMAP_N 1024
++struct nmx_romap {
++	u64 start, end;		/* bytes, end exclusive */
++	u32 pasid;
++	u32 seq;
++	u8 live, kind;		/* kind 1 = read-only userptr, 2 = mapped without WRITEABLE */
++	pid_t pid;
++	char comm[20];
++};
++static struct nmx_romap nmx_romaps[NMX_ROMAP_N];
++static u32 nmx_romap_seq;
++static DEFINE_SPINLOCK(nmx_romap_lock);
++
++static void nmx_romap_note(u32 pasid, u64 start, u64 size, int kind)
++{
++	struct nmx_romap *e;
++	unsigned long fl;
++
++	spin_lock_irqsave(&nmx_romap_lock, fl);
++	e = &nmx_romaps[nmx_romap_seq % NMX_ROMAP_N];
++	e->seq = ++nmx_romap_seq;
++	e->start = start;
++	e->end = start + size;
++	e->pasid = pasid;
++	e->live = 1;
++	e->kind = (u8)kind;
++	e->pid = current->pid;
++	strlcpy(e->comm, current->comm ? current->comm : "", sizeof(e->comm));
++	spin_unlock_irqrestore(&nmx_romap_lock, fl);
+ }
+ 
++/* UNMAP (whole == false: the mapping starting at va) or CLEAR (whole == true: anything inside [va, va + size)) */
++static void nmx_romap_drop(u32 pasid, u64 va, u64 size, bool whole)
++{
++	unsigned long fl;
++	int i;
++
++	spin_lock_irqsave(&nmx_romap_lock, fl);
++	for (i = 0; i < NMX_ROMAP_N; i++) {
++		struct nmx_romap *e = &nmx_romaps[i];
++
++		if (!e->live || e->pasid != pasid)
++			continue;
++		if (whole ? (e->start < va + size && e->end > va) : e->start == va)
++			e->live = 0;
++	}
++	spin_unlock_irqrestore(&nmx_romap_lock, fl);
++}
++
++/* for the fault print: the newest live read-only mapping of pasid that holds addr */
++int nmx_romap_find(u32 pasid, u64 addr, char *buf, size_t len)
++{
++	struct nmx_romap *best = NULL;
++	unsigned long fl;
++	int i, n = 0;
++
++	spin_lock_irqsave(&nmx_romap_lock, fl);
++	for (i = 0; i < NMX_ROMAP_N; i++) {
++		struct nmx_romap *e = &nmx_romaps[i];
++
++		if (e->live && e->pasid == pasid && addr >= e->start && addr < e->end &&
++		    (best == NULL || (s32)(e->seq - best->seq) > 0))
++			best = e;
++	}
++	if (best != NULL)
++		n = snprintf(buf, len, "%s map #%u [%llx, %llx) by %s pid %d",
++			     best->kind == 1 ? "read-only userptr" : "no-WRITEABLE", best->seq,
++			     (unsigned long long)best->start, (unsigned long long)best->end, best->comm, best->pid);
++	spin_unlock_irqrestore(&nmx_romap_lock, fl);
++	return best != NULL ? n : 0;
++}
++#endif
++
+ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 			  struct drm_file *filp)
+ {
+@@ -936,6 +1016,23 @@
+ 	default:
+ 		break;
+ 	}
++#ifdef NMXKPI
++	if (!r) {
++		if (args->operation == AMDGPU_VA_OP_MAP || args->operation == AMDGPU_VA_OP_REPLACE) {
++			if (args->operation == AMDGPU_VA_OP_REPLACE)
++				nmx_romap_drop(fpriv->vm.pasid, args->va_address, args->map_size, true);
++			if (abo && abo->tbo.ttm && amdgpu_ttm_tt_is_userptr(abo->tbo.ttm) &&
++			    amdgpu_ttm_tt_is_readonly(abo->tbo.ttm))
++				nmx_romap_note(fpriv->vm.pasid, args->va_address, args->map_size, 1);
++			else if (!(args->flags & AMDGPU_VM_PAGE_WRITEABLE))
++				nmx_romap_note(fpriv->vm.pasid, args->va_address, args->map_size, 2);
++		} else if (args->operation == AMDGPU_VA_OP_UNMAP) {
++			nmx_romap_drop(fpriv->vm.pasid, args->va_address, 0, false);
++		} else if (args->operation == AMDGPU_VA_OP_CLEAR) {
++			nmx_romap_drop(fpriv->vm.pasid, args->va_address, args->map_size, true);
++		}
++	}
++#endif
+ 	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !adev->debug_vm)
+ 		amdgpu_gem_va_update_vm(adev, &fpriv->vm, bo_va,
+ 					args->operation);

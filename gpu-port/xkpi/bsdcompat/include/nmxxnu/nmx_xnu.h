@@ -35,6 +35,10 @@ void *nmx_xnu_map_phys(uint64_t pa, size_t size, int cache, void **handle);
 /* maps an array of single physical pages contiguously into the kernel (vmap) */
 void *nmx_xnu_map_pages(const uint64_t *pages, size_t npages, int cache, void **handle);
 void nmx_xnu_unmap(void *handle);
+/* physical address at a prepared IOMemoryDescriptor offset, and the segment length (ga403wm Step99 imports) */
+uint64_t nmx_xnu_md_phys(void *md, uint64_t offset, uint64_t *len);
+/* ga403wm Step128: a boot stage mark in NVRAM (nmxgpu-stage); sleepable contexts only */
+void nmx_xnu_stage(const char *what);
 
 /* ---- another process's memory (nmx_mm.cpp) -------------------------------------------------------------------------- */
 
@@ -55,6 +59,16 @@ int nmx_xnu_mm_copy(void *mm, uint64_t uaddr, void *kbuf, size_t len, int to_use
  */
 int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle);
 void nmx_xnu_user_unwire(void *handle);
+/*
+ * ga403wm Step142: dropping a wiring while its BO is idle and taking it again when the GPU needs it. Only an IOSurface's
+ * own descriptor is parkable (no task behind it). park: 0 or ENOTSUP; the descriptor stays held (memory allocated,
+ * pageable). rewire: wires a parked handle again (a wired one is left as it is) and returns the physical address of
+ * each of its first npages pages, which may differ from before. Park, rewire and unwire of one handle must not run at
+ * the same time (the caller serialises them).
+ */
+int nmx_xnu_user_parkable(void *handle);
+int nmx_xnu_user_park(void *handle);
+int nmx_xnu_user_rewire(void *handle, size_t npages, uint64_t *phys);
 
 /* ---- DMA (nmx_dma.cpp) -------------------------------------------------------------------------------------------- */
 
@@ -157,8 +171,13 @@ int nmx_xnu_devfs_busy(void);
 /* a clone node at /dev/<path>; 'cookie' is handed back to nmx_cdev_open for every open of it */
 void *nmx_xnu_devfs_make(const char *path, uint32_t uid, uint32_t gid, int mode, void *cookie);
 void nmx_xnu_devfs_remove(void *node);
-/* maps physical pages into the calling process (the GPU mmap ioctl); 'uaddr' receives the user address */
-int nmx_xnu_map_user(const uint64_t *pages, size_t npages, int cache, int writable, uint64_t *uaddr, void **handle);
+/*
+ * maps physical pages into the calling process (the GPU mmap ioctl); 'uaddr' receives the user address. fixed != 0
+ * places the mapping at that address, replacing whatever the process had there (Linux MAP_FIXED); unmapping such a
+ * mapping leaves a hole, as munmap(2) does.
+ */
+int nmx_xnu_map_user(const uint64_t *pages, size_t npages, int cache, int writable, uint64_t fixed, uint64_t *uaddr,
+                     void **handle);
 void nmx_xnu_unmap_user(void *handle);
 
 /* implemented on the LinuxKPI side (override/src/nmx_linux_cdev.c), called by the device-node glue */

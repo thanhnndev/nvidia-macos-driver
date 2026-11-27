@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "2.0.3"
-    static let name = "nullmoth-nvidia-2.0.3.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.0.3/nullmoth-nvidia-2.0.3.tar.gz")!
-    static let sha256 = "9868142c88941985b7105d8ac48539774533cd8babd56d74ad3b03a7c04c5721"
+    static let version = "2.0.4"
+    static let name = "nullmoth-nvidia-2.0.4.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.0.4/nullmoth-nvidia-2.0.4.tar.gz")!
+    static let sha256 = "ae307a431cb0e964757c15ed68d090508e2d85d01160599fbe9b899ae9ccf81b"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -448,6 +448,15 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
                 extra: ["--gpu-test", (b["on"] as? Bool ?? false) ? "on" : "off",
                         "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path]
                     + (pk.map { ["--pkg", $0, "--sha", Package.sha256] } ?? []))
+        // macOS 15 -> 26: setup's one-button path ("--update prepare" with the package) installs or updates the driver,
+        // then parks it and sets the installer's small BAR; "--update cancel" puts it all back before the update
+        case "osupdate":
+            if b["cancel"] as? Bool ?? false {
+                run(mode: "tahoecancel", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--update", "cancel"])
+            } else if let pk = b["pkg"] as? String, !pk.isEmpty {
+                run(mode: "tahoe", pkg: pk, efi: b["efi"] as? String ?? "auto", extra: ["--update", "prepare"])
+            }
+        case "swupdate": NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Software-Update-Settings.extension")!)
         default: break
         }
     }
@@ -483,7 +492,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         // laptop guides (it hides every discrete GPU, NVIDIA included), and a disable-gpu property or a dGPU-off SSDT
         // does the same: the card is then on the bus with another class code, or not on the bus at all.
         let hiding = sysctl("kern.bootargs").split(separator: " ").map(String.init)
-            .filter { ["-wegnoegpu", "-wegonogpu", "-nvoff"].contains($0) }
+            .filter { ["-wegnoegpu", "-wegonogpu", "-nvoff", "-wegnoigpu"].contains($0) }
         let hiddenNvidia = services("IOPCIDevice").compactMap { s -> String? in
             defer { IOObjectRelease(s) }
             guard u32(s, "vendor-id").map({ $0 & 0xffff }) == 0x10DE, let cls = u32(s, "class-code"), cls >> 16 != 0x03,
@@ -990,7 +999,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     }
 
     func run(mode: String, pkg: String, efi: String, extra: [String], expectedSha: String? = nil) {
-        guard ["dry", "install", "remove", "usbmap", "verbose"].contains(mode),
+        guard ["dry", "install", "remove", "usbmap", "verbose", "tahoe", "tahoecancel"].contains(mode),
               !runningSetup, pendingDownload == nil else { return }
         runningSetup = true
         let log: URL
@@ -1027,7 +1036,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         var args: [String]
         switch mode {
         case "remove": args = ["--remove"]
-        case "usbmap", "verbose": args = extra
+        case "usbmap", "verbose", "tahoecancel": args = extra
         default:
             args = ["--pkg", pkg, "--sha", expectedSha ?? Package.sha256, "--tool", res.appendingPathComponent("NullMothSafe.efi").path,
                     "--app", Bundle.main.executablePath ?? ""]

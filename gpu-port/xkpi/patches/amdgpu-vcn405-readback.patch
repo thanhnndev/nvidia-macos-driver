@@ -1,0 +1,37 @@
+--- a/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c	2026-11-08 17:33:17
++++ b/drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c	2026-11-08 17:33:17
+@@ -982,6 +982,11 @@
+ 			ring->doorbell_index << VCN_RB1_DB_CTRL__OFFSET__SHIFT |
+ 			VCN_RB1_DB_CTRL__EN_MASK);
+ 
++	/* ga403wm Step136 (upstream "drm/amdgpu: read back register after written for VCN v4.0.5"): keep one read-back so
++	 * every register write above has landed before the doorbell is used; without it VCN could miss the WPTR after
++	 * starting from idle and the next job timed out (vcn_unified_0, signaled = emitted - 1, after a power-gate cycle). */
++	RREG32_SOC15(VCN, inst_idx, regUVD_STATUS);
++
+ 	return 0;
+ }
+ 
+@@ -1166,6 +1171,11 @@
+ 		tmp |= VCN_RB_ENABLE__RB1_EN_MASK;
+ 		WREG32_SOC15(VCN, i, regVCN_RB_ENABLE, tmp);
+ 		fw_shared->sq.queue_mode &= ~(FW_QUEUE_RING_RESET | FW_QUEUE_DPG_HOLD_OFF);
++
++		/* ga403wm Step136 (upstream "drm/amdgpu: read back register after written for VCN v4.0.5"): keep one read-back so
++		 * every register write above has landed before the doorbell is used; without it VCN could miss the WPTR after
++		 * starting from idle and the next job timed out (vcn_unified_0, signaled = emitted - 1, after a power-gate cycle). */
++		RREG32_SOC15(VCN, i, regUVD_STATUS);
+ 	}
+ 
+ 	return 0;
+@@ -1197,6 +1207,10 @@
+ 	/* disable dynamic power gating mode */
+ 	WREG32_P(SOC15_REG_OFFSET(VCN, inst_idx, regUVD_POWER_STATUS), 0,
+ 		~UVD_POWER_STATUS__UVD_PG_MODE_MASK);
++	/* ga403wm Step136 (upstream "drm/amdgpu: read back register after written for VCN v4.0.5"): keep one read-back so
++	 * every register write above has landed before the doorbell is used; without it VCN could miss the WPTR after
++	 * starting from idle and the next job timed out (vcn_unified_0, signaled = emitted - 1, after a power-gate cycle). */
++	RREG32_SOC15(VCN, inst_idx, regUVD_STATUS);
+ }
+ 
+ /**

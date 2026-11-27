@@ -1,0 +1,350 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1512,7 +1512,273 @@
+  * Returns:
+  * 0 for success.
+  *
++ */
++#ifdef NMXKPI
++/*
++ * ga403wm FRAME-PATH row 12 (10.4): name what a faulting GPU address was. The VideoToolbox and mediaanalysisd faults
++ * are PERMISSION_FAULTS 0x5 (a write through a V = 0 PTE) with MAPPING_ERROR 0: the page tables exist and say "not
++ * valid". Linux writes V = 0 for a mapping that was freed (amdgpu_vm_clear_freed) or for a BO placed in SYSTEM (an
++ * evicted or parked BO). The fault print says neither which, nor which BO. Two read-only aids, printed under the fault:
++ * - a ring of the last NMX_VAFREE_N ranges whose PTEs clear_freed invalidated (pasid, range, when): a hit = the GPU
++ *   used an address after its process unmapped it (a use-after-free in the client or its driver);
++ * - the live mapping at the address, looked up under a trylock of the VM's root reservation: the BO, its placement
++ *   (SYSTEM = evicted/parked: its PTEs are V = 0 until a CS validates it), userptr or not, size and pin count.
++ */
++#define NMX_VAFREE_N 4096	/* 32 B each; a power of two (the u32 sequence wraps onto the same slots) */
++struct nmx_vafree {
++	u64 start, end;		/* bytes, end exclusive */
++	u64 ns;
++	u32 pasid;
++	u32 seq;
++};
++static struct nmx_vafree nmx_vafrees[NMX_VAFREE_N];
++static u32 nmx_vafree_seq;
++static DEFINE_SPINLOCK(nmx_vafree_lock);
++
++static void nmx_vafree_note(u32 pasid, u64 start_pfn, u64 last_pfn)
++{
++	struct nmx_vafree *e;
++	unsigned long fl;
++
++	spin_lock_irqsave(&nmx_vafree_lock, fl);
++	e = &nmx_vafrees[nmx_vafree_seq % NMX_VAFREE_N];
++	e->seq = ++nmx_vafree_seq;
++	e->start = start_pfn << AMDGPU_GPU_PAGE_SHIFT;
++	e->end = (last_pfn + 1) << AMDGPU_GPU_PAGE_SHIFT;
++	e->ns = ktime_get_ns();
++	e->pasid = pasid;
++	spin_unlock_irqrestore(&nmx_vafree_lock, fl);
++}
++
++/* the fault print's NMX lines (gmc_v11_0_process_interrupt; IH thread context, nothing here sleeps) */
++void nmx_vm_fault_name(struct amdgpu_device *adev, u32 pasid, u64 addr)
++{
++	struct amdgpu_bo *root = NULL;
++	struct amdgpu_vm *vm;
++	unsigned long fl;
++	struct nmx_vafree hit[4];
++	u64 now = ktime_get_ns();
++	u32 last;
++	int i, hits = 0;
++
++	xa_lock_irqsave(&adev->vm_manager.pasids, fl);
++	vm = xa_load(&adev->vm_manager.pasids, pasid);
++	if (vm && vm->root.bo)
++		root = amdgpu_bo_ref(vm->root.bo);
++	xa_unlock_irqrestore(&adev->vm_manager.pasids, fl);
++
++	if (root == NULL) {
++		dev_err(adev->dev, "  NMX: pasid %u has no VM any more\n", pasid);
++	} else if (!dma_resv_trylock(root->tbo.base.resv)) {
++		dev_err(adev->dev, "  NMX: VM of pasid %u busy, live mapping not looked up\n", pasid);
++	} else {
++		struct amdgpu_bo_va_mapping *m = NULL;
++
++		xa_lock_irqsave(&adev->vm_manager.pasids, fl);
++		vm = xa_load(&adev->vm_manager.pasids, pasid);
++		xa_unlock_irqrestore(&adev->vm_manager.pasids, fl);
++		if (vm && vm->root.bo == root)
++			m = amdgpu_vm_bo_lookup_mapping(vm, addr >> AMDGPU_GPU_PAGE_SHIFT);
++		if (m == NULL) {
++			dev_err(adev->dev, "  NMX: no live mapping at 0x%llx\n", addr);
++		} else {
++			struct amdgpu_bo *bo = m->bo_va ? m->bo_va->base.bo : NULL;
++			/* review 3: tbo.resource / tbo.ttm change under the BO's own reservation; a per-VM BO shares the
++			 * root's (held), any other is tried, and its placement is not read when someone holds it */
++			bool own = bo && bo->tbo.base.resv != root->tbo.base.resv;
++			bool locked = bo && (!own || dma_resv_trylock(bo->tbo.base.resv));
++
++			dev_err(adev->dev, "  NMX: live mapping 0x%llx-0x%llx flags 0x%llx bo %p size %lu placement %d "
++				"(0 SYSTEM = evicted/parked, 1 GTT, 2 VRAM, -2 BO busy) userptr %d pin %u prefer 0x%x "
++				"IOSurface %u\n",
++				m->start << AMDGPU_GPU_PAGE_SHIFT, (m->last + 1) << AMDGPU_GPU_PAGE_SHIFT,
++				(unsigned long long)m->flags, bo, bo ? (unsigned long)amdgpu_bo_size(bo) : 0UL,
++				!bo ? -1 : !locked ? -2 : bo->tbo.resource ? (int)bo->tbo.resource->mem_type : -1,
++				!bo ? -1 : !locked ? -2 : bo->tbo.ttm ? (int)amdgpu_ttm_tt_is_userptr(bo->tbo.ttm) : -1,
++				bo ? bo->tbo.pin_count : 0, bo ? bo->preferred_domains : 0,
++				locked && bo->tbo.ttm ? amdgpu_ttm_tt_nmx_sid(bo->tbo.ttm) : 0);
++			if (own && locked)
++				dma_resv_unlock(bo->tbo.base.resv);
++		}
++		dma_resv_unlock(root->tbo.base.resv);
++	}
++	if (root)
++		amdgpu_bo_unref(&root);
++
++	/* review 4: copy the hits under the lock, print after it (clear_freed notes under it from CS threads) */
++	spin_lock_irqsave(&nmx_vafree_lock, fl);
++	last = nmx_vafree_seq;
++	for (i = 0; i < NMX_VAFREE_N && hits < 4; i++) {
++		struct nmx_vafree *e = &nmx_vafrees[(last - 1 - i) % NMX_VAFREE_N];
++
++		if (e->seq == 0 || e->pasid != pasid || addr < e->start || addr >= e->end)
++			continue;
++		hit[hits++] = *e;
++	}
++	spin_unlock_irqrestore(&nmx_vafree_lock, fl);
++	for (i = 0; i < hits; i++)
++		dev_err(adev->dev, "  NMX: 0x%llx was FREED: range 0x%llx-0x%llx invalidated %llu ms ago (free #%u of %u)\n",
++			addr, hit[i].start, hit[i].end, (now - hit[i].ns) / 1000000ULL, hit[i].seq, last);
++	if (hits == 0)
++		dev_err(adev->dev, "  NMX: 0x%llx is in none of the last %u freed ranges\n", addr,
++			last < NMX_VAFREE_N ? last : NMX_VAFREE_N);
++}
++/*
++ * ga403wm row 12 (2026-11-18 20:34): after a GPU page fault the faulting job does not finish; the ring sat until the
++ * 3 s gfx timeout (amdgpu-gfx-timeout-3s.patch) soft-recovered it, and every process waiting on that ring waited too
++ * (WindowServer's fenced flip 2 s -> flips off). panfrost/etnaviv call drm_sched_fault() from their fault IRQ to run
++ * the timeout handler at once. Here, only with debug.nmx_fault_kick_on = 1 (default 0), and only a soft recovery:
++ *  - only rings with funcs->soft_recovery (gfx, compute): VCN has none (-> full GPU reset), SDMA would go to ring reset
++ *  - only when exactly one such ring on the faulting hub has a head job of that pasid + vmid (else ambiguous: skip)
++ *  - the token names that job (pointer + finished fence seqno). A timeout handler run younger than the ring's own
++ *    timeout since the token is the kick's (however late the work ran, review N1): it soft-recovers only that job,
++ *    any other head job is put back untouched (with the free-queue rerun the scheduler would have done). Older: the
++ *    token is stale (its work found the ring empty) and the run is a genuine timeout. A new kick replaces a token
++ *    older than 100 ms
++ *  - a kicked job whose soft recovery fails is put back too: the 3 s timer then handles it as before (ring reset ...)
++ *  - one kick per pasid per second (a table of 16 pasids, stamped only when a kick is issued, review N3): trailing
++ *    fault interrupts for the same wave never kick that process's next job
+  */
++extern volatile long long gNmxFaultKick, gNmxFaultKickIgnored, gNmxFaultKickFail;
++extern int nmx_fault_kick_on;
++struct nmx_kick_tok {
++	struct drm_sched_job *job;	/* identity only, never dereferenced from the token */
++	u64 seqno, ns;
++};
++static struct nmx_kick_tok nmx_kick_tok[AMDGPU_MAX_RINGS];	/* under that ring's sched.job_list_lock */
++static DEFINE_SPINLOCK(nmx_kick_rl_lock);
++#define NMX_KICK_RL_N		16
++static struct { u32 pasid; u64 ns; } nmx_kick_rl[NMX_KICK_RL_N];	/* under nmx_kick_rl_lock */
++#define NMX_KICK_TOK_NS		(100ULL * 1000000ULL)
++#define NMX_KICK_RL_NS		(1000ULL * 1000000ULL)
++
++/* the pasid was kicked less than a second ago */
++static bool nmx_kick_rl_recent(u32 pasid, u64 now)
++{
++	bool hit = false;
++	int i;
++
++	spin_lock(&nmx_kick_rl_lock);
++	for (i = 0; i < NMX_KICK_RL_N; i++)
++		if (nmx_kick_rl[i].pasid == pasid && now - nmx_kick_rl[i].ns < NMX_KICK_RL_NS)
++			hit = true;
++	spin_unlock(&nmx_kick_rl_lock);
++	return hit;
++}
++
++/* stamp a kick: the pasid's own slot, else a free or expired one, else the oldest */
++static void nmx_kick_rl_stamp(u32 pasid, u64 now)
++{
++	int i, pick = -1, old = 0;
++
++	spin_lock(&nmx_kick_rl_lock);
++	for (i = 0; i < NMX_KICK_RL_N && pick < 0; i++)
++		if (nmx_kick_rl[i].pasid == pasid)
++			pick = i;
++	for (i = 0; i < NMX_KICK_RL_N && pick < 0; i++)
++		if (!nmx_kick_rl[i].pasid || now - nmx_kick_rl[i].ns >= NMX_KICK_RL_NS)
++			pick = i;
++	for (i = 1; i < NMX_KICK_RL_N && pick < 0; i++)
++		if (nmx_kick_rl[i].ns < nmx_kick_rl[old].ns)
++			old = i;
++	if (pick < 0)
++		pick = old;
++	nmx_kick_rl[pick].pasid = pasid;
++	nmx_kick_rl[pick].ns = now;
++	spin_unlock(&nmx_kick_rl_lock);
++}
++
++void nmx_vm_fault_kick(struct amdgpu_device *adev, u32 pasid, u32 vmid, u32 hub)
++{
++	struct amdgpu_ring *hit = NULL;
++	struct drm_sched_job *hjob = NULL;
++	u64 hseq = 0, now;
++	int i, n = 0;
++	bool go;
++
++	if (!pasid || !READ_ONCE(nmx_fault_kick_on))
++		return;
++	for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
++		struct amdgpu_ring *ring = adev->rings[i];
++		struct drm_sched_job *s_job;
++
++		if (!ring || !ring->sched.ready || ring->vm_hub != hub || !ring->funcs->soft_recovery)
++			continue;
++		spin_lock(&ring->sched.job_list_lock);
++		s_job = list_first_entry_or_null(&ring->sched.pending_list, struct drm_sched_job, list);
++		if (s_job && to_amdgpu_job(s_job)->pasid == pasid && to_amdgpu_job(s_job)->vmid == vmid) {
++			n++;
++			hit = ring;
++			hjob = s_job;
++			hseq = s_job->s_fence->finished.seqno;
++		}
++		spin_unlock(&ring->sched.job_list_lock);
++	}
++	if (n != 1) {
++		if (n > 1)
++			__atomic_add_fetch(&gNmxFaultKickIgnored, 1, __ATOMIC_RELAXED);	/* gfx + compute: which one? */
++		return;
++	}
++	now = ktime_get_ns();
++	if (nmx_kick_rl_recent(pasid, now)) {
++		__atomic_add_fetch(&gNmxFaultKickIgnored, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	spin_lock(&hit->sched.job_list_lock);
++	go = list_first_entry_or_null(&hit->sched.pending_list, struct drm_sched_job, list) == hjob &&
++	     hjob->s_fence->finished.seqno == hseq &&
++	     !(nmx_kick_tok[hit->idx].job && now - nmx_kick_tok[hit->idx].ns < NMX_KICK_TOK_NS);
++	if (go) {
++		nmx_kick_tok[hit->idx].job = hjob;
++		nmx_kick_tok[hit->idx].seqno = hseq;
++		nmx_kick_tok[hit->idx].ns = now;
++	}
++	spin_unlock(&hit->sched.job_list_lock);
++	if (!go)
++		return;
++	nmx_kick_rl_stamp(pasid, now);
++	__atomic_add_fetch(&gNmxFaultKick, 1, __ATOMIC_RELAXED);
++	dev_err(adev->dev, "  NMX: ring %s head job is the faulting one (pasid %u vmid %u): soft recovery now\n",
++		hit->name, pasid, vmid);
++	drm_sched_fault(&hit->sched);
++}
++
++/* drm_sched_job_timedout took s_job off the pending list: put it back at the head, untouched, and rerun the free
++ * queue as drm_sched_free_job_work would (a job that finished meanwhile is freed now, not at the next completion) */
++void nmx_vm_fault_kick_putback(struct amdgpu_ring *ring, struct drm_sched_job *s_job)
++{
++	struct drm_gpu_scheduler *sched = &ring->sched;
++
++	spin_lock(&sched->job_list_lock);
++	list_add(&s_job->list, &sched->pending_list);
++	if (dma_fence_is_signaled(&s_job->s_fence->finished) && !READ_ONCE(sched->pause_submit))
++		queue_work(sched->submit_wq, &sched->work_free_job);
++	spin_unlock(&sched->job_list_lock);
++}
++
++/* amdgpu_job_timedout: 0 = a timeout, handle it as always; 1 = the kicked faulting job: soft recovery only;
++ * -1 = a kick that found another job at the head: it was put back, untouched */
++int nmx_vm_fault_kick_take(struct amdgpu_ring *ring, struct drm_sched_job *s_job)
++{
++	struct nmx_kick_tok t;
++	u64 now = ktime_get_ns();
++
++	spin_lock(&ring->sched.job_list_lock);
++	t = nmx_kick_tok[ring->idx];
++	nmx_kick_tok[ring->idx].job = NULL;
++	spin_unlock(&ring->sched.job_list_lock);
++	/* no kick; or a token as old as the ring's timeout: its work found the ring empty, and this run is the timer
++	 * of a job queued after it (that timer started after the token) */
++	if (!t.job || now - t.ns >= (u64)jiffies_to_msecs(ring->sched.timeout) * 1000000ULL)
++		return 0;
++	if (t.job == s_job && t.seqno == s_job->s_fence->finished.seqno)
++		return 1;
++	__atomic_add_fetch(&gNmxFaultKickIgnored, 1, __ATOMIC_RELAXED);
++	nmx_vm_fault_kick_putback(ring, s_job);
++	return -1;
++}
++#endif
++
+ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
+ 			  struct amdgpu_vm *vm,
+ 			  struct dma_fence **fence)
+@@ -1537,6 +1803,9 @@
+ 		mapping = list_first_entry(&vm->freed,
+ 			struct amdgpu_bo_va_mapping, list);
+ 		list_del(&mapping->list);
++#ifdef NMXKPI
++		nmx_vafree_note(vm->pasid, mapping->start, mapping->last);
++#endif
+ 
+ 		r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
+ 					   &sync, mapping->start, mapping->last,
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c
+@@ -124,7 +124,15 @@
+ 		amdgpu_vm_update_fault_cache(adev, entry->pasid, addr, status,
+ 					     entry->vmid_src ? AMDGPU_MMHUB0(0) : AMDGPU_GFXHUB(0));
+ 	}
++#ifdef NMXKPI
++	{
++		void nmx_vm_fault_kick(struct amdgpu_device *adev, u32 pasid, u32 vmid, u32 hub);	/* amdgpu_vm.c */
+ 
++		nmx_vm_fault_kick(adev, entry->pasid, entry->vmid,
++				  entry->vmid_src ? AMDGPU_MMHUB0(0) : AMDGPU_GFXHUB(0));
++	}
++#endif
++
+ 	if (printk_ratelimit()) {
+ 		struct amdgpu_task_info *task_info;
+ 
+@@ -153,6 +161,11 @@
+ 			else
+ 				dev_err(adev->dev, "  NMX: address is in no recorded read-only mapping of pasid %u\n",
+ 					entry->pasid);
++		}
++		{
++			void nmx_vm_fault_name(struct amdgpu_device *adev, u32 pasid, u64 addr);	/* amdgpu_vm.c, row 12 */
++
++			nmx_vm_fault_name(adev, entry->pasid, addr);
+ 		}
+ #endif
+ 
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -94,6 +94,31 @@
+ 	int idx;
+ 	int r;
+ 
++#ifdef NMXKPI
++	{
++		int nmx_vm_fault_kick_take(struct amdgpu_ring *ring, struct drm_sched_job *s_job);	/* amdgpu_vm.c */
++		void nmx_vm_fault_kick_putback(struct amdgpu_ring *ring, struct drm_sched_job *s_job);
++		extern volatile long long gNmxFaultKickFail;
++		int k = nmx_vm_fault_kick_take(ring, s_job);
++
++		if (k < 0)
++			return DRM_GPU_SCHED_STAT_NOMINAL;	/* not a timeout: the timer restarts for it */
++		if (k > 0) {
++			/* the GPU page fault kicked this job: soft recovery or nothing. Either way it goes back on the
++			 * pending list (finished: freed by the free queue; not: the 3 s timer handles it as a timeout) */
++			if (amdgpu_gpu_recovery &&
++			    amdgpu_ring_soft_recovery(ring, job->vmid, s_job->s_fence->parent)) {
++				dev_err(adev->dev, "ring %s faulting job soft recovered\n", s_job->sched->name);
++			} else {
++				__atomic_add_fetch(&gNmxFaultKickFail, 1, __ATOMIC_RELAXED);
++				dev_err(adev->dev, "ring %s faulting job: soft recovery failed, left to the timeout\n",
++					s_job->sched->name);
++			}
++			nmx_vm_fault_kick_putback(ring, s_job);
++			return DRM_GPU_SCHED_STAT_NOMINAL;
++		}
++	}
++#endif
+ 	/* NullMoth: a timed-out job is the failure this port must survive; count it where a reader can see it. */
+ 	{ extern void nmx_job_timeout(unsigned vmid); nmx_job_timeout(job->vmid); }
+ 

@@ -864,6 +864,26 @@ int bus_setup_intr(device_t dev, struct resource *r, int flags, driver_filter_t 
     return 0;
 }
 
+/* ga403wm Step97 irqwatch: the interrupt event sources' counters, one line each (first four) */
+void nmx_xnu_pci_irq_describe(void *cookie, char *buf, size_t len);
+void nmx_bus_dump_intrs(void (*say)(const char *))
+{
+    struct nmx_intr *in;
+    char s[200];
+    int i = 0, n;
+
+    mtx_lock(&bus_mtx);
+    TAILQ_FOREACH(in, &intrs, link) {
+        if (i >= 4)
+            break;
+        n = snprintf(s, sizeof(s), "intr %d irqno %d ", i++, in->r ? (int)in->r->irqno : -1);
+        if (n > 0 && n < (int)sizeof(s))
+            nmx_xnu_pci_irq_describe(in->xcookie, s + n, sizeof(s) - n);
+        say(s);
+    }
+    mtx_unlock(&bus_mtx);
+}
+
 int bus_teardown_intr(device_t dev, struct resource *r, void *cookie)
 {
     struct nmx_intr *in = cookie;

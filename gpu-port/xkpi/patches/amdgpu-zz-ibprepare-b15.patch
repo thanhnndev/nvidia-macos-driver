@@ -1,0 +1,211 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c
+@@ -34,46 +34,6 @@
+ #include "amdgpu.h"
+ #include "atom.h"
+ #include "amdgpu_trace.h"
+-
+-/*
+- * NullMoth b14: a user IB has no kernel pointer (ib->ptr is NULL) and its dwords reach memory through the process's
+- * own mapping. Push the IB's lines out before the CP fetches them, and say which IB each submission carries, so a
+- * stuck job can be matched to the PM4 the CP was asked to run.
+- */
+-static void nmx_ib_prepare(struct amdgpu_job *job, struct amdgpu_ib *ib)
+-{
+-	struct amdgpu_bo_va_mapping *m;
+-	struct amdgpu_bo *bo;
+-	void *kaddr = NULL;
+-	u64 off;
+-	u32 i;
+-
+-	if (!job || !job->vm || !ib->length_dw || ib->ptr || !ib->gpu_addr)
+-		return;
+-
+-	m = amdgpu_vm_bo_lookup_mapping(job->vm, ib->gpu_addr >> PAGE_SHIFT);
+-	if (!m || !m->bo_va || !m->bo_va->base.bo)
+-		return;
+-	bo = m->bo_va->base.bo;
+-
+-	off = m->offset + (ib->gpu_addr - (m->start << PAGE_SHIFT));
+-	if (amdgpu_bo_kmap(bo, &kaddr) || !kaddr)
+-		return;
+-
+-	{
+-		char *p = (char *)kaddr + off;
+-
+-		for (i = 0; i < ib->length_dw * 4; i += 64)
+-			__asm__ __volatile__("clflush (%0)" : : "r"(p + i) : "memory");
+-		mb();
+-		printf("NullMoth ibsub: vmid %u pasid %u va %llx len %u off %llx first %08x %08x %08x %08x %08x\n",
+-		       job->vmid, job->pasid, (unsigned long long)ib->gpu_addr, ib->length_dw,
+-		       (unsigned long long)off, ((u32 *)p)[0], ((u32 *)p)[1], ((u32 *)p)[2],
+-		       ((u32 *)p)[3], ((u32 *)p)[4]);
+-	}
+-	amdgpu_bo_kunmap(bo);
+-}
+-
+ 
+ #define AMDGPU_IB_TEST_TIMEOUT	msecs_to_jiffies(1000)
+ #define AMDGPU_IB_TEST_GFX_XGMI_TIMEOUT	msecs_to_jiffies(2000)
+@@ -299,7 +259,6 @@
+ 			}
+ 		}
+ 
+-		nmx_ib_prepare(job, ib);
+ 		amdgpu_ring_emit_ib(ring, job, ib, status);
+ 		status &= ~AMDGPU_HAVE_CTX_SWITCH;
+ 	}
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1019,12 +1019,78 @@
+ 	}
+ }
+ 
++/* NMX b15: prepare CPU-authored GFX IBs while CS still owns the VM and
++ * BO reservations. job->vm is cleared by prepare_job before run_job, so
++ * the former amdgpu_ib_schedule hook could never reach a user IB.
++ */
++static int nmx_cs_prepare_ibs(struct amdgpu_cs_parser *p,
++			      struct amdgpu_job *job)
++{
++	unsigned int i;
++
++	if (amdgpu_job_ring(job)->funcs->type != AMDGPU_RING_TYPE_GFX)
++		return 0;
++	for (i = 0; i < job->num_ibs; ++i) {
++		struct amdgpu_ib *ib = &job->ibs[i];
++		struct amdgpu_bo_va_mapping *m;
++		struct amdgpu_bo *bo;
++		u64 va = ib->gpu_addr & AMDGPU_GMC_HOLE_MASK;
++		u64 bytes = (u64)ib->length_dw * sizeof(u32), delta, off, pos;
++		void *kaddr;
++		char *data;
++		int r;
++
++		if (ib->ptr || !bytes)
++			continue;
++		r = amdgpu_cs_find_mapping(p, va, &bo, &m);
++		if (r)
++			return r;
++		/* Validate both the VA mapping and the underlying BO before kmap.
++		 * All arithmetic is 64-bit; subtraction avoids end overflow. */
++		delta = va - (m->start << AMDGPU_GPU_PAGE_SHIFT);
++		if (bytes > ((m->last + 1) << AMDGPU_GPU_PAGE_SHIFT) - va ||
++		    m->offset > amdgpu_bo_size(bo) ||
++		    delta > amdgpu_bo_size(bo) - m->offset)
++			return -EINVAL;
++		off = m->offset + delta;
++		if (bytes > amdgpu_bo_size(bo) - off)
++			return -EINVAL;
++		r = amdgpu_bo_kmap(bo, &kaddr);
++		if (r)
++			return r;
++		if (!kaddr) {
++			amdgpu_bo_kunmap(bo);
++			return -EFAULT;
++		}
++		data = (char *)kaddr + off;
++		/* Include the last cache line even for a non-aligned IB start. */
++		for (pos = off & ~63ULL; pos < off + bytes; pos += 64)
++			__asm__ __volatile__("clflush (%0)" : : "r"((char *)kaddr + pos) : "memory");
++		mb();
++		if (!i) {
++			job->nmx_ib_va = ib->gpu_addr;
++			job->nmx_ib_length_dw = ib->length_dw;
++			job->nmx_ib_snapshot_dw = min_t(u32, ib->length_dw, 96);
++			memcpy(job->nmx_ib_snapshot, data, job->nmx_ib_snapshot_dw * sizeof(u32));
++			printf("NullMoth ibprep b15: va %llx len %u off %llx first %08x captured %u\n",
++			       (unsigned long long)ib->gpu_addr, ib->length_dw,
++			       (unsigned long long)off, job->nmx_ib_snapshot[0], job->nmx_ib_snapshot_dw);
++		}
++		amdgpu_bo_kunmap(bo);
++	}
++	return 0;
++}
++
+ static int amdgpu_cs_patch_ibs(struct amdgpu_cs_parser *p,
+ 			       struct amdgpu_job *job)
+ {
+ 	struct amdgpu_ring *ring = amdgpu_job_ring(job);
+ 	unsigned int i;
+ 	int r;
++
++	r = nmx_cs_prepare_ibs(p, job);
++	if (r)
++		return r;
+ 
+ 	/* Only for UVD/VCE VM emulation */
+ 	if (!ring->funcs->parse_cs && !ring->funcs->patch_cs_in_place)
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.h
+@@ -79,6 +79,12 @@
+ 	/* enforce isolation */
+ 	bool			enforce_isolation;
+ 
++	/* NMX b15: owned snapshot; scheduler deliberately clears job->vm. */
++	uint64_t nmx_ib_va;
++	uint32_t nmx_ib_length_dw;
++	uint32_t nmx_ib_snapshot_dw;
++	uint32_t nmx_ib_snapshot[96];
++
+ 	uint32_t		num_ibs;
+ 	struct amdgpu_ib	ibs[];
+ };
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c
+@@ -50,6 +50,21 @@
+ 	struct drm_printer p = { .printfn = nmx_ipdump_printfn };
+ 	int i;
+ 
++	/* No VM/BO dereference on the timeout path: CS owns this snapshot. */
++	if (job && job->nmx_ib_snapshot_dw) {
++		u32 q, nd = job->nmx_ib_snapshot_dw;
++		printf("NullMoth ibsnapshot b15: va %llx len %u vmid %u pasid %u captured %u\n",
++		       (unsigned long long)job->nmx_ib_va, job->nmx_ib_length_dw,
++		       job->vmid, job->pasid, nd);
++		for (q = 0; q < nd; q += 8) {
++			u32 row[8] = {0}, j;
++			for (j = 0; j < 8 && q + j < nd; ++j)
++				row[j] = job->nmx_ib_snapshot[q + j];
++			printf("NullMoth ibsnapshot +%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			       q, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]);
++		}
++	}
++
+ 	for (i = 0; i < adev->num_ip_blocks; i++)
+ 		if (adev->ip_blocks[i].version->funcs->print_ip_state)
+ 			adev->ip_blocks[i].version->funcs->print_ip_state(&adev->ip_blocks[i], &p);
+@@ -91,32 +106,7 @@
+ 						    q + 3 < nd ? ib->ptr[q + 3] : 0, q + 4 < nd ? ib->ptr[q + 4] : 0,
+ 						    q + 5 < nd ? ib->ptr[q + 5] : 0, q + 6 < nd ? ib->ptr[q + 6] : 0,
+ 						    q + 7 < nd ? ib->ptr[q + 7] : 0);
+-				} else if (job && job->num_ibs && job->vm && job->ibs[0].length_dw) {
+-					/* NullMoth b14: a user IB has no ib->ptr; print what the CP was asked to run (same bytes RADV
+-					 * wrote, seen through the kernel mapping of the BO). */
+-					struct amdgpu_ib *ib = &job->ibs[0];
+-					struct amdgpu_bo_va_mapping *m = amdgpu_vm_bo_lookup_mapping(job->vm, ib->gpu_addr >> PAGE_SHIFT);
+-					void *kaddr = NULL;
+-
+-					if (m && m->bo_va && m->bo_va->base.bo &&
+-					    !amdgpu_bo_kmap(m->bo_va->base.bo, &kaddr) && kaddr) {
+-						u64 off = m->offset + (ib->gpu_addr - (m->start << PAGE_SHIFT));
+-						u32 *p = (u32 *)((char *)kaddr + off), q, nd = ib->length_dw < 96 ? ib->length_dw : 96;
+-
+-						printf("NullMoth ibmap: va %llx len %u off %llx vmid %u pasid %u\n",
+-						    (unsigned long long)ib->gpu_addr, ib->length_dw, (unsigned long long)off,
+-						    job->vmid, job->pasid);
+-						for (q = 0; q < nd; q += 8)
+-							printf("NullMoth ibmap +%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n", q,
+-							    q + 0 < nd ? p[q + 0] : 0, q + 1 < nd ? p[q + 1] : 0,
+-							    q + 2 < nd ? p[q + 2] : 0, q + 3 < nd ? p[q + 3] : 0,
+-							    q + 4 < nd ? p[q + 4] : 0, q + 5 < nd ? p[q + 5] : 0,
+-							    q + 6 < nd ? p[q + 6] : 0, q + 7 < nd ? p[q + 7] : 0);
+-						amdgpu_bo_kunmap(m->bo_va->base.bo);
+-					} else {
+-						printf("NullMoth ibmap: lookup failed for va %llx (m %p)\n",
+-						    (unsigned long long)ib->gpu_addr, m);
+-					}
++
+ 				}
+ 				{
+ 					u32 c, rp_a, rp_b;

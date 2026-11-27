@@ -8,13 +8,17 @@
 #include <sys/sysctl.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/proc.h>
 
 MALLOC_DEFINE(M_SYSCTLOID, "sysctloid", "sysctl dynamic nodes");
 
 struct sysctl_oid_list sysctl__children;
 struct sysctl_oid_list sysctl__hw_children;
 struct sysctl_oid_list sysctl__kern_children;
-struct sysctl_oid_list sysctl__debug_children;
+/* No sysctl__debug_children here: the port never adds a node under debug (checked), and defining it would make every
+ * NMXGPU SYSCTL_* entry in the kext attach to this private list instead of the kernel's debug list, which is why
+ * debug.nmx_trace stayed invisible. Left undefined, the kext binds the kernel's exported list at load, the same way
+ * NMXAccel does. */
 struct sysctl_oid_list sysctl__sys_children;
 struct sysctl_oid_list sysctl__compat_children;
 struct sysctl_oid_list sysctl__dev_children;
@@ -302,7 +306,14 @@ static int run(struct sysctl_oid *o, struct rw_ctx *c, size_t newlen, size_t *ou
     req.newfunc = rw_in;
     req.newptr = c->val;
     req.newlen = newlen;
-    int err = o->oid_handler(o, o->oid_arg1, o->oid_arg2, &req);
+    struct thread *etd;     /* a user thread runs driver code here (review of fdffd32) */
+    int err = nmx_entry_try(&etd);
+    if (err != 0) {     /* not started or stopping: the handler is not run (review of 0266402) */
+        *outlen = 0;
+        return err;
+    }
+    err = o->oid_handler(o, o->oid_arg1, o->oid_arg2, &req);
+    nmx_entry_end(etd);
     *outlen = req.oldidx;
     return err;
 }

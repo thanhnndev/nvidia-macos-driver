@@ -1,0 +1,11 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -221,7 +221,7 @@
+ int amdgpu_mes_log_enable = 0;
+ int amdgpu_mes_kiq;
+ int amdgpu_uni_mes = 1;
+-int amdgpu_noretry = -1;
++int amdgpu_noretry = 1; /* NullMoth: retry faults off, a bad translation faults instead of stalling the CP */
+ int amdgpu_force_asic_type = -1;
+ int amdgpu_tmz = -1; /* auto */
+ uint amdgpu_freesync_vid_mode;

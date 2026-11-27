@@ -1,0 +1,24 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2510,11 +2510,21 @@
+ 	vm->task_info->pid = current->pid;
+ 	get_task_comm(vm->task_info->task_name, current);
+ 
++#ifdef NMXKPI
++	/* ga403wm row 13: LinuxKPI gives every thread its own task (pid = td_tid, group_leader = itself), so tgid was the
++	 * submitting thread's id and process_name its thread name (debug.nmx_gtt "pid 981" was WindowServer's thread
++	 * 0x3d5; the VM fault print named a thread as "process ... pid"). Linux's tgid is the process: take it from the
++	 * thread's BSD process record (the real xnu pid and p_comm; pid 0 "kernel_task" for kernel threads). */
++	vm->task_info->tgid = task_pid_group_leader(current);
++	strscpy(vm->task_info->process_name, current->task_thread->td_proc->p_comm,
++		sizeof(vm->task_info->process_name));
++#else
+ 	if (current->group_leader->mm != current->mm)
+ 		return;
+ 
+ 	vm->task_info->tgid = current->group_leader->pid;
+ 	get_task_comm(vm->task_info->process_name, current->group_leader);
++#endif
+ }
+ 
+ /**

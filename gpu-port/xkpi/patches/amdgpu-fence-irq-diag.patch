@@ -1,0 +1,69 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -340,8 +340,19 @@
+ 	struct amdgpu_ring *ring = from_timer(ring, t,
+ 					      fence_drv.fallback_timer);
+ 
+-	if (amdgpu_fence_process(ring))
++	extern unsigned long nmx_irq_dispatched;
++	u32 before = atomic_read(&ring->fence_drv.last_seq);
++
++	if (amdgpu_fence_process(ring)) {
++		static int shown;
++
++		if (shown < 60) {
++			shown++;
++			printf("NullMoth: fence fallback on %s: last_seq %u -> %u, sync_seq %u, irqs so far %lu\n", ring->name,
++			       before, atomic_read(&ring->fence_drv.last_seq), ring->fence_drv.sync_seq, nmx_irq_dispatched);
++		}
+ 		DRM_WARN("Fence fallback timer expired on ring %s\n", ring->name);
++	}
+ }
+ 
+ /**
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -437,12 +437,17 @@
+  *
+  * Dispatches IRQ to IP blocks.
+  */
++/* NullMoth: interrupts dispatched since boot; the fence fallback log prints it to tell lost interrupts from stale reads */
++unsigned long nmx_irq_dispatched;
++
+ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 			 struct amdgpu_ih_ring *ih)
+ {
+ 	u32 ring_index = ih->rptr >> 2;
+ 	struct amdgpu_iv_entry entry;
+ 	unsigned int client_id, src_id;
++
++	nmx_irq_dispatched++;
+ 	struct amdgpu_irq_src *src;
+ 	bool handled = false;
+ 	int r;
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c
+@@ -163,7 +163,23 @@
+ 
+ 	if (count != 0)
+ 		ring->funcs->insert_nop(ring, count);
++
++	/*
++	 * NullMoth: the ring lives in system memory and the kernel maps it write-back; flush the dwords just written
++	 * (wptr_old..wptr, wrapping) so a non-snooping GPU fetch sees them, then ring the doorbell.
++	 */
++	{
++		u32 from = (u32)(ring->wptr_old & ring->buf_mask) * 4, to = (u32)(ring->wptr & ring->buf_mask) * 4, i;
++		char *base = (char *)ring->ring;
+ 
++		if (from > to) {
++			for (i = from & ~63U; i < ring->ring_size; i += 64)
++				__asm__ __volatile__("clflush %0" : : "m"(base[i]) : "memory");
++			from = 0;
++		}
++		for (i = from & ~63U; i < to + 64 && i < ring->ring_size; i += 64)
++			__asm__ __volatile__("clflush %0" : : "m"(base[i]) : "memory");
++	}
+ 	mb();
+ 	amdgpu_ring_set_wptr(ring);
+ 

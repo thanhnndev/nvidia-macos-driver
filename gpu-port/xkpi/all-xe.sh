@@ -1,11 +1,11 @@
 #!/bin/bash
 # all-xe.sh [N]: compiles every source Linux 6.14's xe Makefile builds (display included) into obj-xe/ and ranks the
 # remaining errors. The DRM core, TTM, scheduler and dma-buf come from all.sh (obj/), as for i915.
-X=/Volumes/MiniData/build/gpu-src/xkpi
-V=/Volumes/MiniData/build/gpu-src/linux-6.14
+X=${GPU_SRC:-$HOME/develop/projects/gpu-src}/xkpi
+V=${GPU_SRC:-$HOME/develop/projects/gpu-src}/linux-6.14
 XE=$X/xe-src
 # the i915 display and soc code xe shares: drm-kmod's 6.14 copy, the one the i915 build already compiles
-I915=/Volumes/MiniData/build/gpu-src/kpi/drm-kmod/drivers/gpu/drm/i915
+I915=${GPU_SRC:-$HOME/develop/projects/gpu-src}/kpi/drm-kmod/drivers/gpu/drm/i915
 # compat-i915-headers reach it as ../../../i915 from inside xe-src
 ln -sfn "$I915" i915
 cd "$X" || exit 1
@@ -13,7 +13,7 @@ cd "$X" || exit 1
 # picked up by an #include "..." from its own directory; the replacements live in override/xe.
 rsync -a --delete --exclude tests/ --exclude xe_pt_walk.c --exclude xe_pt_walk.h --exclude xe_res_cursor.h \
     --exclude 'xe_trace*' --exclude 'xe_vsec.*' --exclude xe_module.c "$V/drivers/gpu/drm/xe/" xe-src/ || exit 1
-/opt/homebrew/bin/python3 fork_xe.py xe-src || exit 1
+python3 fork_xe.py xe-src || exit 1
 # (Makefile/Kconfig are kbuild files, never built; only source and headers must be free of GPL)
 if grep -rl --include='*.c' --include='*.h' 'SPDX-License-Identifier: GPL' xe-src; then echo 'a GPL file is left in xe-src' >&2; exit 1; fi
 mkdir -p obj-xe/gen logs-xe && rm -f logs-xe/*.log logs-xe/*.failed
@@ -31,7 +31,7 @@ if [ ! -f obj-xe/gen/generated/xe_wa_oob.h ]; then
     xcrun clang -O2 '-Dprogram_invocation_short_name=getprogname()' -include stdlib.h -o obj-xe/gen/xe_gen_wa_oob "$XE/xe_gen_wa_oob.c" || exit 1
     obj-xe/gen/xe_gen_wa_oob "$XE/xe_wa_oob.rules" obj-xe/gen/generated/xe_wa_oob.c obj-xe/gen/generated/xe_wa_oob.h || exit 1
 fi
-/opt/homebrew/bin/python3 xesrc.py "$V" amd.flags --i915 "$I915" DRM_XE DRM_XE_DISPLAY | sed "s|^$V/drivers/gpu/drm/xe/|$XE/|" > srcs-xe.all
+python3 xesrc.py "$V" amd.flags --i915 "$I915" DRM_XE DRM_XE_DISPLAY | sed "s|^$V/drivers/gpu/drm/xe/|$XE/|" > srcs-xe.all
 : > srcs-xe.txt
 while read -r f; do
     case " $EXCLUDE " in

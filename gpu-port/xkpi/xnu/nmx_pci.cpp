@@ -183,6 +183,27 @@ extern "C" int nmx_xnu_pci_irq_setup(void *pci, int vector, void (*handler)(void
     return 0;
 }
 
+/* ga403wm Step97 irqwatch: one line about an interrupt event source's counters (lost-interrupt evidence). The fields
+ * are protected members of IOInterruptEventSource; this view only reads them. */
+class NMXIrqPeek : public IOInterruptEventSource {
+public:
+    static void describe(IOInterruptEventSource *es, char *buf, size_t len)
+    {
+        NMXIrqPeek *p = static_cast<NMXIrqPeek *>(es);
+        snprintf(buf, len, "index %d es enabled %d produced %u consumed %u autodisable %d explicitdisable %d",
+                 p->intIndex, p->isEnabled(), p->producerCount, p->consumerCount, p->autoDisable, p->explicitDisable);
+    }
+};
+
+extern "C" void nmx_xnu_pci_irq_describe(void *cookie, char *buf, size_t len)
+{
+    NMXIrq *irq = (NMXIrq *)cookie;
+    if (irq == nullptr || irq->es == nullptr)
+        snprintf(buf, len, "cookie %p no event source", cookie);
+    else
+        NMXIrqPeek::describe(irq->es, buf, len);
+}
+
 static IOReturn drain_action(OSObject *, void *, void *, void *, void *)
 {
     return kIOReturnSuccess;

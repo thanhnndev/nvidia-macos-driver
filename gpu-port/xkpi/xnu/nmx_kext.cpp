@@ -13,6 +13,8 @@
  */
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
+#include <mach/mach_time.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IONVRAM.h>
 #include <IOKit/pci/IOPCIDevice.h>
@@ -21,8 +23,13 @@
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include "nmx_port.h"
 #include "nmx_xnu.h"
+#include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPM.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 
 #define AMD_VENDOR 0x1002
 #define INTEL_VENDOR 0x8086
@@ -31,15 +38,826 @@
 IOService *nmx_fb_publish(IOService *gpu, void *dev);
 void nmx_fb_unpublish(IOService *fb, IOService *gpu, void *dev);
 
+/* ---- M2 job trace ------------------------------------------------------------------------------------------------
+ * No kernel message from any kext is dependable in the system log on this machine, and the answer is needed inside
+ * the probing process's lifetime, so the driver publishes what it decided on sysctl instead of printf:
+ *
+ *   debug.nmx_trace  the last 16 submissions of every ring: ring, VM hub, ring type, vmid, pasid, page directory,
+ *                    the raw job->vm_needs_flush and the flush the call actually emitted.
+ *   debug.nmx_grab   the last 16 VMID assignments: hub, vmid, the flush decision, the VM's fence context, the VMID's
+ *                    owner before the update and its cached page directory before and after. "stray" marks a job that
+ *                    skips the flush while the VMID still belongs to another VM - the state that leaves the hardware
+ *                    reading the other VM's page table.
+ *   debug.nmx_timeouts  scheduler timeouts, also recorded as a row whose ring is TIME.
+ */
+#include <sys/sysctl.h>
+
+struct nmx_tr_rec {
+    unsigned long long seq, pd;
+    unsigned hub, type, vmid, pasid, needs_flush, flush, pasid_map, pipe_sync, gpu_reset, gds;
+    char ring[12];
+};
+static nmx_tr_rec gTr[16];
+static unsigned gTrN;
+static unsigned long long gTrSeq;
+
+struct nmx_gr_rec {
+    unsigned long long seq, vm_ctx, owner, pd_new, pd_old;
+    unsigned hub, vmid, needs_flush, stray;
+};
+static nmx_gr_rec gGr[16];
+static unsigned gGrN;
+static unsigned long long gGrSeq;
+
+static volatile SInt64 gNmxJobs, gNmxJobsFlushed, gNmxJobsNoFlush, gNmxTimeouts;
+static volatile SInt64 gNmxGrabFlushed, gNmxGrabSkipped, gNmxGrabStray;
+
+static void nmx_tr_ring(nmx_tr_rec *r, const char *name)
+{
+    unsigned i = 0;
+    if (name) while (name[i] && i + 1 < sizeof r->ring) { r->ring[i] = name[i]; i++; }
+    r->ring[i] = 0;
+}
+
+extern "C" void nmx_vm_trace(const char *ring, unsigned hub, unsigned type, unsigned vmid, unsigned pasid,
+                             unsigned long long pd, unsigned needs_flush, unsigned flags)
+{
+    nmx_tr_rec *r = &gTr[gTrN % 16];
+    r->seq = ++gTrSeq;
+    r->pd = pd;
+    r->hub = hub;
+    r->type = type;
+    r->vmid = vmid;
+    r->pasid = pasid;
+    r->needs_flush = needs_flush ? 1u : 0u;
+    r->flush = (flags & 1) ? 1u : 0u;
+    r->pasid_map = (flags & 2) ? 1u : 0u;
+    r->pipe_sync = (flags & 4) ? 1u : 0u;
+    r->gpu_reset = (flags & 8) ? 1u : 0u;
+    r->gds = (flags & 16) ? 1u : 0u;
+    nmx_tr_ring(r, ring);
+    gTrN++;
+    gNmxJobs = gNmxJobs + 1;
+    if (flags & 1) gNmxJobsFlushed = gNmxJobsFlushed + 1;
+    else gNmxJobsNoFlush = gNmxJobsNoFlush + 1;
+}
+
+extern "C" void nmx_grab_trace(unsigned hub, unsigned vmid, unsigned needs_flush,
+                               unsigned long long vm_ctx, unsigned long long id_owner,
+                               unsigned long long pd_new, unsigned long long pd_old)
+{
+    nmx_gr_rec *r = &gGr[gGrN % 16];
+    r->seq = ++gGrSeq;
+    r->hub = hub;
+    r->vmid = vmid;
+    r->needs_flush = needs_flush ? 1u : 0u;
+    r->vm_ctx = vm_ctx;
+    r->owner = id_owner;
+    r->pd_new = pd_new;
+    r->pd_old = pd_old;
+    r->stray = (!needs_flush && id_owner != vm_ctx) ? 1u : 0u;
+    gGrN++;
+    if (needs_flush) gNmxGrabFlushed = gNmxGrabFlushed + 1;
+    else gNmxGrabSkipped = gNmxGrabSkipped + 1;
+    if (r->stray) gNmxGrabStray = gNmxGrabStray + 1;
+}
+
+extern "C" void nmx_job_timeout(unsigned vmid)
+{
+    nmx_tr_rec *r = &gTr[gTrN % 16];
+    r->seq = ++gTrSeq;
+    r->pd = 0;
+    r->hub = 0xff;
+    r->type = 0xff;
+    r->vmid = vmid;
+    r->pasid = 0;
+    r->needs_flush = r->flush = r->pasid_map = r->pipe_sync = r->gpu_reset = r->gds = 0;
+    nmx_tr_ring(r, "TIME");
+    gTrN++;
+    gNmxTimeouts = gNmxTimeouts + 1;
+}
+
+static int nmx_trace_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[2048];
+    int n = snprintf(buf, sizeof buf,
+                     "seq ring hub type vmid pasid pd needs_flush flush pasid_map pipe_sync gpu_reset gds\n");
+    unsigned count = gTrN < 16 ? gTrN : 16;
+    for (unsigned k = 0; k < count && n > 0 && (size_t)n < sizeof buf - 1; k++) {
+        const nmx_tr_rec *r = &gTr[(gTrN - count + k) % 16];
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu %s %u %u %u %u %llx %u %u %u %u %u %u\n",
+                      r->seq, r->ring, r->hub, r->type, r->vmid, r->pasid, r->pd,
+                      r->needs_flush, r->flush, r->pasid_map, r->pipe_sync, r->gpu_reset, r->gds);
+        if ((size_t)n >= sizeof buf) { n = (int)sizeof buf - 1; break; }
+    }
+    if (n < 0) n = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+
+static int nmx_grab_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[2048];
+    int n = snprintf(buf, sizeof buf,
+                     "seq hub vmid needs_flush vm_ctx owner pd_new pd_old stray\n");
+    unsigned count = gGrN < 16 ? gGrN : 16;
+    for (unsigned k = 0; k < count && n > 0 && (size_t)n < sizeof buf - 1; k++) {
+        const nmx_gr_rec *r = &gGr[(gGrN - count + k) % 16];
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%llu %u %u %u %llx %llx %llx %llx %u\n",
+                      r->seq, r->hub, r->vmid, r->needs_flush, r->vm_ctx, r->owner,
+                      r->pd_new, r->pd_old, r->stray);
+        if ((size_t)n >= sizeof buf) { n = (int)sizeof buf - 1; break; }
+    }
+    if (n < 0) n = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+
+/* review of fdffd32: a user thread running driver code outside the device node is counted like a device-node entry, so
+ * nmx_proc_reap keeps its Linux task while it is inside (nmx_kernel.c) */
+struct thread;
+/* 0 = inside; ENXIO = the port is not started or is stopping: run no driver code (review of 0266402) */
+extern "C" int nmx_entry_try(struct thread **td);
+extern "C" void nmx_entry_end(struct thread *td);
+struct NmxEntry { struct thread *td = nullptr; int err; NmxEntry() : err(nmx_entry_try(&td)) {}
+                  ~NmxEntry() { if (!err) nmx_entry_end(td); } NmxEntry(const NmxEntry &) = delete; };
+extern "C" int nmx_pin_by_proc_format(char *buf, size_t size);
+static int nmx_pin_by_proc_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[512];
+    int n;
+    { NmxEntry entry; if (entry.err) return entry.err; n = nmx_pin_by_proc_format(buf, sizeof buf); }
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    buf[n] = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+extern "C" int nmx_userwire_format(char *buf, size_t size);
+/* frame-path trace (FRAME-PATH.md section 7): per-flip stage stamps, vblank/VBL-timer phase, DMUB IPS counters */
+extern "C" int nmx_ft_format(char *buf, size_t size);
+static int nmx_frametrace_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 96 * 1024;
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_ft_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
+    if (n < 0) n = 0;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_frametrace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_frametrace_sysctl, "A",
+            "frame-path trace: last 512 flips (submit, commit return, armed, pageflip IRQ, status seen), vblank, VBL timer phase, IPS");
+static int nmx_userwire_by_kind_sysctl SYSCTL_HANDLER_ARGS
+{
+    char buf[1024];
+    int n;
+    { NmxEntry entry; if (entry.err) return entry.err; n = nmx_userwire_format(buf, sizeof buf); }
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    buf[n] = 0;
+    return sysctl_handle_string(oidp, buf, sizeof buf, req);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_userwire_by_kind, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_userwire_by_kind_sysctl, "A",
+            "Step142: user wirings by kind (surface/plain), age, parked, orphaned surfaces, and per process (pages)");
+SYSCTL_PROC(_debug, OID_AUTO, nmx_pin_by_proc, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_pin_by_proc_sysctl, "A", "Step139: user-page pin calls and pages per process name");
+SYSCTL_PROC(_debug, OID_AUTO, nmx_trace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_trace_sysctl, "A",
+            "last 16 AMD submissions: ring, VM hub, vmid, page directory, job->vm_needs_flush and the flush emitted");
+SYSCTL_PROC(_debug, OID_AUTO, nmx_grab, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            0, 0, nmx_grab_sysctl, "A",
+            "last 16 VMID assignments: hub, vmid, flush decision, VM context, VMID owner, page directory");
+
+/* review of c53afe6: page-sized malloc/free in interrupt context (nmx_malloc.c big_lock_take), count and last caller */
+extern "C" volatile int64_t nmx_malloc_irq_hits, nmx_malloc_irq_caller;
+#define NMX_CNT(nm, var, desc) \
+    SYSCTL_QUAD(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (SInt64 *)&var, desc)
+NMX_CNT(nmx_jobs, gNmxJobs, "AMD submissions whose VM/flush decision was recorded");
+NMX_CNT(nmx_malloc_irq, nmx_malloc_irq_hits, "page-sized malloc/free taken in primary interrupt context (expected 0)");
+NMX_CNT(nmx_malloc_irq_caller, nmx_malloc_irq_caller, "return address of the last of those (kext-relative: subtract the load address)");
+NMX_CNT(nmx_jobs_flushed, gNmxJobsFlushed, "of those, submissions that emitted a VM flush");
+NMX_CNT(nmx_jobs_no_flush, gNmxJobsNoFlush, "of those, submissions with no VM flush");
+NMX_CNT(nmx_timeouts, gNmxTimeouts, "AMD submissions the scheduler reported as timed out");
+NMX_CNT(nmx_grab_flushed, gNmxGrabFlushed, "VMID assignments that asked for a flush");
+NMX_CNT(nmx_grab_skipped, gNmxGrabSkipped, "VMID assignments that skipped the flush");
+extern "C" volatile SInt64 gNmxPinWriteFail, gNmxPinWriteRetryOk, gNmxPinRoRetry, gNmxPinLastRc, gNmxPinLastRc2;
+NMX_CNT(nmx_pin_write_fail, gNmxPinWriteFail, "Step132: writable user-page wires that failed the first time");
+NMX_CNT(nmx_pin_write_retry_ok, gNmxPinWriteRetryOk, "Step132: of those, wires that worked after a read fault-in");
+NMX_CNT(nmx_pin_ro_retry, gNmxPinRoRetry, "Step96/132: userptr BOs pinned read-only after a failed writable pin");
+NMX_CNT(nmx_pin_last_rc, gNmxPinLastRc, "Step132: IOReturn of the last failed first writable wire");
+NMX_CNT(nmx_pin_last_rc2, gNmxPinLastRc2, "Step132: IOReturn of the last writable wire that failed again after fault-in");
+extern "C" volatile SInt64 gNmxPinOtherFail, gNmxPinOtherRc;
+extern "C" char gNmxPinOtherName[32];
+NMX_CNT(nmx_pin_other_fail, gNmxPinOtherFail, "Step132b: failed first writable wires outside WindowServer");
+NMX_CNT(nmx_pin_other_rc, gNmxPinOtherRc, "Step132b: IOReturn of the last of those");
+extern "C" volatile SInt64 gNmxSurfHint, gNmxSurfWire, gNmxSurfMiss, gNmxSurfBadPage, gNmxSurfNoSurf, gNmxSurfShort,
+    gNmxSurfPrepFail;
+extern "C" volatile SInt64 gNmxUserWires, gNmxUserWirePages;
+extern "C" uint64_t gNmxPagesLive;
+NMX_CNT(nmx_pages_live, gNmxPagesLive, "Step138: port page records handed out now (GTT/system pages, all kinds)");
+extern "C" uint64_t gNmxPageChunks, gNmxPageFree, gNmxPageChunksFreed, gNmxPageChunksFilled, gNmxPageChunksInline, gNmxPageHwm;
+NMX_CNT(nmx_page_chunks, gNmxPageChunks, "Step141: 2 MB page chunks held now");
+NMX_CNT(nmx_page_free, gNmxPageFree, "Step141: free pages pooled in those chunks");
+NMX_CNT(nmx_page_chunks_freed, gNmxPageChunksFreed, "Step141: chunks given back to the system");
+NMX_CNT(nmx_page_chunks_filled, gNmxPageChunksFilled, "Step141c: chunks made ahead by the fill thread call");
+NMX_CNT(nmx_page_chunks_inline, gNmxPageChunksInline, "Step141c: chunks made in the allocation path");
+extern "C" uint64_t gNmxPageSingleRuns, gNmxPageAllocWaits, gNmxPageAllocFails;
+NMX_CNT(nmx_page_single_runs, gNmxPageSingleRuns, "cs-enomem: pages taken as one-page runs because no 2 MB chunk could be made");
+NMX_CNT(nmx_page_alloc_waits, gNmxPageAllocWaits, "cs-enomem: back-off sleeps of page allocations that may wait (system short of pages)");
+NMX_CNT(nmx_page_alloc_fails, gNmxPageAllocFails, "cs-enomem: page allocations that still failed (no-wait caller, or 2 s of waiting)");
+NMX_CNT(nmx_page_hwm, gNmxPageHwm, "Step141d: peak chunk pages in use over the last 60 s (kept pooled)");
+NMX_CNT(nmx_userwire_count, gNmxUserWires, "Step138: user-memory wirings (IOMemoryDescriptors) held for the GPU now");
+NMX_CNT(nmx_userwire_pages, gNmxUserWirePages, "Step138: pages covered by those wirings");
+extern "C" volatile SInt64 gNmxSurfWires, gNmxSurfWirePages, gNmxUserParked, gNmxUserParkedPages, gNmxUserParks,
+    gNmxUserUnparks, gNmxUserUnparkFail;
+NMX_CNT(nmx_surfwire_count, gNmxSurfWires, "Step142: of the user wirings, IOSurface descriptors wired now");
+NMX_CNT(nmx_surfwire_pages, gNmxSurfWirePages, "Step142: pages of those (the NMX share of zprint's IOSurface tag)");
+NMX_CNT(nmx_userwire_parked, gNmxUserParked, "Step142: IOSurface wirings parked now (BO idle: held, not wired)");
+NMX_CNT(nmx_userwire_parked_pages, gNmxUserParkedPages, "Step142: pages of those");
+NMX_CNT(nmx_userwire_parks, gNmxUserParks, "Step142: wirings parked since boot");
+NMX_CNT(nmx_userwire_unparks, gNmxUserUnparks, "Step142: parked wirings wired again for the GPU since boot");
+NMX_CNT(nmx_userwire_unpark_fail, gNmxUserUnparkFail, "Step142: parked wirings that could not be wired again");
+extern "C" volatile SInt64 gNmxUpinRestoreFail, gNmxUpinDestroyRec, gNmxParkSkipBusy, gNmxParkFail;
+NMX_CNT(nmx_upin_restore_fail, gNmxUpinRestoreFail, "Step142: userptr BO page restores that failed");
+NMX_CNT(nmx_upin_destroy_rec, gNmxUpinDestroyRec,
+        "Step142: userptr BOs destroyed still holding their pages (never populated: they leaked before Step142)");
+NMX_CNT(nmx_park_skip_busy, gNmxParkSkipBusy, "Step142: idle-park candidates skipped (locked, busy, pinned or shared)");
+NMX_CNT(nmx_park_fail, gNmxParkFail, "Step142: idle parks whose move to system memory failed");
+extern "C" volatile SInt64 gNmxParkSkipVm, gNmxParkAbort, gNmxParkPtUpdate;
+NMX_CNT(nmx_park_skip_vm, gNmxParkSkipVm, "11.9: idle-park candidates skipped (mapped in no VM or in more than one)");
+NMX_CNT(nmx_park_abort, gNmxParkAbort, "11.9: parks dropped between move and unwire (a CS took the BO back)");
+NMX_CNT(nmx_park_pt_update, gNmxParkPtUpdate, "11.9: parks that cleared the mapping's PTEs before unwiring");
+extern "C" volatile SInt64 gNmxFaultKick, gNmxFaultKickIgnored, gNmxFaultKickFail;
+NMX_CNT(nmx_fault_kick, gNmxFaultKick, "row 12: GPU page faults whose head job got an immediate soft recovery (not at the 3 s timeout)");
+NMX_CNT(nmx_fault_kick_ignored, gNmxFaultKickIgnored, "row 12: fault kicks skipped (ambiguous, rate limited) or that found another job at the ring head (left running)");
+NMX_CNT(nmx_fault_kick_fail, gNmxFaultKickFail, "row 12: kicked jobs whose soft recovery failed (put back, the 3 s timer decides)");
+/* shutdown stall 2026-11-18 17:47 (ttm-pool-trim-batch.patch): the TTM page pool, in pages unless named otherwise */
+extern "C" volatile SInt64 gNmxTtmPoolGive, gNmxTtmPoolTake, gNmxTtmPoolMissPages, gNmxTtmPoolMiss, gNmxTtmPoolPages,
+    gNmxTtmPoolCap, gNmxTtmFreeCalls, gNmxTtmFreePages, gNmxTtmTrimCalls, gNmxTtmTrimPages, gNmxTtmShrinkCalls,
+    gNmxTtmFreeNs;
+NMX_CNT(nmx_ttm_pool_pages, gNmxTtmPoolPages, "TTM pool: write-combined/uncached pages held in the pools now");
+NMX_CNT(nmx_ttm_pool_cap, gNmxTtmPoolCap, "TTM pool: cap ttm_pool_free trims to (Step141: 32768 = 128 MB)");
+NMX_CNT(nmx_ttm_pool_give, gNmxTtmPoolGive, "TTM pool: freed pages given to a pool");
+NMX_CNT(nmx_ttm_pool_take, gNmxTtmPoolTake, "TTM pool: allocated pages taken from a pool (zeroed, caching already set)");
+NMX_CNT(nmx_ttm_pool_miss, gNmxTtmPoolMiss, "TTM pool: allocations of a pooled caching that found the pool empty (made fresh pages)");
+NMX_CNT(nmx_ttm_pool_miss_pages, gNmxTtmPoolMissPages, "TTM pool: pages those allocations made fresh");
+NMX_CNT(nmx_ttm_free_calls, gNmxTtmFreeCalls, "TTM pool: ttm_pool_free calls (BO backing freed)");
+NMX_CNT(nmx_ttm_free_pages, gNmxTtmFreePages, "TTM pool: pages those calls returned");
+NMX_CNT(nmx_ttm_free_ns, gNmxTtmFreeNs, "TTM pool: ns spent in ttm_pool_free, trim included");
+NMX_CNT(nmx_ttm_trim_calls, gNmxTtmTrimCalls, "TTM pool: ttm_pool_free calls that found the pool over its cap and trimmed it");
+NMX_CNT(nmx_ttm_trim_pages, gNmxTtmTrimPages, "TTM pool: pages those trims freed to the system");
+NMX_CNT(nmx_ttm_shrink_calls, gNmxTtmShrinkCalls, "TTM pool: ttm_pool_shrink calls (one pool type, a batch of pages each)");
+extern "C" int nmx_fault_kick_on;
+SYSCTL_INT(_debug, OID_AUTO, nmx_fault_kick_on, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_fault_kick_on, 0,
+           "row 12: 1 = soft-recover a faulting ring head job at fault time; 0 (default) = the 3 s timeout only");
+extern "C" int nmx_userptr_park_ms;
+SYSCTL_INT(_debug, OID_AUTO, nmx_userptr_park_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_userptr_park_ms, 0,
+           "Step142: unwire an IOSurface userptr BO's memory after this many ms without GPU use; 0 = never");
+extern "C" int nmx_ft_on;
+SYSCTL_INT(_debug, OID_AUTO, nmx_ft, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_ft_on, 0,
+           "frame-path trace (FRAME-PATH.md section 7): 0 stops the NMXGPU-side hooks (flip records, VBL timer phase, memory stalls)");
+/* out-31 (FRAME-PATH rows 1-3): new behaviour by default, each one back to the old path at runtime here or from boot
+ * with nmxkfence=0 / nmxflipirq=0 / nmxvblirq=0 (names audited against every kext on disk, 2026-11-18) */
+extern "C" int nmx_flip_kfence, nmx_flip_irq, nmx_vbl_irq;
+SYSCTL_INT(_debug, OID_AUTO, nmx_flip_kfence, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_flip_kfence, 0,
+           "out-31 row 1: flips wait for the IOSurface's last CS job fence in the atomic commit; 0 = NMXAccel polls NMXFenceDone");
+SYSCTL_INT(_debug, OID_AUTO, nmx_flip_irq, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_flip_irq, 0,
+           "out-31 row 3: the pageflip IRQ notifies NMXAccel; 0 = NMXAccel polls flip status");
+SYSCTL_INT(_debug, OID_AUTO, nmx_vbl_irq, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_vbl_irq, 0,
+           "out-31 row 2: IOFramebuffer VBL from the CRTC vblank IRQ (vblank reference held while enabled); 0 = timer");
+extern "C" volatile SInt64 gNmxFlipFenced, gNmxFlipNoFence, gNmxSurfFenceSet, gNmxFlipNotified, gNmxVblDelivered;
+NMX_CNT(nmx_flip_fenced, gNmxFlipFenced, "out-31: flips committed with a kernel render fence on the plane");
+NMX_CNT(nmx_flip_nofence, gNmxFlipNoFence, "out-31: fence-only flips refused because no fence was known for the surface");
+NMX_CNT(nmx_surf_fence_set, gNmxSurfFenceSet, "out-31: CS jobs recorded as an IOSurface's last fence");
+NMX_CNT(nmx_flip_notified, gNmxFlipNotified, "out-31: pageflip IRQ notifications sent to NMXAccel");
+NMX_CNT(nmx_vbl_delivered, gNmxVblDelivered, "out-31: IOFramebuffer VBLs delivered from the CRTC vblank (only while a 'vbl ' registration is on)");
+/* hardware cursor (2026-11-25 v2, nmx_fb.cpp / nmx_fb_bridge.c): boot-arg nmxhwcur=1 (name audited against every
+ * kext on disk) advertises the cursor plane at framebuffer open; anything else changes nothing. No run-time switch. */
+extern "C" int nmx_hwcursor, nmx_hwcursor_avail;
+SYSCTL_INT(_debug, OID_AUTO, nmx_hwcursor, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_hwcursor, 0,
+           "hardware cursor: 1 = boot-arg nmxhwcur=1 was given (read-only)");
+SYSCTL_INT(_debug, OID_AUTO, nmx_hwcursor_avail, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_hwcursor_avail, 0,
+           "hardware cursor: 1 = the plane is up and the framebuffer advertises it");
+extern "C" volatile SInt64 gNmxCurStates, gNmxCurAccepted, gNmxCurSwFallback, gNmxCurCopyRetry, gNmxCurKeptLast;
+NMX_CNT(nmx_cur_commits, gNmxCurCommits, "hw cursor: cursor plane commits (async + full)");
+NMX_CNT(nmx_cur_full, gNmxCurFull, "hw cursor: of those, commits asked for as full (first, after a re-arm); DM picks async or full itself");
+NMX_CNT(nmx_cur_images, gNmxCurImages, "hw cursor: images uploaded to the cursor buffers");
+NMX_CNT(nmx_cur_errors, gNmxCurErrors, "hw cursor: failed commits / uploads");
+NMX_CNT(nmx_cur_rearms, gNmxCurRearms, "hw cursor: re-arms after the bridge's own commits (restore, hotplug, power-on)");
+NMX_CNT(nmx_cur_off, gNmxCurOff, "hw cursor: plane turned off (framebuffer stop)");
+NMX_CNT(nmx_cur_states, gNmxCurStates, "hw cursor: setCursorState calls from IOFramebuffer");
+NMX_CNT(nmx_cur_accepted, gNmxCurAccepted, "hw cursor: setCursorImage calls taken by the plane");
+NMX_CNT(nmx_cur_sw_fallback, gNmxCurSwFallback, "hw cursor: setCursorImage refusals (the descriptor probe at open; anything more is a bug)");
+NMX_CNT(nmx_cur_kept_last, gNmxCurKeptLast, "hw cursor: images not converted after an accepted one (last image kept, answered yes)");
+NMX_CNT(nmx_cur_copy_retry, gNmxCurCopyRetry, "hw cursor: image copies retried because a new image was being written");
+/* hardware colour stages (2026-11-25, nmx_fb_bridge.c): CRTC DEGAMMA_LUT / CTM / GAMMA_LUT, staged by NMXAccel (nmxhwcolor=1) */
+NMX_CNT(nmx_color_staged, gNmxColorStaged, "hw colour: colour states staged (degamma / CTM / gamma)");
+NMX_CNT(nmx_color_flip, gNmxColorFlip, "hw colour: flips that changed the CRTC colour state");
+NMX_CNT(nmx_color_alone, gNmxColorAlone, "hw colour: colour-only commits (transactions with no plane)");
+NMX_CNT(nmx_color_errors, gNmxColorErrors, "hw colour: failed stagings / colour commits");
+NMX_CNT(nmx_color_rejected, gNmxColorRejected, "hw colour: colour states DM refused (the flip went up without them; the last accepted state stays)");
+extern "C" int nmx_gtt_format(char *buf, size_t size);
+static int nmx_gtt_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 16 * 1024;
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_gtt_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
+    if (n < 0) n = 0;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_gtt, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0, nmx_gtt_sysctl,
+            "A", "out-31: GTT and VRAM used/size, and per open DRM file: pid, name, resident bytes per placement, evicted, BOs");
+/* power under load step 1: amdgpu's gpu_metrics (SMU 14.0.0 metrics table: socket/gfx/core power, clocks, activity,
+ * temperatures), the GFXOFF bookkeeping and the SMU workload profile; nmx_pp_features: the SMU feature list
+ * (pp_features). One SMU query per read, none for the size probe; nothing periodic. */
+extern "C" int nmx_power_format(char *buf, size_t size, int features);
+/* The port's own GPU power changes (NMXGPU::setPowerState -> nmx_port_power: amdgpu suspend/resume, and
+ * systemWillShutdown) hold g_pwr_lock; a reader only try-locks it, so it never starts a query during a power change and
+ * never queries the SMU while the GPU is down (g_gpu_powered 0) or between the two halves of a transition. A reader
+ * already inside its query when a power change begins does delay it: setPowerState waits for the lock, i.e. for one
+ * SMU table transfer, normally about a millisecond, at worst one SMU message timeout per message (2-4 s) on a hung
+ * PMFW. macOS readers keep running across setPowerState; Linux relies on frozen user space instead. */
+static IOLock *g_pwr_lock;
+static volatile int g_gpu_powered = 1;
+static int nmx_power_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 8 * 1024;
+    if (req->oldptr == USER_ADDR_NULL)
+        return SYSCTL_OUT(req, NULL, size);
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = -1, eerr = 0;
+    if (g_pwr_lock == nullptr || !IOLockTryLock(g_pwr_lock)) {
+        n = snprintf(buf, size, "skipped: GPU power change in progress\n");
+    } else {
+        if (!g_gpu_powered)
+            n = snprintf(buf, size, "skipped: GPU powered down (NMXGPU power state 0)\n");
+        else { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_power_format(buf, size, arg2); }
+        IOLockUnlock(g_pwr_lock);
+    }
+    if (eerr) { IOFree(buf, size); return eerr; }
+    if (n < 0) n = 0;
+    if ((size_t)n > size) n = (int)size;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_gpu_metrics, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_power_sysctl, "A",
+            "power: gpu_metrics v3.0 (mW, MHz, %, centi-C), GFXOFF req_count/state, SMU workload; one SMU table read");
+SYSCTL_PROC(_debug, OID_AUTO, nmx_pp_features, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 1,
+            nmx_power_sysctl, "A", "power: SMU features enabled (amdgpu pp_features), GFXOFF bookkeeping");
+extern "C" int nmx_tt_census_format(char *buf, size_t size);
+/* Review of c001bc7: (b) a size probe (oldptr NULL; sysctl(8) probes first) returns the fixed size without walking the
+ * BOs, so one read walks once; (c) no nested sysctlbyname from inside a sysctl handler (the reader reads
+ * kern.memorystatus_vm_pressure_level / kern.memorystatus_level itself); (d) 64 KB (~900 processes), and a cut is marked
+ * "TRUNCATED" instead of silent. */
+static int nmx_tt_census_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 64 * 1024;
+    if (req->oldptr == USER_ADDR_NULL)
+        return SYSCTL_OUT(req, NULL, size);
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_tt_census_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
+    if (n < 0) n = 0;
+    if ((size_t)n > size) n = (int)size;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_tt_census, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_tt_census_sysctl, "A",
+            "FRAME-PATH 12.13 S1: per process resident GPU pages split pinned/userptr/idle/busy, BOs held by another thread (read-only; pressure: read kern.memorystatus_vm_pressure_level)");
+extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
+NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
+NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
+NMX_CNT(nmx_userrec_freed, gNmxUserRecFreed, "Step138: user page records freed after their last unpin");
+NMX_CNT(nmx_userrec_kept, gNmxUserRecKept, "Step138: user page records made permanent (reached by another path)");
+NMX_CNT(nmx_surf_hint, gNmxSurfHint, "Step137: IOSurface hints for a userptr range (DRM_AMDGPU_NMX_SURFACE_HINT)");
+NMX_CNT(nmx_surf_wire, gNmxSurfWire, "Step137: userptr imports that pinned the IOSurface's own memory");
+NMX_CNT(nmx_surf_miss, gNmxSurfMiss, "Step137: hinted imports that fell back to the plain user wire");
+NMX_CNT(nmx_surf_bad_page, gNmxSurfBadPage, "Step137: of those, the range's first page was not the surface's");
+NMX_CNT(nmx_surf_no_surf, gNmxSurfNoSurf, "Step137: of those, the task could not look the surface up");
+NMX_CNT(nmx_surf_short, gNmxSurfShort, "Step137: of those, the surface's memory was shorter than the range");
+NMX_CNT(nmx_surf_prep_fail, gNmxSurfPrepFail, "Step137: of those, the surface's memory could not be prepared");
+SYSCTL_STRING(_debug, OID_AUTO, nmx_pin_other_name, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, gNmxPinOtherName,
+              sizeof(gNmxPinOtherName), "Step132b: process of the last of those");
+NMX_CNT(nmx_grab_stray, gNmxGrabStray,
+        "VMID assignments that skipped the flush while the VMID still belonged to another VM");
+
+/* A kext's SYSCTL_* entries are not registered automatically: sys/sysctl.h says so plainly ("UNLESS they are defined in
+ * I/O-Kit. In this case, you have to call sysctl_register_oid() manually - just like in a KEXT"). NMXAccel did that and
+ * its debug.* entries work; NMXGPU did not, so every debug.nmx_* was an unknown oid even though the kext carried it. */
+/* User (mmap) cache mode for GPU buffers, read by nmx_umap_insert: 1 = uncached (default, this GPU does not snoop
+ * the CPU caches), 2 = write-combined, 0 = whatever the DRM driver asked for. */
+/* Flush every CPU cache before a submission (amdgpu_cs.c). Blunt on purpose: it tests whether a dirty write-back line
+ * from the kernel's view is being written over what userland put in a buffer through its uncached mapping. */
+/* Flush every CPU cache when a user mapping of GPU buffers is created (nmx_mmap): dirty write-back lines from the
+ * kernel's view of those pages would otherwise land on top of what userland writes through its uncached mapping. */
+extern "C" int nmx_umap_flush_on_map = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmx_umap_flush, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_umap_flush_on_map, 0,
+           "flush all CPU caches when a user BO mapping is created: 0 off (default), 1 on");
+
+extern "C" int nmx_wbinvd_before_submit = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmx_wbinvd, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_wbinvd_before_submit, 0,
+           "flush all CPU caches before each submission: 0 off (default), 1 on");
+
+/* ga403wm Step91: default 0 = the driver's own attribute. With snooped GTT (Step88) a cached BO maps write-back and
+ * a USWC BO maps WC; forced UC/WC made every CPU read of a BO run at ~108 MB/s. */
+extern "C" int nmx_umap_cache = 0;
+SYSCTL_INT(_debug, OID_AUTO, nmx_umap_cache, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_umap_cache, 0,
+           "user BO mapping cache: 0 driver default (default), 1 uncached, 2 write-combined");
+
+/* Every debug.nmx_* oid, registered by nmx_sysctl_install and unregistered by nmx_sysctl_remove (review of 7219f55:
+ * the two malloc_irq oids were declared but never registered, and no oid was unregistered at unload, which leaves
+ * them pointing into the unloaded kext). A new SYSCTL_* / NMX_CNT goes in this table. */
+static struct sysctl_oid *const nmx_oids[] = {
+    &sysctl__debug_nmx_trace,
+    &sysctl__debug_nmx_grab,
+    &sysctl__debug_nmx_jobs,
+    &sysctl__debug_nmx_jobs_flushed,
+    &sysctl__debug_nmx_jobs_no_flush,
+    &sysctl__debug_nmx_timeouts,
+    &sysctl__debug_nmx_grab_flushed,
+    &sysctl__debug_nmx_grab_skipped,
+    &sysctl__debug_nmx_grab_stray,
+    &sysctl__debug_nmx_pin_write_fail,
+    &sysctl__debug_nmx_pin_write_retry_ok,
+    &sysctl__debug_nmx_pin_ro_retry,
+    &sysctl__debug_nmx_pin_last_rc,
+    &sysctl__debug_nmx_pin_last_rc2,
+    &sysctl__debug_nmx_pin_other_fail,
+    &sysctl__debug_nmx_pin_other_rc,
+    &sysctl__debug_nmx_pin_other_name,
+    &sysctl__debug_nmx_pin_by_proc,
+    &sysctl__debug_nmx_pages_live,
+    &sysctl__debug_nmx_page_chunks,
+    &sysctl__debug_nmx_page_free,
+    &sysctl__debug_nmx_page_chunks_freed,
+    &sysctl__debug_nmx_page_chunks_filled,
+    &sysctl__debug_nmx_page_chunks_inline,
+    &sysctl__debug_nmx_page_single_runs,
+    &sysctl__debug_nmx_page_alloc_waits,
+    &sysctl__debug_nmx_page_alloc_fails,
+    &sysctl__debug_nmx_page_hwm,
+    &sysctl__debug_nmx_userwire_count,
+    &sysctl__debug_nmx_userwire_pages,
+    &sysctl__debug_nmx_userwire_by_kind,
+    &sysctl__debug_nmx_frametrace,
+    &sysctl__debug_nmx_surfwire_count,
+    &sysctl__debug_nmx_surfwire_pages,
+    &sysctl__debug_nmx_userwire_parked,
+    &sysctl__debug_nmx_userwire_parked_pages,
+    &sysctl__debug_nmx_userwire_parks,
+    &sysctl__debug_nmx_userwire_unparks,
+    &sysctl__debug_nmx_userwire_unpark_fail,
+    &sysctl__debug_nmx_upin_restore_fail,
+    &sysctl__debug_nmx_upin_destroy_rec,
+    &sysctl__debug_nmx_park_skip_busy,
+    &sysctl__debug_nmx_park_fail,
+    &sysctl__debug_nmx_park_skip_vm,
+    &sysctl__debug_nmx_park_abort,
+    &sysctl__debug_nmx_park_pt_update,
+    &sysctl__debug_nmx_fault_kick,
+    &sysctl__debug_nmx_fault_kick_ignored,
+    &sysctl__debug_nmx_fault_kick_fail,
+    &sysctl__debug_nmx_ttm_pool_pages,
+    &sysctl__debug_nmx_ttm_pool_cap,
+    &sysctl__debug_nmx_ttm_pool_give,
+    &sysctl__debug_nmx_ttm_pool_take,
+    &sysctl__debug_nmx_ttm_pool_miss,
+    &sysctl__debug_nmx_ttm_pool_miss_pages,
+    &sysctl__debug_nmx_ttm_free_calls,
+    &sysctl__debug_nmx_ttm_free_pages,
+    &sysctl__debug_nmx_ttm_free_ns,
+    &sysctl__debug_nmx_ttm_trim_calls,
+    &sysctl__debug_nmx_ttm_trim_pages,
+    &sysctl__debug_nmx_ttm_shrink_calls,
+    &sysctl__debug_nmx_fault_kick_on,
+    &sysctl__debug_nmx_userptr_park_ms,
+    &sysctl__debug_nmx_ft,
+    &sysctl__debug_nmx_flip_kfence,
+    &sysctl__debug_nmx_flip_irq,
+    &sysctl__debug_nmx_vbl_irq,
+    &sysctl__debug_nmx_flip_fenced,
+    &sysctl__debug_nmx_flip_nofence,
+    &sysctl__debug_nmx_surf_fence_set,
+    &sysctl__debug_nmx_flip_notified,
+    &sysctl__debug_nmx_vbl_delivered,
+    &sysctl__debug_nmx_hwcursor,
+    &sysctl__debug_nmx_hwcursor_avail,
+    &sysctl__debug_nmx_cur_commits,
+    &sysctl__debug_nmx_cur_full,
+    &sysctl__debug_nmx_cur_images,
+    &sysctl__debug_nmx_cur_errors,
+    &sysctl__debug_nmx_cur_rearms,
+    &sysctl__debug_nmx_cur_off,
+    &sysctl__debug_nmx_cur_states,
+    &sysctl__debug_nmx_cur_accepted,
+    &sysctl__debug_nmx_cur_sw_fallback,
+    &sysctl__debug_nmx_cur_kept_last,
+    &sysctl__debug_nmx_cur_copy_retry,
+    &sysctl__debug_nmx_color_staged,
+    &sysctl__debug_nmx_color_flip,
+    &sysctl__debug_nmx_color_alone,
+    &sysctl__debug_nmx_color_errors,
+    &sysctl__debug_nmx_color_rejected,
+    &sysctl__debug_nmx_gtt,
+    &sysctl__debug_nmx_gpu_metrics,
+    &sysctl__debug_nmx_pp_features,
+    &sysctl__debug_nmx_tt_census,
+    &sysctl__debug_nmx_userrec_live,
+    &sysctl__debug_nmx_userrec_made,
+    &sysctl__debug_nmx_userrec_freed,
+    &sysctl__debug_nmx_userrec_kept,
+    &sysctl__debug_nmx_surf_hint,
+    &sysctl__debug_nmx_surf_wire,
+    &sysctl__debug_nmx_surf_miss,
+    &sysctl__debug_nmx_surf_bad_page,
+    &sysctl__debug_nmx_surf_no_surf,
+    &sysctl__debug_nmx_surf_short,
+    &sysctl__debug_nmx_surf_prep_fail,
+    &sysctl__debug_nmx_umap_cache,
+    &sysctl__debug_nmx_wbinvd,
+    &sysctl__debug_nmx_umap_flush,
+    &sysctl__debug_nmx_malloc_irq,
+    &sysctl__debug_nmx_malloc_irq_caller,
+};
+static bool nmx_sysctl_installed;
+
+static void nmx_sysctl_install(void)
+{
+    if (nmx_sysctl_installed) return;
+    {
+        int v;
+        if (PE_parse_boot_argn("nmxkfence", &v, sizeof v)) nmx_flip_kfence = v != 0;
+        if (PE_parse_boot_argn("nmxflipirq", &v, sizeof v)) nmx_flip_irq = v != 0;
+        if (PE_parse_boot_argn("nmxvblirq", &v, sizeof v)) nmx_vbl_irq = v != 0;
+    }
+    for (size_t i = 0; i < sizeof nmx_oids / sizeof *nmx_oids; i++)
+        sysctl_register_oid(nmx_oids[i]);
+    nmx_sysctl_installed = true;
+}
+
+/* unload (nmx_kmod_stop), before the port goes: no new read reaches the driver; reads in flight are waited for by
+ * sysctl_unregister_oid */
+static void nmx_sysctl_remove(void)
+{
+    if (!nmx_sysctl_installed) return;
+    for (size_t i = sizeof nmx_oids / sizeof *nmx_oids; i-- > 0; )
+        sysctl_unregister_oid(nmx_oids[i]);
+    nmx_sysctl_installed = false;
+}
+
+/*
+ * ga403wm Step128 boot stage marks. The Step125 source build hung boots at ~12 s with the disk already stopped, so
+ * the kernel log of the hang never reached it. NVRAM survives: each stage is appended to "nmxgpu-stage" (the last
+ * ~180 bytes, "<uptime ms>:<stage>|" entries, rewritten whole) and forced to flash (IONVRAM-FORCESYNCNOW; the plain
+ * SYNCNOW is rate limited and an unsynced write stays in RAM). After NMXAMDFB is published a 1 s heartbeat writes
+ * "nmxgpu-alive" for 40 s (uptime, beats, 890M IRQs dispatched, NVRM's nvrm-nmx-wait), so the last one dates the hang.
+ * Both live in the Apple NVRAM GUID (7C436110-AB2A-4BBB-A880-FE41995C9F82). Boot-arg nmxstage=0 turns them off.
+ * Never from interrupt context or with interrupts off (NVRAM writes take locks and may sleep). No memchr and no
+ * ml_get_interrupts_enabled: no other kext here imports them, so their kext export is unproven (Step128 lesson).
+ */
+static IOLock *g_stage_lock;
+static char g_stage_buf[192];
+static size_t g_stage_len;
+static int g_stage_on = -1;
+extern "C" unsigned long nmx_irq_dispatched;
+
+static void nmx_nvram_put(const char *key, const char *val, size_t len)
+{
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (options == nullptr)
+        return;
+    if (OSData *d = OSData::withBytes(val, (unsigned)len)) {
+        options->setProperty(key, d);
+        d->release();
+    }
+    if (OSData *one = OSData::withBytes("1", 1)) {
+        options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", one);
+        one->release();
+    }
+    options->release();
+}
+
+static bool nmx_stage_enabled()
+{
+    if (g_stage_on < 0) {
+        int v = 1;
+        if (PE_parse_boot_argn("nmxstage", &v, sizeof(v)) && v == 0)
+            g_stage_on = 0;
+        else
+            g_stage_on = 1;
+    }
+    return g_stage_on == 1 && g_stage_lock != nullptr;
+}
+
+static uint64_t nmx_uptime_ms()
+{
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns / 1000000;
+}
+
+extern "C" void nmx_xnu_stage(const char *what)
+{
+    /* the call sites are all sleepable (attach thread, IOKit matching, thread_call); interrupt context is refused */
+    if (!nmx_stage_enabled() || ml_at_interrupt_context())
+        return;
+    char e[64], copy[sizeof(g_stage_buf)];
+    int n = snprintf(e, sizeof(e), "%llu:%s|", nmx_uptime_ms(), what);
+    if (n <= 0)
+        return;
+    if (n >= (int)sizeof(e))
+        n = sizeof(e) - 1;
+    IOLockLock(g_stage_lock);
+    /* drop the oldest entries until the new one fits */
+    while (g_stage_len + n > sizeof(g_stage_buf) - 1 && g_stage_len > 0) {
+        size_t cut = 0;
+        while (cut < g_stage_len && g_stage_buf[cut] != '|')
+            cut++;
+        cut = cut < g_stage_len ? cut + 1 : g_stage_len;
+        memmove(g_stage_buf, g_stage_buf + cut, g_stage_len - cut);
+        g_stage_len -= cut;
+    }
+    memcpy(g_stage_buf + g_stage_len, e, n);
+    g_stage_len += n;
+    size_t len = g_stage_len;
+    memcpy(copy, g_stage_buf, len);
+    nmx_nvram_put("nmxgpu-stage", copy, len);     /* under the lock: marks reach NVRAM in order */
+    IOLockUnlock(g_stage_lock);
+}
+
+static thread_call_t g_beat_call;
+static unsigned g_beats;
+
+static void nmx_beat(thread_call_param_t, thread_call_param_t)
+{
+    char nv[48] = "-", b[160];
+    OSDictionary *m = IOService::serviceMatching("NVRM");
+    if (m != nullptr) {
+        if (IOService *s = IOService::copyMatchingService(m)) {
+            if (OSString *w = OSDynamicCast(OSString, s->getProperty("nvrm-nmx-wait")))
+                strlcpy(nv, w->getCStringNoCopy(), sizeof(nv));
+            else
+                strlcpy(nv, "started, no wait yet", sizeof(nv));
+            s->release();
+        }
+        m->release();
+    }
+    int n = snprintf(b, sizeof(b), "%llu ms beat %u irq %lu nvrm %s", nmx_uptime_ms(), ++g_beats,
+                     nmx_irq_dispatched, nv);
+    nmx_nvram_put("nmxgpu-alive", b, n > 0 ? (size_t)n : 0);
+    if (g_beats < 40) {
+        uint64_t deadline;
+        clock_interval_to_deadline(1, kSecondScale, &deadline);
+        thread_call_enter_delayed(g_beat_call, deadline);
+    }
+}
+
+static void nmx_beat_start()
+{
+    if (!nmx_stage_enabled() || g_beat_call != nullptr)
+        return;
+    g_beat_call = thread_call_allocate(&nmx_beat, nullptr);   /* kept for the kext's life: the cap is 40 beats */
+    if (g_beat_call != nullptr)
+        thread_call_enter(g_beat_call);
+}
+
+/*
+ * ga403wm Step130 (was the NMXPowerKeep personality of the NMXBacklight kext, Step106): keeps NMXGPU powered while the
+ * system is awake. NMXGPU registers two power states but never asks for one itself, so its state follows its
+ * children: when display sleep takes the framebuffer down, NMXGPU dropped to 0 and ran a full amdgpu suspend under
+ * WindowServer and NMXAccel (the 2026-10-17 hang). This child of NMXGPU asks for state 1, which needs NMXGPU's
+ * kIOPMPowerOn, so display sleep is the framebuffer's own DPMS off/on only. On system sleep the power domain goes down
+ * from the top and this child follows it to 0 as any device does. -nmxkeepoff leaves it out; nmxkeep_dsleep=0 keeps
+ * the logging but lets display sleep suspend NMXGPU. It also logs the system sleep/wake timeline.
+ */
+class NMXPowerKeep : public IOService {
+    OSDeclareDefaultStructors(NMXPowerKeep)
+    bool pm_ = false;
+    UInt32 changes_ = 0, sleeps_ = 0, wakes_ = 0;
+    uint64_t tSleep_ = 0;
+    IONotifier *sysNote_ = nullptr;
+    static IOReturn sysPower(void *target, void *, UInt32 type, IOService *, void *arg, vm_size_t);
+public:
+    bool start(IOService *provider) override;
+    void stop(IOService *provider) override;
+    IOReturn setPowerState(unsigned long state, IOService *device) override;
+};
+OSDefineMetaClassAndStructors(NMXPowerKeep, IOService)
+
+bool NMXPowerKeep::start(IOService *provider)
+{
+    if (!IOService::start(provider))
+        return false;
+    static IOPMPowerState states[2] = {
+        { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    PMinit();
+    provider->joinPMtree(this);
+    if (registerPowerDriver(this, states, 2) != kIOReturnSuccess) {
+        IOLog("NMXPowerKeep: registerPowerDriver failed, inert\n");
+        PMstop();
+        return false;
+    }
+    pm_ = true;
+    UInt32 hold = 1;
+    PE_parse_boot_argn("nmxkeep_dsleep", &hold, sizeof hold);
+    if (hold)
+        changePowerStateTo(1);
+    setProperty("PowerKeep,Wanted", (unsigned long long)(hold ? 1 : 0), 32);
+    sysNote_ = registerPrioritySleepWakeInterest(&NMXPowerKeep::sysPower, this, nullptr);
+    setProperty("PowerKeep,SysSleeps", 0ULL, 32);
+    IOLog("NMXPowerKeep: %s %s while the system is awake; sleep/wake interest %s\n", hold ? "holding" : "NOT holding",
+          provider->getName(), sysNote_ ? "on" : "FAILED");
+    registerService();
+    return true;
+}
+
+void NMXPowerKeep::stop(IOService *provider)
+{
+    if (sysNote_) { sysNote_->remove(); sysNote_ = nullptr; }
+    if (pm_)
+        PMstop();
+    pm_ = false;
+    IOService::stop(provider);
+}
+
+IOReturn NMXPowerKeep::setPowerState(unsigned long state, IOService *)
+{
+    UInt32 n = ++changes_;
+    setProperty("PowerKeep,State", (unsigned long long)state, 32);
+    setProperty("PowerKeep,Changes", n, 32);
+    if (n <= 64)
+        IOLog("NMXPowerKeep: power state %lu (change %u)\n", state, (unsigned)n);
+    return kIOPMAckImplied;
+}
+
+IOReturn NMXPowerKeep::sysPower(void *target, void *, UInt32 type, IOService *, void *arg, vm_size_t)
+{
+    NMXPowerKeep *me = static_cast<NMXPowerKeep *>(target);
+    IOPowerStateChangeNotification *note = static_cast<IOPowerStateChangeNotification *>(arg);
+    uint64_t now = mach_absolute_time(), ns = 0;
+    switch (type) {
+    case kIOMessageCanSystemSleep:
+        if (note) note->returnValue = 0;
+        break;
+    case kIOMessageSystemWillSleep:
+        me->tSleep_ = now;
+        me->sleeps_++;
+        me->setProperty("PowerKeep,SysSleeps", me->sleeps_, 32);
+        IOLog("NMXPowerKeep: system will sleep (#%u), keep state %u\n", (unsigned)me->sleeps_,
+              (unsigned)me->getPowerState());
+        if (note) note->returnValue = 0;
+        break;
+    case kIOMessageSystemWillPowerOn:
+        if (me->tSleep_) absolutetime_to_nanoseconds(now - me->tSleep_, &ns);
+        IOLog("NMXPowerKeep: system will power on, %llu ms after will-sleep\n", ns / 1000000);
+        break;
+    case kIOMessageSystemHasPoweredOn:
+        me->wakes_++;
+        if (me->tSleep_) absolutetime_to_nanoseconds(now - me->tSleep_, &ns);
+        me->setProperty("PowerKeep,SysWakes", me->wakes_, 32);
+        me->setProperty("PowerKeep,LastWakeMs", ns / 1000000, 64);
+        IOLog("NMXPowerKeep: system has powered on (#%u), %llu ms after will-sleep, keep state %u\n",
+              (unsigned)me->wakes_, ns / 1000000, (unsigned)me->getPowerState());
+        break;
+    default:
+        break;
+    }
+    return kIOReturnSuccess;
+}
+
 class NMXGPU : public IOService {
     OSDeclareDefaultStructors(NMXGPU)
     void *dev_;
     IOService *fb_;
     IOPCIDevice *pci_;
+    NMXPowerKeep *keep_;
     volatile int attach_;   /* 0 = attach pending on its thread, 1 = attached, -1 = not attached */
     bool pm_;
+    volatile SInt32 hold_;          /* 1 while the boot hold keeps this service busy */
+    uint64_t holdT0_;
+    thread_call_t holdCall_;
     static void attachThread(void *arg, wait_result_t);
+    static void holdCap(thread_call_param_t self, thread_call_param_t);
     void attachNow();
+    void holdArm();
+    void holdRelease(const char *why);
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
@@ -85,9 +903,15 @@ bool NMXGPU::start(IOService *provider)
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (pci == nullptr || g_lock == nullptr || !IOService::start(provider))
         return false;
+    nmx_sysctl_install();
+    if (g_stage_lock == nullptr)
+        g_stage_lock = IOLockAlloc();
+    nmx_xnu_stage("start");
     IOLockLock(g_lock);
     if (!g_started) {
+        nmx_xnu_stage("port_start");
         int err = nmx_port_start();
+        nmx_xnu_stage(err ? "port_start FAILED" : "port_started");
         if (err) {
             IOLockUnlock(g_lock);
             IOLog("NullMoth GPU: the driver layer did not start (%d)\n", err);
@@ -108,7 +932,11 @@ bool NMXGPU::start(IOService *provider)
     pci_ = pci;
     dev_ = nullptr;
     fb_ = nullptr;
+    keep_ = nullptr;
     pm_ = false;
+    hold_ = 0;
+    holdT0_ = 0;
+    holdCall_ = nullptr;
     attach_ = 0;
     retain();
     thread_t t = THREAD_NULL;
@@ -130,57 +958,56 @@ void NMXGPU::attachThread(void *arg, wait_result_t)
 }
 
 /*
- * Boot guard, as in NMXNPU: the NPU kext on this layer panicked 7 s into every start until its boot argument was
- * removed from Linux. The attach, the modeset and the hand-over to macOS run between setting an NVRAM marker
- * and clearing it; a start that finds the marker still set follows an attach that never returned (a panic or a hang),
- * so this GPU stays with macOS and the driver says so. Turning the test driver off and on in the app clears it.
+ * Boot hold: from the moment the firmware folder is there until NMXAMDFB is published, this service stays busy, so
+ * whatever waits for the GPU's branch of the registry to settle (WindowServer's display discovery, NVRM's
+ * waitQuiet) does not take the boot firmware framebuffer for the only display. Not in start(): the attach thread
+ * first waits for the root volume, and a busy service before that would hold up the mount (the logo hang). Capped at
+ * 30 s; released on every exit of attachNow. The outcome is in the "nmxgpu-boot-hold" property.
  */
-static const char *const kAttachMarker = "nullmoth-gpu-attaching";
-
-static IODTNVRAM *nmx_nvram()
+void NMXGPU::holdArm()
 {
-    IORegistryEntry *e = IORegistryEntry::fromPath("/options", gIODTPlane);
-    IODTNVRAM *n = OSDynamicCast(IODTNVRAM, e);
-    if (n == nullptr && e != nullptr)
-        e->release();
-    return n;
-}
-
-static bool nmx_marker_set()
-{
-    IODTNVRAM *n = nmx_nvram();
-    if (n == nullptr)
-        return false;
-    OSObject *v = n->copyProperty(kAttachMarker);
-    bool set = v != nullptr;
-    if (v)
-        v->release();
-    n->release();
-    return set;
-}
-
-static void nmx_marker_write(bool on)
-{
-    IODTNVRAM *n = nmx_nvram();
-    if (n == nullptr) {
-        IOLog("NullMoth GPU: no NVRAM; the boot guard is off\n");
+    int v = 1;
+    /* ga403wm Step128: boot-arg nmxhold=0 skips the hold (bisects the ~12 s boot hang without a rebuild) */
+    if (PE_parse_boot_argn("nmxhold", &v, sizeof(v)) && v == 0) {
+        setProperty("nmxgpu-boot-hold", "off (nmxhold=0)");
+        nmx_xnu_stage("hold off");
         return;
     }
-    const OSSymbol *k = OSSymbol::withCString(kAttachMarker);
-    if (k != nullptr) {
-        if (on) {
-            OSData *d = OSData::withBytes("1", 1);
-            if (d == nullptr || !n->setProperty(k, d))
-                IOLog("NullMoth GPU: could not set the boot guard\n");
-            if (d)
-                d->release();
-        } else {
-            n->removeProperty(k);
-        }
-        k->release();
+    holdT0_ = mach_absolute_time();
+    hold_ = 1;
+    adjustBusy(1);
+    holdCall_ = thread_call_allocate(&NMXGPU::holdCap, this);
+    if (holdCall_ != nullptr) {
+        uint64_t deadline;
+        retain();                   /* dropped by holdCap, or by holdRelease when it cancels the cap */
+        clock_interval_to_deadline(30, kSecondScale, &deadline);
+        thread_call_enter_delayed(holdCall_, deadline);
     }
-    n->sync();
-    n->release();
+    setProperty("nmxgpu-boot-hold", "held");
+}
+
+void NMXGPU::holdCap(thread_call_param_t p, thread_call_param_t)
+{
+    NMXGPU *self = (NMXGPU *)p;
+    self->holdRelease("30 s cap");
+    self->release();
+}
+
+void NMXGPU::holdRelease(const char *why)
+{
+    uint64_t ns;
+    char text[96];
+
+    if (!OSCompareAndSwap(1, 0, &hold_))
+        return;
+    adjustBusy(-1);
+    absolutetime_to_nanoseconds(mach_absolute_time() - holdT0_, &ns);
+    snprintf(text, sizeof(text), "released: %s after %llu ms", why, ns / 1000000);
+    setProperty("nmxgpu-boot-hold", text);
+    IOLog("NullMoth GPU: boot hold %s\n", text);
+    /* the thread_call itself is kept (one per device per boot): freeing it here could race a cap that is running */
+    if (holdCall_ != nullptr && thread_call_cancel(holdCall_))
+        release();
 }
 
 void NMXGPU::attachNow()
@@ -191,21 +1018,15 @@ void NMXGPU::attachNow()
         attach_ = -1;
         return;
     }
-    if (nmx_marker_set()) {
-        IOLog("NullMoth GPU: the last attach of %04x:%04x never returned (the Mac stopped or restarted); this GPU stays "
-              "with macOS. Send logs, then turn the test driver off and on to try again\n",
-              pci_->configRead16(kIOPCIConfigVendorID), pci_->configRead16(kIOPCIConfigDeviceID));
-        setProperty("nullmoth-gpu-state", "parked: the last attach never returned");
-        attach_ = -1;
-        return;
-    }
-    nmx_marker_write(true);
+    holdArm();
+    nmx_xnu_stage("fw ok, hold, attach");
     dev_ = nmx_port_attach(pci_);
+    nmx_xnu_stage(dev_ ? "attached" : "attach FAILED");
     if (dev_ == nullptr) {
-        nmx_marker_write(false);
         IOLog("NullMoth GPU: no driver took %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
               pci_->configRead16(kIOPCIConfigDeviceID));
         attach_ = -1;
+        holdRelease("no driver");
         return;
     }
 
@@ -218,13 +1039,26 @@ void NMXGPU::attachNow()
     registerPowerDriver(this, states, 2);
     pm_ = true;
     registerService();
+    if (PE_parse_boot_argn("-nmxkeepoff", nullptr, 0)) {
+        IOLog("NMXPowerKeep: -nmxkeepoff, not started\n");
+    } else if ((keep_ = OSTypeAlloc(NMXPowerKeep)) != nullptr) {
+        if (!keep_->init() || !keep_->attach(this) || !keep_->start(this)) {
+            IOLog("NMXPowerKeep: start failed\n");
+            if (keep_->getProvider() != nullptr) keep_->detach(this);
+            OSSafeReleaseNULL(keep_);
+        }
+    }
     /* NMXAccel (the Metal accelerator for this GPU) starts only on a device this driver has claimed; it declined while
        the claim was pending, so matching on the device runs again now that it is set */
     pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
     pci_->registerService();
     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
+    nmx_xnu_stage("registered, fb publish");
     fb_ = nmx_fb_publish(this, dev_);
-    nmx_marker_write(false);
+    nmx_xnu_stage(fb_ ? "fb published" : "fb FAILED");
+    holdRelease(fb_ != nullptr ? "NMXAMDFB published" : "no framebuffer");
+    nmx_xnu_stage("hold released");
+    nmx_beat_start();
     IOLog("NullMoth GPU: driving %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
           pci_->configRead16(kIOPCIConfigDeviceID));
     OSSynchronizeIO();
@@ -240,6 +1074,11 @@ void NMXGPU::stop(IOService *provider)
     if (fb_ != nullptr)
         nmx_fb_unpublish(fb_, this, dev_);
     fb_ = nullptr;
+    if (keep_ != nullptr) {
+        keep_->stop(this);
+        keep_->detach(this);
+        OSSafeReleaseNULL(keep_);
+    }
     if (pm_)
         PMstop();
     pm_ = false;
@@ -255,17 +1094,29 @@ void NMXGPU::stop(IOService *provider)
 IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
 {
     if (dev_ != nullptr) {
+        uint64_t t0 = mach_absolute_time(), t1, ns;
+        IOLog("NullMoth GPU: setPowerState(%lu) begin\n", state);
+        if (g_pwr_lock) IOLockLock(g_pwr_lock);     // waits out a power readout in flight (one SMU table read)
+        g_gpu_powered = 0;
         int err = nmx_port_power(dev_, state != 0);
-        if (err)
-            IOLog("NullMoth GPU: %s returned %d\n", state ? "resume" : "suspend", err);
+        g_gpu_powered = state != 0 && err == 0;
+        if (g_pwr_lock) IOLockUnlock(g_pwr_lock);
+        t1 = mach_absolute_time();
+        absolutetime_to_nanoseconds(t1 - t0, &ns);
+        IOLog("NullMoth GPU: %s returned %d in %llu ms\n", state ? "resume" : "suspend", err, ns / 1000000);
     }
     return kIOPMAckImplied;
 }
 
 void NMXGPU::systemWillShutdown(IOOptionBits spec)
 {
-    if (dev_ != nullptr)
+    if (dev_ != nullptr) {
+        /* as setPowerState: no power readout may query the SMU while (or after) the port tears the GPU down */
+        if (g_pwr_lock) IOLockLock(g_pwr_lock);
+        g_gpu_powered = 0;
         nmx_port_shutdown(dev_);
+        if (g_pwr_lock) IOLockUnlock(g_pwr_lock);
+    }
     IOService::systemWillShutdown(spec);
 }
 
@@ -279,7 +1130,12 @@ kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data);
 kern_return_t nmx_kmod_start(kmod_info_t *ki, void *data)
 {
     g_lock = IOLockAlloc();
-    return g_lock ? KERN_SUCCESS : KERN_FAILURE;
+    g_pwr_lock = IOLockAlloc();
+    if (g_lock && g_pwr_lock)
+        return KERN_SUCCESS;
+    if (g_lock) { IOLockFree(g_lock); g_lock = nullptr; }
+    if (g_pwr_lock) { IOLockFree(g_pwr_lock); g_pwr_lock = nullptr; }
+    return KERN_FAILURE;
 }
 
 kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data)
@@ -291,11 +1147,14 @@ kern_return_t nmx_kmod_stop(kmod_info_t *ki, void *data)
             IOLog("NullMoth GPU: still in use; not unloading\n");
             return KERN_FAILURE;
         }
+        nmx_sysctl_remove();
         nmx_port_stop();
         g_started = false;
     }
+    nmx_sysctl_remove();     /* also when no device ever started the port (start() installs them first) */
     IOLockUnlock(g_lock);
     IOLockFree(g_lock);
+    if (g_pwr_lock) { IOLockFree(g_pwr_lock); g_pwr_lock = nullptr; }
     g_lock = nullptr;
     return KERN_SUCCESS;
 }

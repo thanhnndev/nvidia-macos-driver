@@ -1,0 +1,164 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2989,8 +2989,115 @@
+ 			return false;
+ 	}
+ 	return true;
++}
++
++#ifdef NMXKPI
++/*
++ * ga403wm 2026-11-19 (BOOT-TIMELINE 4): VTDecoderXPCService [19187] hung 2 h 14 min in amdgpu_vm_fini+0x105 on out-37,
++ * the wait for vm->last_tlb_flush, with every scheduler idle and no ring timeout logged: a page-table job that never
++ * reached a ring. To name it the next time: the wait stays unbounded (freeing page tables while a job may still write
++ * them is worse than a stuck exit), but after 5 s, then every 60 s, the fence, its scheduler state, the VM's two
++ * page-table entities (queue, stopped, the dependency they wait on) and the root's unsignalled fences are logged.
++ * The root reservation is held here, so the root's fence list is stable. A scheduler fence's hardware fence and an
++ * entity's dependency are put and cleared by the scheduler without our locks (drm_sched_stop, the dependency
++ * callback): each is read once under RCU with a reference (fences are freed through RCU), then put.
++ */
++/* a reference to *slot taken under RCU, or NULL: the scheduler puts and clears these pointers without our locks */
++static struct dma_fence *nmx_vm_fence_snap(struct dma_fence **slot)
++{
++	struct dma_fence *f;
++
++	rcu_read_lock();
++	f = READ_ONCE(*slot);
++	if (f)
++		f = dma_fence_get_rcu(f);
++	rcu_read_unlock();
++	return f;
+ }
++
++struct dma_fence *amdgpu_tlb_fence_dependency(struct dma_fence *f);	/* amdgpu_vm_tlb_fence.c */
++
++static void nmx_vm_fence_desc(struct amdgpu_device *adev, const char *what, struct dma_fence *f, int depth)
++{
++	struct drm_sched_fence *sf;
++	struct dma_fence *dep;
+ 
++	if (!f) {
++		dev_err(adev->dev, "vm_fini:   %s: none\n", what);
++		return;
++	}
++	sf = to_drm_sched_fence(f);
++	dev_err(adev->dev, "vm_fini:   %s: %s:%s ctx %llu seq %llu signaled %d error %d\n", what,
++		f->ops->get_driver_name(f), f->ops->get_timeline_name(f), (unsigned long long)f->context,
++		(unsigned long long)f->seqno, dma_fence_is_signaled(f), f->error);
++	if (sf) {
++		struct dma_fence *parent = nmx_vm_fence_snap(&sf->parent);
++
++		dev_err(adev->dev, "vm_fini:     scheduler %s, scheduled %d, hardware fence %s seq %llu signaled %d\n",
++			sf->sched ? sf->sched->name : "?", dma_fence_is_signaled(&sf->scheduled),
++			parent ? parent->ops->get_timeline_name(parent) : "none (not on a ring)",
++			parent ? (unsigned long long)parent->seqno : 0ULL, parent ? dma_fence_is_signaled(parent) : -1);
++		dma_fence_put(parent);
++		return;
++	}
++	/* a compute VM's TLB fence: its work item waits for the page-table job first (amdgpu_tlb_fence_work) */
++	dep = amdgpu_tlb_fence_dependency(f);
++	if (dep || !strcmp(f->ops->get_driver_name(f), "amdgpu tlb fence")) {
++		dev_err(adev->dev, "vm_fini:     TLB fence, work item %s\n", dep ? "still waits on:" : "past its wait");
++		if (dep && depth < 1)
++			nmx_vm_fence_desc(adev, "  TLB fence dependency", dep, depth + 1);
++		dma_fence_put(dep);
++	} else {
++		dev_err(adev->dev, "vm_fini:     not a scheduler or TLB fence\n");
++	}
++}
++
++static void nmx_vm_entity_desc(struct amdgpu_device *adev, const char *what, struct drm_sched_entity *e)
++{
++	struct dma_fence *dep = nmx_vm_fence_snap(&e->dependency);
++
++	dev_err(adev->dev, "vm_fini:   entity %s: %d jobs queued, stopped %d, scheduler %s\n", what,
++		spsc_queue_count(&e->job_queue), READ_ONCE(e->stopped), e->rq && e->rq->sched ? e->rq->sched->name : "none");
++	if (dep)
++		nmx_vm_fence_desc(adev, "  it waits on", dep, 0);
++	dma_fence_put(dep);
++}
++
++static void nmx_vm_fini_wait(struct amdgpu_device *adev, struct amdgpu_vm *vm, struct amdgpu_bo *root,
++			     struct dma_fence *f, const char *what)
++{
++	long t = msecs_to_jiffies(5000);
++	unsigned int waited = 0;
++
++	while (dma_fence_wait_timeout(f, false, t) == 0) {
++		struct dma_resv_iter cursor;
++		struct dma_fence *r;
++		int n = 0;
++
++		waited += jiffies_to_msecs(t) / 1000;
++		dev_err(adev->dev, "vm_fini: %s (pid %d) still waits on vm->%s after %u s:\n",
++			vm->task_info ? vm->task_info->process_name : "?", vm->task_info ? vm->task_info->tgid : -1,
++			what, waited);
++		nmx_vm_fence_desc(adev, what, f, 0);
++		nmx_vm_entity_desc(adev, "immediate", &vm->immediate);
++		nmx_vm_entity_desc(adev, "delayed", &vm->delayed);
++		dma_resv_for_each_fence(&cursor, root->tbo.base.resv, DMA_RESV_USAGE_BOOKKEEP, r) {
++			if (dma_fence_is_signaled(r))
++				continue;
++			if (n++ == 16)
++				break;
++			nmx_vm_fence_desc(adev, dma_resv_iter_usage(&cursor) == DMA_RESV_USAGE_KERNEL ? "root (kernel)" :
++					  dma_resv_iter_usage(&cursor) == DMA_RESV_USAGE_WRITE ? "root (write)" :
++					  dma_resv_iter_usage(&cursor) == DMA_RESV_USAGE_READ ? "root (read)" :
++					  "root (bookkeep)", r, 0);
++		}
++		if (!n)
++			dev_err(adev->dev, "vm_fini:   root: no unsignalled fence\n");
++		t = msecs_to_jiffies(60000);
++	}
++}
++#endif
++
+ /**
+  * amdgpu_vm_fini - tear down a vm instance
+  *
+@@ -3015,9 +3122,15 @@
+ 	root = amdgpu_bo_ref(vm->root.bo);
+ 	amdgpu_bo_reserve(root, true);
+ 	amdgpu_vm_set_pasid(adev, vm, 0);
++#ifdef NMXKPI
++	nmx_vm_fini_wait(adev, vm, root, vm->last_unlocked, "last_unlocked");
++	dma_fence_put(vm->last_unlocked);
++	nmx_vm_fini_wait(adev, vm, root, vm->last_tlb_flush, "last_tlb_flush");
++#else
+ 	dma_fence_wait(vm->last_unlocked, false);
+ 	dma_fence_put(vm->last_unlocked);
+ 	dma_fence_wait(vm->last_tlb_flush, false);
++#endif
+ 	/* Make sure that all fence callbacks have completed */
+ 	spin_lock_irqsave(vm->last_tlb_flush->lock, flags);
+ 	spin_unlock_irqrestore(vm->last_tlb_flush->lock, flags);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c
+@@ -76,6 +76,27 @@
+ 	.get_timeline_name = amdgpu_tlb_fence_get_timeline_name
+ };
+ 
++#ifdef NMXKPI
++/* ga403wm (amdgpu_vm_fini diagnostics): the page-table job a TLB fence's work item still waits on, with a reference,
++ * or NULL (not a TLB fence, or the work item is past its wait). The work item clears the pointer: read under RCU. */
++struct dma_fence *amdgpu_tlb_fence_dependency(struct dma_fence *fence);
++struct dma_fence *amdgpu_tlb_fence_dependency(struct dma_fence *fence)
++{
++	struct amdgpu_tlb_fence *f;
++	struct dma_fence *dep;
++
++	if (!fence || fence->ops != &amdgpu_tlb_fence_ops)
++		return NULL;
++	f = container_of(fence, struct amdgpu_tlb_fence, base);
++	rcu_read_lock();
++	dep = READ_ONCE(f->dependency);
++	if (dep)
++		dep = dma_fence_get_rcu(dep);
++	rcu_read_unlock();
++	return dep;
++}
++#endif
++
+ void amdgpu_vm_tlb_fence_create(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 				struct dma_fence **fence)
+ {

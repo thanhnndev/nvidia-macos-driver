@@ -1,0 +1,19 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1121,10 +1121,12 @@
+ 	else
+ 		gtt->pool_id = abo->xcp_id;
+ 
+-	if (abo->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
+-		caching = ttm_write_combined;
+-	else
+-		caching = ttm_cached;
++	/*
++	 * NullMoth: on this machine the GPU's writes to system memory do not invalidate the CPU's cache lines (fence reads
++	 * come back stale: "STALE fence read" in the log), so snooped write-back pages cannot be trusted in either direction.
++	 * Every GTT page is write-combined instead (PTE not snooped, CPU mappings WC): no CPU cache is involved at all.
++	 */
++	caching = ttm_write_combined;
+ 
+ 	/* allocate space for the uninitialized page entries */
+ 	if (ttm_sg_tt_init(&gtt->ttm, bo, page_flags, caching)) {

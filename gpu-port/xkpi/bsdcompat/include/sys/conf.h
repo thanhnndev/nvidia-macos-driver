@@ -73,6 +73,7 @@ struct nmx_bsd_cdevsw {
 #define D_NEEDGIANT 0x00400000
 #define D_NEEDMINOR 0x00800000
 
+struct vnode;
 struct cdev {
     void *si_drv1;
     void *si_drv2;
@@ -86,6 +87,7 @@ struct cdev {
     int nmx_base_minor;             /* minor of the clone node; opens get their own minors */
     u_int nmx_refs;                 /* creation reference + one per open (dev_ref/dev_rel) */
     int nmx_gone;                   /* destroy_dev ran: no new opens */
+    struct vnode *nmx_vnode;        /* the Linux inode of this node (v_rdev = this cdev), lives as long as the cdev */
     TAILQ_ENTRY(cdev) nmx_link;
     LIST_ENTRY(cdev) si_list;       /* in si_devsw->d_devs */
 };

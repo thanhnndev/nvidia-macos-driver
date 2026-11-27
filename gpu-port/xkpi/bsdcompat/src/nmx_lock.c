@@ -114,6 +114,14 @@ void nmx_mtx_unlock(struct mtx *m)
         m->mtx_recurse--;
         return;
     }
+    /* ga403wm Step78: on x86 xnu, lck_mtx_unlock of a free mutex is taken for a spin-mode release and calls
+     * enable_preemption, so the preemption level goes to -1 and a later thread_block panics far from the culprit.
+     * A mutex with no owner is not held: log the caller and leave the lock alone. */
+    if (__builtin_expect(m->mtx_owner == 0, 0)) {
+        printf("NullMoth xkpi: unlock of unlocked mutex %s (%p) from %p\n", m->lock_object.lo_name, m,
+               __builtin_return_address(0));
+        return;
+    }
     m->mtx_owner = 0;
     if (m->lock_object.lo_class == NMX_LC_SPIN) {
         boolean_t was = (boolean_t)m->mtx_saved_intr;

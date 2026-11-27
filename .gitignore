@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+# Local build completeness guards; never commit these machine-local markers.
+gpu-port/xkpi/.nmx-driver-build-incomplete
+gpu-port/xkpi/.nmx-runtime-build-incomplete

@@ -27,8 +27,30 @@ struct nmx_fb_info {
 /* before the driver attaches: settings the bridge needs from the driver (scan-out buffers in contiguous VRAM) */
 void nmx_fb_before_attach(void);
 int nmx_fb_open(void *dev, struct nmx_fb_info *out);
+/* Immutable identity snapshot of the connector whose mode sized the scanout.
+ * Separate from nmx_fb_info to preserve its existing layout. No synthesized EDID. */
+struct nmx_fb_display_info {
+    uint32_t edid_size, internal, width_mm, height_mm;
+    uint32_t hsync_positive, vsync_positive;
+    uint8_t edid[1024];
+};
+int nmx_fb_get_display_info(void *dev, struct nmx_fb_display_info *out);
 void nmx_fb_close(void *dev);
 int nmx_fb_power(void *dev, int on);
+/* hardware cursor on the CRTC's cursor plane (nmx_fb_bridge.c, end of file); NMXAMDFB is the only caller */
+int nmx_fb_cursor_init(uint32_t *side);
+/* the kInvertingEncoding value NMXAMDFB offers IOFramebuffer (see nmx_fb_cursor.h) */
+#define NMX_CUR_INVERT_PIXEL 0x00ffffffu
+void nmx_fb_cursor_set_kick(void (*fn)(void *), void *arg);
+int nmx_fb_cursor_apply(const uint32_t *img, uint32_t w, uint32_t h, uint32_t seq, int32_t x, int32_t y, int visible);
+int nmx_fb_cursor_off(void);
+extern uint64_t gNmxCurCommits, gNmxCurFull, gNmxCurImages, gNmxCurErrors, gNmxCurRearms, gNmxCurOff;
+/* hardware colour stages (nmx_fb_bridge.c, end of file): CRTC DEGAMMA_LUT / CTM / GAMMA_LUT staged for the next flip */
+struct nmx_color_lut;
+int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm, const struct nmx_color_lut *gamma);
+int nmx_fb_color_commit(void);
+extern uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors, gNmxColorRejected;
+
 #ifdef __cplusplus
 }
 #endif

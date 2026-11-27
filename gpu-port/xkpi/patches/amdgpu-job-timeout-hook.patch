@@ -1,0 +1,12 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -94,6 +94,9 @@
+ 	int idx;
+ 	int r;
+ 
++	/* NullMoth: a timed-out job is the failure this port must survive; count it where a reader can see it. */
++	{ extern void nmx_job_timeout(unsigned vmid); nmx_job_timeout(job->vmid); }
++
+ 	if (!drm_dev_enter(adev_to_drm(adev), &idx)) {
+ 		dev_info(adev->dev, "%s - device unplugged skipping recovery on scheduler:%s",
+ 			 __func__, s_job->sched->name);

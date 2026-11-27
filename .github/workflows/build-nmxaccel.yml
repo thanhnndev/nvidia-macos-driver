@@ -1,0 +1,118 @@
+name: build-nmxaccel
+
+# Builds NMXAccel.kext (the AMD/Intel Metal accelerator, -DNMX_ACCEL) on a macOS runner.
+# The source build needs the NVIDIA open kernel module headers only; they are public, so CI can fetch them.
+on:
+  push:
+    branches: [ci/nmxaccel]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: NVIDIA open kernel modules 610.57.04 (headers the accelerator includes)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/ogkm.tar.gz \
+            https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/610.57.04.tar.gz
+          tar -xzf /tmp/ogkm.tar.gz -C "$HOME"
+          mv "$HOME/open-gpu-kernel-modules-610.57.04" "$HOME/ogkm610"
+          test -d "$HOME/ogkm610/src/nvidia/generated"
+          ls "$HOME/ogkm610/src/nvidia/generated" | wc -l
+
+      - name: build NMXAccel
+        env:
+          NM_TAHOE: "1"
+        run: |
+          set -euo pipefail
+          bash build/nmxaccel_build.sh kexts/NVRM out/nmxaccel
+          /usr/libexec/PlistBuddy -c 'Add :IOKitPersonalities:NVAccel:NMXDisplayPipeEnabled bool true' \
+            out/nmxaccel/NMXAccel.kext/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :IOKitPersonalities:NVAccel:NMXDisplayPipeEnabled' \
+            out/nmxaccel/NMXAccel.kext/Contents/Info.plist
+          shasum -a 256 out/nmxaccel/NMXAccel.kext/Contents/MacOS/NMXAccel
+          otool -l out/nmxaccel/NMXAccel.kext/Contents/MacOS/NMXAccel | grep -A1 LC_UUID
+
+      - name: compiler errors
+        if: failure()
+        run: |
+          for f in out/nmxaccel/nmxaccel.err out/nmxaccel/nmxaccelld.err; do
+            [ -f "$f" ] && { echo "== $f"; tail -60 "$f"; }
+          done
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: NMXAccel.kext
+          path: out/nmxaccel/NMXAccel.kext
+          if-no-files-found: error
+
+  # NMXAGDC: AppleGraphicsDeviceControl service for the 890M. Without it IOPresentment's map has no AMD pipe.
+  agdc:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: build NMXAGDC
+        run: |
+          set -euo pipefail
+          bash build/nmxagdc_build.sh kexts/NMXAGDC out/nmxagdc
+          shasum -a 256 out/nmxagdc/NMXAGDC.kext/Contents/MacOS/NMXAGDC
+      - name: compiler errors
+        if: failure()
+        run: |
+          for f in out/nmxagdc/nmxagdc.err out/nmxagdc/nmxagdcld.err; do [ -f "$f" ] && { echo "== $f"; tail -60 "$f"; }; done
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: NMXAGDC.kext
+          path: out/nmxagdc/NMXAGDC.kext
+          if-no-files-found: error
+
+  # NVMTLDriver: the Metal-over-Vulkan plugin the accelerators point MetalPluginName at. One translation unit
+  # (plugin/NVMTLDevice.m #includes plugin/nvmtl_vk.c), Vulkan headers only, no private SDK. Ad-hoc signed here so the
+  # artifact can be dropped into /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS from another OS.
+  plugin:
+    # The plugin calls Metal APIs that only exist in the macOS 26 SDK (MTLResidencySet, MTLShaderValidation); the
+    # macos-14 image ships Xcode 15.4 and its SDK stops at macOS 14.
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vulkan headers
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers /tmp/vk
+          test -f /tmp/vk/include/vulkan/vulkan.h
+
+      - name: build NVMTLDriver
+        run: |
+          set -euo pipefail
+          mkdir -p out/plugin
+          xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 -Wno-protocol -Wno-incomplete-implementation \
+            -I/tmp/vk/include -o out/plugin/NVMTLDriver plugin/NVMTLDevice.m \
+            -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation \
+            2>out/plugin/NVMTLDriver.err \
+            || { echo '== compiler errors'; grep -n 'error:' out/plugin/NVMTLDriver.err | head -20; echo '== tail'; tail -40 out/plugin/NVMTLDriver.err; exit 1; }
+          codesign --force --sign - --timestamp=none out/plugin/NVMTLDriver
+          codesign -dv out/plugin/NVMTLDriver 2>&1 | head -5
+          shasum -a 256 out/plugin/NVMTLDriver
+          otool -l out/plugin/NVMTLDriver | grep -A1 LC_UUID
+          strings -a out/plugin/NVMTLDriver | grep -c 'does not claim this process'
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: NVMTLDriver
+          path: out/plugin/NVMTLDriver
+          if-no-files-found: error

@@ -4,9 +4,25 @@
  *
  * Per-thread records: LinuxKPI hangs Linux's task_struct off FreeBSD's struct thread, and DRM's locks record their
  * owner as a struct thread pointer. xnu has no per-thread storage for kexts, so records live in a hash table keyed by
- * thread_t, created on first use. User threads only pass through the driver inside a system call; the entry points
- * release a record the call created (nmx_thread_leave), so records do not accumulate. Kernel threads the port starts
- * keep theirs until they exit.
+ * thread_t, created on first use. Kernel threads the port starts drop theirs when they exit (nmx_thread_leave).
+ * Records of user threads stay: xnu tells a kext about no thread or process exit, and it recycles thread_t and
+ * proc_t, so a record found by its xnu pointer is checked against the owner's identity (thread_tid; pid and start
+ * time) and rebuilt for the new owner when it was made for an earlier one (ga403wm Step100: a new WindowServer
+ * thread on a recycled thread_t ran with the dead process's Linux task and mm, and amdgpu refused its userptr BOs).
+ *
+ * curthread finds its record without a lock (ga403wm Step114, Kernel-2026-11-05-111129). It runs on every kfree,
+ * sched_pin, sx lock and critical section, so the registry spin lock it used to take was the hottest lock in the
+ * driver, taken from all CPUs, often with interrupts off (rcu_read_lock and the FPU window are critical sections,
+ * MTX_SPIN mutexes hold interrupts off), while its holder kept interrupts on. xnu's spin lock is not fair, and a
+ * holder can be held up by interrupts: a CPU waiting with interrupts off hit the spin lock timeout and the Mac
+ * panicked. Now:
+ *   - thread records are type-stable: a dropped record goes on a free list and is reused, never freed while the
+ *     layer runs, so a lock-free reader can never step onto freed memory; a reader that lands on a record that moved
+ *     only misses, and a miss is always checked again under the lock;
+ *   - chain links and bucket heads are published with release stores, the lock serializes the writers;
+ *   - the registry lock is held with interrupts off on every path, so no holder is ever stretched by an interrupt
+ *     while another CPU spins on it; full-table scans take it one bucket at a time;
+ *   - in interrupt context curthread uses a per-CPU record and never allocates.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -80,8 +96,39 @@ struct nmx_thread_rec {
     int transient;                  /* created by a system-call entry; freed when that entry returns */
 };
 static struct nmx_thread_rec *nmx_threads[NMX_THREAD_BUCKETS];
+static struct nmx_thread_rec *nmx_threads_free;     /* dropped records, reused by the next new thread */
 static lck_spin_t *nmx_thread_lock;
+static boolean_t nmx_thread_lock_intr;              /* the holder's interrupt state, restored at unlock */
 static volatile int nmx_thread_count;
+/* the records curthread hands out in interrupt context (the interrupted thread's record is not touched there) */
+static struct nmx_thread_rec nmx_intr_threads[MAXCPU];
+/* a lock-free walk longer than this (a chain that long, or a reader that kept landing on moving records) goes to
+ * the locked lookup */
+#define NMX_FIND_STEPS 1024
+
+/* the registry lock, always held with interrupts off: other CPUs spin on it with interrupts off too */
+static void nmx_tl_lock(void)
+{
+    boolean_t was = ml_set_interrupts_enabled(FALSE);
+    lck_spin_lock(nmx_thread_lock);
+    nmx_thread_lock_intr = was;
+}
+
+static void nmx_tl_unlock(void)
+{
+    boolean_t was = nmx_thread_lock_intr;
+    lck_spin_unlock(nmx_thread_lock);
+    ml_set_interrupts_enabled(was);
+}
+
+/* nmx_thread_lock held. A thread whose td_proc was taken (nmx_curproc) before its record was linked or rebuilt may
+ * name a record retired in between, which the reaper's walk did not see: it belongs to kernproc, like the threads the
+ * walk moved. The record is still allocated: the graveyard frees it one reap after retiring it. */
+static void nmx_thread_proc_fix_locked(struct thread *td)
+{
+    if (td->td_proc != NULL && td->td_proc->nmx_retired)
+        td->td_proc = nmx_kernproc;
+}
 
 #define NMX_PROC_BUCKETS 64
 struct nmx_proc_rec {
@@ -90,6 +137,24 @@ struct nmx_proc_rec {
     struct nmx_proc_rec *next;
 };
 static struct nmx_proc_rec *nmx_procs[NMX_PROC_BUCKETS];
+/*
+ * Records of processes that are gone wait here (unlinked, under nmx_thread_lock) for nmx_proc_reap, which detaches
+ * their threads' Linux tasks and drops the record's mm reference; it frees them one reap later (the graveyard), so a
+ * pointer nmx_proc_find handed out just before cannot be used after it is freed.
+ */
+static struct nmx_proc_rec *nmx_procs_retired;
+static struct nmx_proc_rec *nmx_procs_grave;
+static volatile int nmx_procs_new;          /* records made since the last scan for exited processes */
+static volatile int nmx_reaping;
+/* Linux tasks taken from recycled thread records, released by nmx_proc_reap */
+#define NMX_TASKS_PENDING 64
+static struct task_struct *nmx_tasks_pending[NMX_TASKS_PENDING];
+static int nmx_tasks_npending;
+static unsigned nmx_tasks_leaked;           /* pending list full: the task (and its mm reference) is kept */
+static unsigned nmx_tasks_deferred;         /* retired while their thread was inside an entry point (kept) */
+static unsigned nmx_tasks_deferred_done;    /* ... and handed over by that thread as it left */
+void (*nmx_task_release_hook)(struct task_struct *ts);
+void (*nmx_proc_release_hook)(struct proc *p);
 static struct proc nmx_kernproc_rec = { .p_pid = 0, .p_comm = "kernel_task" };
 struct proc *nmx_kernproc = &nmx_kernproc_rec;
 struct proc *proc0 = &nmx_kernproc_rec;
@@ -100,30 +165,74 @@ static unsigned bucket_of(const void *p, unsigned n)
     return (unsigned)((v >> 4) ^ (v >> 12)) & (n - 1);
 }
 
+/*
+ * A process's start time, which with its pid would tell the owners of one recycled proc_t apart. It reads 0: the
+ * pid alone tells owners apart (a recycled proc_t with the same pid needs a full pid wrap while the record lives).
+ * proc_starttime is in the 26.5 SDK but 25G332 does not export it to kexts. A weak import of it does not work there:
+ * kmutil bound the missing weak symbol to an address in kernel data, neither NULL nor gOSKextUnresolved, so the
+ * check passed and the call jumped into data. Every boot panicked in NMXGPU::start about 7 s in (ga403wm Step128,
+ * Kernel-2026-11-07-164643: Kernel NX fault at RIP == CR2, _nmx_thread_get+0x1b6 <- nmx_curthread <- lkpi_kmalloc
+ * <- linux_compat_init). So no weak imports in this layer.
+ */
+static uint64_t nmx_proc_start(void *xnu)
+{
+    (void)xnu;
+    return 0;
+}
+
+/* unlinks the record of a process that is gone and queues it for nmx_proc_reap; nmx_thread_lock held */
+static void nmx_proc_retire_locked(struct nmx_proc_rec **pp)
+{
+    struct nmx_proc_rec *r = *pp;
+    *pp = r->next;
+    r->p.nmx_retired = 1;
+    r->next = nmx_procs_retired;
+    nmx_procs_retired = r;
+}
+
+/* the record of a live xnu process (current_proc() or a proc_find() reference), made on first use */
 static struct proc *nmx_proc_for(void *xnu)
 {
     if (xnu == NULL)
         return nmx_kernproc;
+    pid_t pid = proc_pid(xnu);
+    uint64_t start = nmx_proc_start(xnu);
     unsigned b = bucket_of(xnu, NMX_PROC_BUCKETS);
-    lck_spin_lock(nmx_thread_lock);
-    for (struct nmx_proc_rec *r = nmx_procs[b]; r; r = r->next)
-        if (r->xnu == xnu) { lck_spin_unlock(nmx_thread_lock); return &r->p; }
-    lck_spin_unlock(nmx_thread_lock);
+    nmx_tl_lock();
+    for (struct nmx_proc_rec **pp = &nmx_procs[b]; *pp; pp = &(*pp)->next) {
+        struct nmx_proc_rec *r = *pp;
+        if (r->xnu != xnu)
+            continue;
+        if (r->p.p_pid == pid && r->p.nmx_start == start) {
+            nmx_tl_unlock();
+            return &r->p;
+        }
+        /* the proc_t was recycled: this record (and its mm) belongs to the process that had it before */
+        nmx_proc_retire_locked(pp);
+        break;
+    }
+    nmx_tl_unlock();
 
     struct nmx_proc_rec *nr = IOMallocZero(sizeof(*nr));
     if (nr == NULL)
         return nmx_kernproc;
     nr->xnu = xnu;
     nr->p.nmx_xnu = xnu;
-    nr->p.p_pid = proc_pid(xnu);
+    nr->p.p_pid = pid;
+    nr->p.nmx_start = start;
     proc_name(nr->p.p_pid, nr->p.p_comm, sizeof(nr->p.p_comm));
 
-    lck_spin_lock(nmx_thread_lock);
+    nmx_tl_lock();
     for (struct nmx_proc_rec *r = nmx_procs[b]; r; r = r->next)
-        if (r->xnu == xnu) { lck_spin_unlock(nmx_thread_lock); IOFree(nr, sizeof(*nr)); return &r->p; }
+        if (r->xnu == xnu && r->p.p_pid == pid && r->p.nmx_start == start) {
+            nmx_tl_unlock();
+            IOFree(nr, sizeof(*nr));
+            return &r->p;
+        }
     nr->next = nmx_procs[b];
     nmx_procs[b] = nr;
-    lck_spin_unlock(nmx_thread_lock);
+    nmx_procs_new++;
+    nmx_tl_unlock();
     return &nr->p;
 }
 
@@ -132,11 +241,44 @@ struct proc *nmx_curproc(void)
     return nmx_proc_for(current_proc());
 }
 
+/* nmx_thread_lock held: p is a record still linked in nmx_procs[] (or kernproc), so it is not freed while the lock is
+ * held. A record retired after nmx_proc_for returned is unlinked, and two reaps later freed. */
+static int nmx_proc_linked_locked(const struct proc *p, void *xnu)
+{
+    if (p == nmx_kernproc)
+        return 1;
+    for (struct nmx_proc_rec *r = nmx_procs[bucket_of(xnu, NMX_PROC_BUCKETS)]; r; r = r->next)
+        if (&r->p == p)
+            return 1;
+    return 0;
+}
+
+/* the calling process's record, returned with nmx_thread_lock HELD and checked to be linked under it (review of
+ * b083256: nmx_thread_get / nmx_thread_recycle took nmx_curproc() unlocked and then read the record, which a reap in
+ * between could retire and free). A record retired in between is looked up again, NMX_CURPROC_LOOKUPS lookups in all;
+ * then, or at once when the process is exiting (a new lookup would only make a fresh record for the reaper to retire
+ * again; review of 0266402), kernproc. */
+#define NMX_CURPROC_LOOKUPS 3
+static struct proc *nmx_curproc_lock(void)
+{
+    void *xnu = current_proc();
+    for (int lookup = 1;; lookup++) {
+        struct proc *p = nmx_proc_for(xnu);
+        nmx_tl_lock();
+        if (nmx_proc_linked_locked(p, xnu))
+            return p;
+        if (lookup >= NMX_CURPROC_LOOKUPS || (xnu != NULL && proc_exiting((proc_t)xnu)))
+            return nmx_kernproc;
+        nmx_tl_unlock();
+    }
+}
+
 pid_t nmx_proc_pid(struct proc *p)
 {
     return p ? p->p_pid : 0;
 }
 
+/* nmx_thread_lock held */
 static struct nmx_thread_rec *nmx_thread_find(thread_t xt)
 {
     unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
@@ -146,70 +288,163 @@ static struct nmx_thread_rec *nmx_thread_find(thread_t xt)
     return NULL;
 }
 
+/*
+ * Without the lock: only the calling thread makes, rebuilds or drops a record keyed by its own thread_t, so a match
+ * is its own record and stays put while it runs. A NULL is only a hint (the caller looks again under the lock).
+ */
+static struct nmx_thread_rec *nmx_thread_find_lockless(thread_t xt)
+{
+    unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
+    unsigned steps = 0;
+    for (struct nmx_thread_rec *r = __atomic_load_n(&nmx_threads[b], __ATOMIC_ACQUIRE); r;
+         r = __atomic_load_n(&r->next, __ATOMIC_ACQUIRE)) {
+        if (__atomic_load_n(&r->td.td_xnu, __ATOMIC_RELAXED) == xt)
+            return r;
+        if (++steps > NMX_FIND_STEPS)
+            break;
+    }
+    return NULL;
+}
+
+/* queues a Linux task for release by nmx_proc_reap; nmx_thread_lock held */
+static void nmx_task_pending_locked(struct task_struct *ts)
+{
+    if (nmx_tasks_npending < NMX_TASKS_PENDING)
+        nmx_tasks_pending[nmx_tasks_npending++] = ts;
+    else
+        nmx_tasks_leaked++;
+}
+
+/*
+ * The record of a recycled thread_t, rebuilt for the thread that has it now. Only the owning thread rebuilds its
+ * record; the earlier owner's Linux task (and through it that process's mm) is released later by nmx_proc_reap,
+ * since this may run where nothing may sleep.
+ */
+static void nmx_thread_recycle(struct nmx_thread_rec *r, uint64_t tid)
+{
+    struct proc *p = nmx_curproc_lock();     /* returns with nmx_thread_lock held, p linked */
+    struct task_struct *ts = r->td.td_lkpi_task;
+    r->td.td_lkpi_task = NULL;
+    r->td.td_proc = p;     /* linked under the lock (nmx_curproc_lock): not retired, no fix needed */
+    /* ga403wm Step134: td_name is the Linux task's comm (linux_current.c); left empty, amdgpu's VM fault print named
+     * no process ("in process  pid N"), which hid the 15:17 PERMISSION_FAULTS writer */
+    strlcpy(r->td.td_name, p->p_comm, sizeof(r->td.td_name));
+    r->td.td_tid = (int)(tid & 0x7fffffff);
+    r->td.td_xnu_tid = tid;
+    r->td.td_pinned = 0;
+    r->td.td_critnest = 0;
+    r->td.td_flags = 0;
+    r->td.td_pflags = 0;
+    r->td.td_fpop = NULL;
+    r->td.td_nmx_open = NULL;
+    __atomic_store_n(&r->td.td_nmx_entry, 0, __ATOMIC_RELAXED);
+    r->td.td_siglist = 0;
+    r->td.td_wchan = NULL;
+    r->td.td_wmesg = NULL;
+    if (ts != NULL)
+        nmx_task_pending_locked(ts);
+    nmx_tl_unlock();
+}
+
 /* the record for the calling thread, created on first use; 'transient' marks one made by a system-call entry */
 static struct thread *nmx_thread_get(int transient, int *created)
 {
     thread_t xt = current_thread();
+    uint64_t tid = thread_tid(xt);
     *created = 0;
-    lck_spin_lock(nmx_thread_lock);
-    struct nmx_thread_rec *r = nmx_thread_find(xt);
-    lck_spin_unlock(nmx_thread_lock);
-    if (r)
+    struct nmx_thread_rec *r = nmx_thread_find_lockless(xt);
+    if (r == NULL) {
+        nmx_tl_lock();
+        r = nmx_thread_find(xt);
+        nmx_tl_unlock();
+    }
+    if (r) {
+        if (__builtin_expect(r->td.td_xnu_tid != tid, 0))
+            nmx_thread_recycle(r, tid);
         return &r->td;
+    }
 
-    struct nmx_thread_rec *nr = IOMallocZero(sizeof(*nr));
-    if (nr == NULL)
-        panic("NullMoth xkpi: no memory for a thread record");
-    nr->td.td_xnu = xt;
-    nr->td.td_proc = nmx_curproc();
-    nr->td.td_tid = (int)(thread_tid(xt) & 0x7fffffff);
+    /* a dropped record if there is one, else a new one */
+    nmx_tl_lock();
+    struct nmx_thread_rec *nr = nmx_threads_free;
+    if (nr != NULL)
+        nmx_threads_free = nr->next;
+    nmx_tl_unlock();
+    if (nr != NULL) {
+        /* a stale lock-free reader may still look at it: the link goes first and in one store, and the key is
+         * NULL (cleared when the record was dropped) until the record is complete */
+        __atomic_store_n(&nr->next, NULL, __ATOMIC_RELAXED);
+        bzero(&nr->td, sizeof(nr->td));
+    } else {
+        nr = IOMallocZero(sizeof(*nr));
+        if (nr == NULL)
+            panic("NullMoth xkpi: no memory for a thread record");
+    }
+    nr->td.td_tid = (int)(tid & 0x7fffffff);
+    nr->td.td_xnu_tid = tid;
     nr->td.td_priority = PZERO;
     nr->td.td_base_pri = PZERO;
     nr->transient = transient;
+    __atomic_store_n(&nr->td.td_xnu, xt, __ATOMIC_RELAXED);
 
-    lck_spin_lock(nmx_thread_lock);
-    r = nmx_thread_find(xt);
+    /* the record is not linked yet, so no reader sees td_proc / td_name before they are set here, under the lock */
+    nr->td.td_proc = nmx_curproc_lock();     /* returns with nmx_thread_lock held, the record linked */
+    strlcpy(nr->td.td_name, nr->td.td_proc->p_comm, sizeof(nr->td.td_name));   /* Step134: the task's comm */
+    r = nmx_thread_find(xt);     /* td_proc was checked linked under this lock: not retired */
     if (r == NULL) {
         unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
-        nr->next = nmx_threads[b];
-        nmx_threads[b] = nr;
+        __atomic_store_n(&nr->next, nmx_threads[b], __ATOMIC_RELAXED);
+        __atomic_store_n(&nmx_threads[b], nr, __ATOMIC_RELEASE);
         nmx_thread_count++;
         r = nr;
-        nr = NULL;
         *created = 1;
+    } else {
+        /* cannot happen (only this thread makes its record); keep the spare */
+        __atomic_store_n(&nr->td.td_xnu, NULL, __ATOMIC_RELAXED);
+        nr->next = nmx_threads_free;
+        nmx_threads_free = nr;
     }
-    lck_spin_unlock(nmx_thread_lock);
-    if (nr)
-        IOFree(nr, sizeof(*nr));
+    nmx_tl_unlock();
     return &r->td;
 }
 
 struct thread *nmx_curthread(void)
 {
+    if (__builtin_expect(ml_at_interrupt_context(), 0)) {
+        /* interrupts are off here, so this CPU's record cannot change hands; nothing is allocated */
+        struct thread *td = &nmx_intr_threads[cpu_number() % MAXCPU].td;
+        td->td_proc = nmx_kernproc;
+        td->td_intr_nesting_level = 1;
+        return td;
+    }
     int created;
     struct thread *td = nmx_thread_get(0, &created);
-    td->td_intr_nesting_level = ml_at_interrupt_context() ? 1 : 0;
+    if (td->td_intr_nesting_level != 0)
+        td->td_intr_nesting_level = 0;
     return td;
 }
 
-/* removes and frees the calling thread's record; LinuxKPI's task_struct must already be released by the caller */
+/* unlinks the calling thread's record onto the free list; LinuxKPI's task_struct must already be released */
 static void nmx_thread_drop_current(void)
 {
     thread_t xt = current_thread();
     unsigned b = bucket_of(xt, NMX_THREAD_BUCKETS);
-    struct nmx_thread_rec *found = NULL;
-    lck_spin_lock(nmx_thread_lock);
+    nmx_tl_lock();
     for (struct nmx_thread_rec **pp = &nmx_threads[b]; *pp; pp = &(*pp)->next) {
-        if ((*pp)->td.td_xnu == xt) {
-            found = *pp;
-            *pp = found->next;
+        struct nmx_thread_rec *found = *pp;
+        if (found->td.td_xnu == xt) {
+            __atomic_store_n(pp, found->next, __ATOMIC_RELEASE);
             nmx_thread_count--;
+            /* the record is not freed: a lock-free reader may be on it; it keeps its link until reuse */
+            __atomic_store_n(&found->td.td_xnu, NULL, __ATOMIC_RELAXED);
+            found->transient = 0;
+            /* free-list link: a reader that follows it only meets NULL keys */
+            __atomic_store_n(&found->next, nmx_threads_free, __ATOMIC_RELEASE);
+            nmx_threads_free = found;
             break;
         }
     }
-    lck_spin_unlock(nmx_thread_lock);
-    if (found)
-        IOFree(found, sizeof(*found));
+    nmx_tl_unlock();
 }
 
 /*
@@ -235,6 +470,26 @@ void nmx_thread_leave(int created)
     nmx_thread_drop_current();
 }
 
+/*
+ * Called by the device-node glue as an entry point returns: a critical section the driver left open must not go back
+ * to user space with interrupts off (Step33c) - log it and close it.
+ */
+void nmx_thread_crit_check(const char *where)
+{
+    if (ml_at_interrupt_context())
+        return;
+    struct thread *td = nmx_curthread();
+    if (td->td_critnest != 0) {
+        printf("NullMoth xkpi: %s returned with critical nesting %d - closed\n", where, td->td_critnest);
+        td->td_critnest = 0;
+        ml_set_interrupts_enabled((boolean_t)td->td_crit_saved);
+    }
+    if (td->td_pinned != 0) {
+        printf("NullMoth xkpi: %s returned with sched_pin nesting %d - closed\n", where, td->td_pinned);
+        td->td_pinned = 0;
+    }
+}
+
 void nmx_thread_exit_cleanup(void)
 {
     nmx_thread_leave(1);
@@ -243,11 +498,13 @@ void nmx_thread_exit_cleanup(void)
 struct thread *tdfind(lwpid_t tid, pid_t pid)
 {
     struct thread *found = NULL;
-    lck_spin_lock(nmx_thread_lock);
-    for (unsigned b = 0; b < NMX_THREAD_BUCKETS && !found; b++)
+    /* one bucket per lock hold: interrupts are off while it is held */
+    for (unsigned b = 0; b < NMX_THREAD_BUCKETS && !found; b++) {
+        nmx_tl_lock();
         for (struct nmx_thread_rec *r = nmx_threads[b]; r; r = r->next)
             if (r->td.td_tid == tid && (pid == -1 || nmx_proc_pid(r->td.td_proc) == pid)) { found = &r->td; break; }
-    lck_spin_unlock(nmx_thread_lock);
+        nmx_tl_unlock();
+    }
     return found;
 }
 
@@ -255,29 +512,40 @@ struct thread *tdfind(lwpid_t tid, pid_t pid)
 
 /*
  * Critical sections: xnu does not let kexts disable preemption, so a critical section runs with interrupts off on
- * this CPU, which also rules out preemption and migration. Nesting is counted per CPU; the interrupt state from the
- * outermost entry is restored at the outermost exit. LinuxKPI's critical sections are short and never sleep.
+ * this CPU, which also rules out preemption and migration. The interrupt state from the outermost entry is restored
+ * at the outermost exit.
+ *
+ * Nesting is counted per thread (ga403wm, docs/890M-TRACE.md Step33c). Every LinuxKPI spin_lock enters one
+ * (local_bh_disable -> sched_pin), and a spin_lock taken inside another can block in lck_mtx_lock and resume on
+ * another CPU: with a per-CPU count the exit then decremented the new CPU's count, the old CPU's stayed raised, and
+ * the next thread to leave a critical section there never got its interrupts back - a process exiting with
+ * interrupts off panicked in workq_exit ("unsafe thread_call_cancel_wait"). The thread record is looked up before
+ * interrupts go off (the outermost entry may create it).
  */
-static struct { int nest; boolean_t saved; } nmx_crit[MAXCPU];
-
 void nmx_critical_enter(void)
 {
+    struct thread *td = nmx_curthread();
     boolean_t was = ml_set_interrupts_enabled(FALSE);
-    int c = cpu_number();
-    if (nmx_crit[c].nest++ == 0)
-        nmx_crit[c].saved = was;
+    if (td->td_critnest++ == 0)
+        td->td_crit_saved = was;
 }
 
 void nmx_critical_exit(void)
 {
-    int c = cpu_number();
-    if (--nmx_crit[c].nest == 0)
-        ml_set_interrupts_enabled(nmx_crit[c].saved);
+    struct thread *td = nmx_curthread();
+    if (td->td_critnest <= 0)
+        panic("NullMoth xkpi: critical_exit without critical_enter");
+    if (--td->td_critnest == 0)
+        ml_set_interrupts_enabled((boolean_t)td->td_crit_saved);
 }
 
 int nmx_in_critical(void)
 {
-    return (ml_at_interrupt_context() || nmx_crit[cpu_number()].nest > 0) ? 1 : 0;
+    struct thread *td;
+    if (ml_at_interrupt_context())
+        return 1;
+    td = nmx_curthread();
+    return (td->td_critnest > 0 || td->td_pinned > 0) ? 1 : 0;
 }
 
 int nmx_curcpu(void)
@@ -285,14 +553,25 @@ int nmx_curcpu(void)
     return cpu_number();
 }
 
+/*
+ * sched_pin only counts. It used to be a critical section (interrupts off), and every LinuxKPI spin_lock pins, so a
+ * lock held across a long wait kept this CPU's interrupts off for as long: amdgpu's MES queue reset polls a fence under
+ * its ring lock for up to two seconds, another CPU's TLB shootdown then timed out and the Mac panicked ("NMIPI for
+ * unresponsive processor: TLB flush timeout", Kernel-2026-10-18-153556). A lock is a mutex here, which excludes
+ * other threads without needing the CPU to itself; the pin is only a marker for in_atomic-style checks. Code that
+ * really needs this CPU to itself (the FPU window, seqc) calls critical_enter.
+ */
 void sched_pin(void)
 {
-    nmx_critical_enter();
+    nmx_curthread()->td_pinned++;
 }
 
 void sched_unpin(void)
 {
-    nmx_critical_exit();
+    struct thread *td = nmx_curthread();
+    if (td->td_pinned <= 0)
+        panic("NullMoth xkpi: sched_unpin without sched_pin");
+    td->td_pinned--;
 }
 
 void sched_prio(struct thread *td, u_char prio) { if (td) td->td_priority = prio; }
@@ -455,6 +734,11 @@ void nmx_module_event(void *arg)
 uint64_t tsc_freq;
 extern int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 
+/* device-node / sysctl entries: in-flight count and started flag (nmx_entry_try, reviews of b083256 and 0266402) */
+static volatile int nmx_entry_open;          /* set by nmx_port_start after its last step (nmx_entry_open_now) */
+static volatile unsigned nmx_entry_inflight;
+extern void IOSleep(unsigned int milliseconds);
+
 int nmx_kernel_init(void)
 {
     clock_timebase_info(&nmx_tb);
@@ -478,19 +762,27 @@ int nmx_kernel_init(void)
     return 0;
 }
 
+void nmx_entry_close_and_drain(void);
 void nmx_kernel_fini(void)
 {
+    nmx_entry_close_and_drain();     /* nmx_port_stop closed and drained already; again here costs nothing */
     if (nmx_thread_lock) {
         for (unsigned b = 0; b < NMX_THREAD_BUCKETS; b++) {
             struct nmx_thread_rec *r = nmx_threads[b];
             while (r) { struct nmx_thread_rec *n = r->next; IOFree(r, sizeof(*r)); r = n; }
             nmx_threads[b] = NULL;
         }
+        for (struct nmx_thread_rec *r = nmx_threads_free, *n; r; r = n) { n = r->next; IOFree(r, sizeof(*r)); }
+        nmx_threads_free = NULL;
         for (unsigned b = 0; b < NMX_PROC_BUCKETS; b++) {
             struct nmx_proc_rec *r = nmx_procs[b];
             while (r) { struct nmx_proc_rec *n = r->next; IOFree(r, sizeof(*r)); r = n; }
             nmx_procs[b] = NULL;
         }
+        struct nmx_proc_rec *lists[2] = { nmx_procs_retired, nmx_procs_grave };
+        for (int i = 0; i < 2; i++)
+            for (struct nmx_proc_rec *r = lists[i], *n; r; r = n) { n = r->next; IOFree(r, sizeof(*r)); }
+        nmx_procs_retired = nmx_procs_grave = NULL;
         lck_spin_free(nmx_thread_lock, nmx_lck_grp);
         nmx_thread_lock = NULL;
     }
@@ -580,8 +872,8 @@ struct task_struct *nmx_proc_any_task(struct proc *p, bool get)
 {
     extern void nmx_task_get(struct task_struct *ts);
     struct task_struct *ts = NULL;
-    lck_spin_lock(nmx_thread_lock);
-    for (unsigned b = 0; b < NMX_THREAD_BUCKETS && ts == NULL; b++)
+    for (unsigned b = 0; b < NMX_THREAD_BUCKETS && ts == NULL; b++) {
+        nmx_tl_lock();
         for (struct nmx_thread_rec *r = nmx_threads[b]; r; r = r->next)
             if (r->td.td_proc == p && r->td.td_lkpi_task != NULL) {
                 ts = r->td.td_lkpi_task;
@@ -589,8 +881,248 @@ struct task_struct *nmx_proc_any_task(struct proc *p, bool get)
                     nmx_task_get(ts);
                 break;
             }
-    lck_spin_unlock(nmx_thread_lock);
+        nmx_tl_unlock();
+    }
     return ts;
+}
+
+/*
+ * Releases what earlier owners of recycled records left, and the records of processes that exited; called by
+ * LinuxKPI where it may sleep (linux_alloc_current with M_WAITOK). One caller at a time; cheap when there is nothing
+ * to do. A process that exits is noticed when a new process record appears (the next process to use the driver).
+ */
+void nmx_proc_reap(void)
+{
+    if (nmx_procs_new == 0 && nmx_procs_retired == NULL && nmx_procs_grave == NULL && nmx_tasks_npending == 0)
+        return;
+    if (__atomic_exchange_n(&nmx_reaping, 1, __ATOMIC_ACQUIRE))
+        return;
+
+    /* 1. records whose process is gone (its proc_t not recycled yet) */
+    if (__atomic_exchange_n(&nmx_procs_new, 0, __ATOMIC_ACQ_REL) != 0) {
+        for (unsigned b = 0; b < NMX_PROC_BUCKETS; b++) {
+            enum { MAXB = 16 };
+            struct { struct nmx_proc_rec *r; void *xnu; pid_t pid; uint64_t start; } c[MAXB];
+            int n = 0;
+            nmx_tl_lock();
+            for (struct nmx_proc_rec *r = nmx_procs[b]; r && n < MAXB; r = r->next) {
+                c[n].r = r; c[n].xnu = r->xnu; c[n].pid = r->p.p_pid; c[n].start = r->p.nmx_start;
+                n++;
+            }
+            if (n == MAXB)
+                nmx_procs_new = 1;      /* a long chain: the rest at the next reap */
+            nmx_tl_unlock();
+            for (int i = 0; i < n; i++) {
+                void *xp = (void *)proc_find(c[i].pid);
+                bool alive = xp == c[i].xnu && nmx_proc_start(xp) == c[i].start;
+                if (xp != NULL)
+                    proc_rele((proc_t)xp);
+                if (alive)
+                    continue;
+                nmx_tl_lock();
+                for (struct nmx_proc_rec **pp = &nmx_procs[b]; *pp; pp = &(*pp)->next)
+                    if (*pp == c[i].r) { nmx_proc_retire_locked(pp); break; }
+                nmx_tl_unlock();
+            }
+        }
+    }
+
+    /* 2. free the graveyard (retired one reap ago), then retire: detach the threads, drop the mm */
+    nmx_tl_lock();
+    struct nmx_proc_rec *grave = nmx_procs_grave;
+    struct nmx_proc_rec *retired = nmx_procs_retired;
+    nmx_procs_grave = NULL;
+    nmx_procs_retired = NULL;
+    nmx_tl_unlock();
+    /* 'retired' is ours now; the thread table is walked one bucket per lock hold (interrupts are off meanwhile) */
+    const unsigned deferred0 = nmx_tasks_deferred;
+    if (retired != NULL)
+        for (unsigned b = 0; b < NMX_THREAD_BUCKETS; b++) {
+            nmx_tl_lock();
+            for (struct nmx_thread_rec *t = nmx_threads[b]; t; t = t->next)
+                for (struct nmx_proc_rec *r = retired; r; r = r->next)
+                    if (t->td.td_proc == &r->p) {
+                        /* a thread of the dead process: its record waits for its thread_t to be recycled */
+                        t->td.td_proc = nmx_kernproc;
+                        /* ga403wm exit hang (VTDecoderXPCService 2026-11-19 14:42): proc_find fails for a process in
+                         * exit while its last thread still runs the driver's close (NMXAccel clientDied -> vnode
+                         * close -> nmx_cdev_close -> drm_release -> amdgpu_vm_fini -> dma_fence_wait). Releasing its
+                         * task here freed the task_struct that thread sleeps on and that the fence callback wakes
+                         * (dma_fence_default_wait_cb -> wake_up_task(cb.task)): the wakeup read freed memory, found
+                         * no sleeping state, and the thread slept forever. A thread inside an entry point keeps its
+                         * task; it hands it over itself as it leaves (nmx_thread_entry_leave). */
+                        u_int was = __atomic_fetch_or(&t->td.td_nmx_entry, NMX_ENTRY_REAP, __ATOMIC_SEQ_CST);
+                        if (t->td.td_lkpi_task != NULL && (was & NMX_ENTRY_DEPTH) != 0)
+                            nmx_tasks_deferred++;
+                        else {
+                            if (t->td.td_lkpi_task != NULL) {
+                                nmx_task_pending_locked(t->td.td_lkpi_task);
+                                t->td.td_lkpi_task = NULL;
+                            }
+                            /* the thread now belongs to kernproc: tasks it makes later are not this process's, so
+                             * nothing is left to hand over (review of fdffd32: REAP was sticky). An entry that raced
+                             * in after the fetch_or saw REAP and waits for this lock; one after this clear reads the
+                             * NULL through the RMW chain. A thread with no task yet cannot publish one for this
+                             * process any more: linux_alloc_current publishes under this lock only while td_proc is
+                             * still the process (nmx_thread_proc_locked) */
+                            __atomic_fetch_and(&t->td.td_nmx_entry, ~NMX_ENTRY_REAP, __ATOMIC_SEQ_CST);
+                        }
+                        break;
+                    }
+            nmx_tl_unlock();
+        }
+    if (nmx_tasks_deferred != deferred0)
+        printf("NullMoth xkpi: %u thread(s) of retired processes are inside the driver (exit-time close); their Linux "
+               "tasks stay until they leave (%u so far)\n", nmx_tasks_deferred - deferred0, nmx_tasks_deferred);
+    for (struct nmx_proc_rec *r = grave, *n; r; r = n) {
+        n = r->next;
+        IOFree(r, sizeof(*r));
+    }
+    struct nmx_proc_rec *last = NULL;
+    for (struct nmx_proc_rec *r = retired; r; r = r->next) {
+        if (nmx_proc_release_hook)
+            nmx_proc_release_hook(&r->p);
+        last = r;
+    }
+    if (last != NULL) {
+        nmx_tl_lock();
+        last->next = nmx_procs_grave;
+        nmx_procs_grave = retired;
+        nmx_tl_unlock();
+    }
+
+    /* 3. the Linux tasks of earlier owners */
+    for (;;) {
+        struct task_struct *ts = NULL;
+        nmx_tl_lock();
+        if (nmx_tasks_npending > 0)
+            ts = nmx_tasks_pending[--nmx_tasks_npending];
+        nmx_tl_unlock();
+        if (ts == NULL)
+            break;
+        if (nmx_task_release_hook)
+            nmx_task_release_hook(ts);
+    }
+    __atomic_store_n(&nmx_reaping, 0, __ATOMIC_RELEASE);
+}
+
+/*
+ * Device-node entry points bracket their work with these (nmx_linux_cdev.c enter/leave). The word holds the entry
+ * depth and NMX_ENTRY_REAP, set by nmx_proc_reap when the thread's process was retired. Both sides change it with one
+ * atomic read-modify-write, so they are ordered: the reaper either sees the thread inside (depth > 0) and leaves its
+ * task attached, or sees it outside and detaches the task in the same registry-lock hold as its fetch_or.
+ */
+void nmx_thread_entry_enter(struct thread *td)
+{
+    u_int was = __atomic_fetch_add(&td->td_nmx_entry, 1, __ATOMIC_SEQ_CST);
+    if (was & NMX_ENTRY_REAP) {
+        /* the reaper may have detached the task just before: its store of td_lkpi_task = NULL is made under the
+         * registry lock, so pass through the lock before LinuxKPI reads td_lkpi_task (current) */
+        nmx_tl_lock();
+        nmx_tl_unlock();
+    }
+}
+
+void nmx_thread_entry_leave(struct thread *td)
+{
+    u_int was = __atomic_fetch_sub(&td->td_nmx_entry, 1, __ATOMIC_SEQ_CST);
+    if ((was & NMX_ENTRY_DEPTH) != 1 || !(was & NMX_ENTRY_REAP))
+        return;
+    /* the outermost entry of a thread whose process was retired while it was inside: hand its task to the reaper */
+    struct task_struct *ts = NULL;
+    unsigned done = 0;
+    nmx_tl_lock();
+    if (td->td_lkpi_task != NULL) {
+        ts = td->td_lkpi_task;
+        nmx_task_pending_locked(ts);
+        td->td_lkpi_task = NULL;
+        done = ++nmx_tasks_deferred_done;
+    }
+    /* handed over once: the thread belongs to kernproc now (reparented by the reaper), so later entries are plain
+     * (review of fdffd32: REAP stayed set and every later entry made a task, handed it over and printed) */
+    __atomic_fetch_and(&td->td_nmx_entry, ~NMX_ENTRY_REAP, __ATOMIC_SEQ_CST);
+    nmx_tl_unlock();
+    if (ts != NULL && (done <= 16 || (done & 255) == 0))
+        printf("NullMoth xkpi: thread %d of a retired process left the driver; its Linux task is released now "
+               "(%u kept while inside so far)\n", td->td_tid, done);
+}
+
+/* review of 37bac65: the driver's sysctls are registered before nmx_port_start made the registry lock and stay after a
+ * failed start or nmx_port_stop; curthread there would take a NULL lock. No record then: nothing to count. */
+/* Review of b083256: the NULL check above was check-then-use against nmx_kernel_fini, which frees the lock and the
+ * records. An entry now counts itself in flight first and then checks the started flag (both seq_cst); fini clears
+ * the flag first and then waits for the count to drain, so an entry either sees the flag cleared or is waited for. */
+
+/* Review of 0266402: a closed port used to return NULL here and the caller still ran its handler, uncounted, on the
+ * freed locks. Now the caller learns it and must not run driver code: 0 = inside (pass *tdp to nmx_entry_end), ENXIO =
+ * not started, failed start, or stopping. In interrupt context the entry is counted (unload waits for it) but has no
+ * thread record: *tdp is NMX_ENTRY_IRQ. */
+static char nmx_entry_irq_mark;
+#define NMX_ENTRY_IRQ ((struct thread *)&nmx_entry_irq_mark)
+int nmx_entry_try(struct thread **tdp)
+{
+    *tdp = NULL;
+    __atomic_fetch_add(&nmx_entry_inflight, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&nmx_entry_open, __ATOMIC_SEQ_CST)) {
+        __atomic_fetch_sub(&nmx_entry_inflight, 1, __ATOMIC_SEQ_CST);
+        return ENXIO;
+    }
+    if (ml_at_interrupt_context()) {
+        *tdp = NMX_ENTRY_IRQ;
+        return 0;
+    }
+    struct thread *td = nmx_curthread();     /* never NULL here: the port is started (panics without memory) */
+    if (td == NULL) {
+        __atomic_fetch_sub(&nmx_entry_inflight, 1, __ATOMIC_SEQ_CST);
+        return ENXIO;
+    }
+    nmx_thread_entry_enter(td);
+    *tdp = td;
+    return 0;
+}
+
+void nmx_entry_end(struct thread *td)
+{
+    if (td == NULL)
+        return;
+    if (td != NMX_ENTRY_IRQ)
+        nmx_thread_entry_leave(td);
+    __atomic_fetch_sub(&nmx_entry_inflight, 1, __ATOMIC_SEQ_CST);
+}
+
+/* opens the entries: nmx_port_start, after its last step */
+void nmx_entry_open_now(void)
+{
+    __atomic_store_n(&nmx_entry_open, 1, __ATOMIC_SEQ_CST);
+}
+
+/* closes the entries and waits until none is inside: first in nmx_port_stop (review of 0266402: from nmx_kernel_fini
+ * alone, sysuninit, devfs, ..., nmx_malloc_fini had already run under an entry still in flight) */
+void nmx_entry_close_and_drain(void)
+{
+    __atomic_store_n(&nmx_entry_open, 0, __ATOMIC_SEQ_CST);
+    const uint64_t t0 = mach_absolute_time();
+    unsigned n, said = 0;
+    while ((n = __atomic_load_n(&nmx_entry_inflight, __ATOMIC_SEQ_CST)) != 0) {
+        const unsigned ms = (unsigned)(abs_to_ns(mach_absolute_time() - t0) / 1000000);
+        if (ms >= 1000 && ms / 10000 + 1 > said) {     /* at 1 s, then every 10 s */
+            said = ms / 10000 + 1;
+            printf("NullMoth xkpi: unload waits for %u driver entr%s still inside (%u ms)\n", n, n == 1 ? "y" : "ies", ms);
+        }
+        IOSleep(1);
+    }
+}
+
+int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg)
+{
+    nmx_tl_lock();
+    /* a record retired before this thread's record was linked is not reached by the reaper's walk: move the thread to
+     * kernproc here (review of 37bac65). nmx_thread_get/recycle now check the record linked under the lock, so this is
+     * a backstop for any other path that sets td_proc */
+    nmx_thread_proc_fix_locked(td);
+    int r = td->td_proc == p ? fn(arg) : -1;
+    nmx_tl_unlock();
+    return r;
 }
 
 /* detaches every thread's Linux state and releases it outside the registry lock (unload) */
@@ -598,11 +1130,12 @@ void nmx_threads_release_all(void (*release)(struct thread *))
 {
     for (;;) {
         struct thread *td = NULL;
-        lck_spin_lock(nmx_thread_lock);
-        for (unsigned b = 0; b < NMX_THREAD_BUCKETS && td == NULL; b++)
+        for (unsigned b = 0; b < NMX_THREAD_BUCKETS && td == NULL; b++) {
+            nmx_tl_lock();
             for (struct nmx_thread_rec *r = nmx_threads[b]; r; r = r->next)
                 if (r->td.td_lkpi_task != NULL) { td = &r->td; break; }
-        lck_spin_unlock(nmx_thread_lock);
+            nmx_tl_unlock();
+        }
         if (td == NULL)
             return;
         release(td);            /* clears td_lkpi_task */

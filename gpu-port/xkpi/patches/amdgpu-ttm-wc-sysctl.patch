@@ -1,0 +1,19 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1126,8 +1126,15 @@
+ 	 * come back stale: "STALE fence read" in the log), so snooped write-back pages cannot be trusted in either direction.
+ 	 * Every GTT page is write-combined instead (PTE not snooped, CPU mappings WC): no CPU cache is involved at all.
+ 	 */
+-	caching = ttm_write_combined;
++	{
++		extern int nmx_gtt_wc;	/* sysctl compat.linuxkpi.nmx_wc: 1 = write-combined GTT (default), 0 = stock cached/snooped */
+ 
++		if (nmx_gtt_wc || (abo->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC))
++			caching = ttm_write_combined;
++		else
++			caching = ttm_cached;
++	}
++
+ 	/* allocate space for the uninitialized page entries */
+ 	if (ttm_sg_tt_init(&gtt->ttm, bo, page_flags, caching)) {
+ 		kfree(gtt);

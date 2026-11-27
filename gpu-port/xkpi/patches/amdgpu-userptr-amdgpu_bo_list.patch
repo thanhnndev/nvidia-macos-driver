@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c	2026-11-07 15:10:57
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c	2026-11-07 15:11:22
+@@ -103,6 +103,18 @@
+ 		drm_gem_object_put(gobj);
+ 
+ 		usermm = amdgpu_ttm_tt_get_usermm(bo->tbo.ttm);
++#ifdef NMXKPI
++		/* ga403wm Step97b: userptr pages are pinned on the creating task when the BO is made (Step92) and the CS
++		 * never uses the mm; handles are per DRM file, so per process. A mismatch is logged, not fatal. */
++		if (usermm && usermm != current->mm) {
++			static atomic_t budget;
++
++			if (atomic_inc_return(&budget) <= 64)
++				printf("NMX mmfix: CS userptr BO mm %p != current mm %p (pid %d) - allowed\n",
++				       usermm, current->mm, current->pid);
++			usermm = current->mm;
++		}
++#endif
+ 		if (usermm) {
+ 			if (usermm != current->mm) {
+ 				amdgpu_bo_unref(&bo);

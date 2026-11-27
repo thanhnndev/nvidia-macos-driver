@@ -19,8 +19,11 @@ struct proc {
     char p_comm[MAXCOMLEN + 1];
     void *p_vmspace;
     sigset_t p_siglist;             /* pending signals, refreshed from xnu by PROC_LOCK */
-    void *p_lkpi_mm;                /* the process's Linux mm_struct, shared by its threads (linux_current fork) */
+    void *p_lkpi_mm;                /* the process's Linux mm_struct, shared by its threads (linux_current fork);
+                                     * the record holds one mm_users reference on it until the process is gone */
     void *nmx_xnu;                  /* the xnu proc_t */
+    uint64_t nmx_start;             /* the process's start time (us): with p_pid, tells a recycled proc_t apart */
+    int nmx_retired;                /* set under the registry lock when nmx_proc_reap retired the record */
 };
 struct thread {
     thread_t td_xnu;                    /* the xnu thread */
@@ -30,7 +33,7 @@ struct thread {
     u_char td_priority;
     u_char td_base_pri;
     int td_pinned;
-    int td_critnest;
+    int td_critnest;                /* critical-section nesting of this thread (nmx_critical_enter) */
     int td_intr_nesting_level;      /* refreshed from ml_at_interrupt_context() by curthread */
     int td_flags;
     int td_owepreempt;              /* FreeBSD's deferred-preemption flag; xnu preempts on its own, so always 0 */
@@ -45,7 +48,21 @@ struct thread {
     char td_name[32];
     void *td_wchan;
     const char *td_wmesg;
+    int td_crit_saved;              /* interrupt state at the outermost nmx_critical_enter (last: layout of the rest kept) */
+    uint64_t td_xnu_tid;            /* thread_tid() of the thread the record was made for: tells a recycled thread_t apart */
+    u_int td_nmx_entry;             /* device-node entry depth (low bits) | NMX_ENTRY_REAP: see nmx_thread_entry_enter */
 };
+#define NMX_ENTRY_REAP  0x80000000u
+#define NMX_ENTRY_DEPTH 0x7fffffffu
+void nmx_thread_entry_enter(struct thread *td);
+void nmx_thread_entry_leave(struct thread *td);
+/* the same bracket for entries that are not device-node calls (sysctl handlers, framebuffer calls): curthread's record,
+ * nothing in interrupt context */
+/* 0: inside, pass *td to nmx_entry_end; ENXIO: the port is not started or is stopping, run no driver code */
+int nmx_entry_try(struct thread **td);
+void nmx_entry_end(struct thread *td);
+/* runs fn(arg) under the registry lock if td still belongs to p (not reparented by nmx_proc_reap); -1 if it does not */
+int nmx_thread_proc_locked(struct thread *td, struct proc *p, int (*fn)(void *), void *arg);
 #define TDF_KTH_SUSP 0x00000100
 #define TDP_KTHREAD 0x00200000
 #define TDP_NOFAULTING 0x00000080
@@ -88,6 +105,15 @@ bool nmx_proc_exiting(struct proc *p);
 struct task_struct *nmx_proc_any_task(struct proc *p, bool get);
 void nmx_threads_release_all(void (*release)(struct thread *));
 extern void (*nmx_thread_release_hook)(struct thread *td);
+/*
+ * Lifetime of the records (ga403wm Step100). xnu recycles thread_t and proc_t, and a kext is told about neither
+ * exit, so a record found by its xnu pointer is checked against the thread's tid / the process's pid and start time
+ * and rebuilt when it belongs to an earlier owner. What an old owner left (its Linux task, the process's mm) is
+ * released by nmx_proc_reap, from a context that may sleep, through the two hooks LinuxKPI installs.
+ */
+extern void (*nmx_task_release_hook)(struct task_struct *ts);   /* put_task_struct */
+extern void (*nmx_proc_release_hook)(struct proc *p);           /* drops the record's mm reference */
+void nmx_proc_reap(void);
 extern struct proc *nmx_kernproc;
 struct proc *nmx_curproc(void);
 #define curproc nmx_curproc()

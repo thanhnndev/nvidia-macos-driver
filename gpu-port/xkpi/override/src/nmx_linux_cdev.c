@@ -20,6 +20,7 @@
 #include <sys/mutex.h>
 #include <sys/conf.h>
 #include <sys/file.h>
+#include <sys/vnode.h>
 #include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/stdarg.h>
@@ -77,6 +78,20 @@ static int make_dev_va(struct make_dev_args *args, struct cdev **cdevp, const ch
     c->si_gid = args->mda_gid;
     c->si_mode = (mode_t)args->mda_mode;
     c->nmx_refs = 1;                    /* the creation reference, dropped by destroy_dev */
+    /*
+     * LinuxKPI takes the Linux inode of an open from file->f_vnode: iminor() (drm_stub_open -> drm_minor_acquire) and
+     * i_cdev both read v_rdev. Without it every DRM open failed with ENODEV (iminor = -1U).
+     */
+    c->nmx_vnode = malloc(sizeof(*c->nmx_vnode), M_NMXCDEV,
+        ((args->mda_flags & MAKEDEV_NOWAIT) ? M_NOWAIT : M_WAITOK) | M_ZERO);
+    if (c->nmx_vnode == NULL) {
+        free(c, M_NMXCDEV);
+        return ENOMEM;
+    }
+    mtx_init(&c->nmx_vnode->v_interlock, "nmx vnode", NULL, MTX_DEF);
+    c->nmx_vnode->v_rdev = c;
+    c->nmx_vnode->v_type = VCHR;
+    c->nmx_vnode->v_usecount = 1;
 
     dev_lock();
     LIST_INSERT_HEAD(&c->si_devsw->d_devs, c, si_list);
@@ -88,6 +103,8 @@ static int make_dev_va(struct make_dev_args *args, struct cdev **cdevp, const ch
         dev_lock();
         LIST_REMOVE(c, si_list);
         dev_unlock();
+        mtx_destroy(&c->nmx_vnode->v_interlock);
+        free(c->nmx_vnode, M_NMXCDEV);
         free(c, M_NMXCDEV);
         return ENXIO;
     }
@@ -128,8 +145,13 @@ void dev_ref(struct cdev *c)
 
 void dev_rel(struct cdev *c)
 {
-    if (__atomic_sub_fetch(&c->nmx_refs, 1, __ATOMIC_ACQ_REL) == 0)
+    if (__atomic_sub_fetch(&c->nmx_refs, 1, __ATOMIC_ACQ_REL) == 0) {
+        if (c->nmx_vnode != NULL) {
+            mtx_destroy(&c->nmx_vnode->v_interlock);
+            free(c->nmx_vnode, M_NMXCDEV);
+        }
         free(c, M_NMXCDEV);
+    }
 }
 
 /*
@@ -191,6 +213,8 @@ struct nmx_open {
 };
 
 #define OPEN_BUCKETS 64
+/* an open id is (sequence << 8) | node minor (xnu/nmx_devfs.cpp): hash the sequence */
+#define OPEN_BUCKET(id) (((unsigned)(id) >> 8) % OPEN_BUCKETS)
 static TAILQ_HEAD(, nmx_open) opens[OPEN_BUCKETS];
 static struct mtx opens_mtx;
 MTX_SYSINIT(nmx_opens, &opens_mtx, "cdev opens", MTX_DEF);
@@ -199,7 +223,7 @@ static struct nmx_open *open_find(int id)
 {
     struct nmx_open *o;
     mtx_lock(&opens_mtx);
-    TAILQ_FOREACH(o, &opens[(unsigned)id % OPEN_BUCKETS], link)
+    TAILQ_FOREACH(o, &opens[OPEN_BUCKET(id)], link)
         if (o->id == id)
             break;
     mtx_unlock(&opens_mtx);
@@ -210,6 +234,7 @@ static struct nmx_open *open_find(int id)
 static struct nmx_open *enter(struct nmx_open *o)
 {
     struct thread *td = curthread;
+    nmx_thread_entry_enter(td);
     struct nmx_open *prev = td->td_nmx_open;
     td->td_nmx_open = o;
     return prev;
@@ -217,7 +242,9 @@ static struct nmx_open *enter(struct nmx_open *o)
 
 static void leave(struct nmx_open *prev)
 {
-    curthread->td_nmx_open = prev;
+    struct thread *td = curthread;
+    td->td_nmx_open = prev;
+    nmx_thread_entry_leave(td);
 }
 
 int devfs_set_cdevpriv(void *priv, d_priv_dtor_t *dtr)
@@ -268,6 +295,7 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
     fp->f_count = 1;
     fp->f_flag = (u_int)fflags & (FREAD | FWRITE | O_NONBLOCK | O_APPEND);
     fp->f_type = DTYPE_DEV;
+    fp->f_vnode = c->nmx_vnode;
     o->id = open_id;
     o->fp = fp;
     o->cdev = c;
@@ -281,6 +309,9 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
         err = sw->d_fdopen(c, fflags, curthread, fp);
     else if (sw->d_open != NULL)
         err = sw->d_open(c, fflags, 0x2000 /* S_IFCHR */, curthread);
+    /* FreeBSD devfs: d_fdopen returns ENXIO after finit() installed its own file operations - that is success */
+    if (err == ENXIO && sw->d_fdopen != NULL && fp->f_ops != NULL)
+        err = 0;
     if (err) {
         devfs_clear_cdevpriv();
         leave(prev);
@@ -293,9 +324,9 @@ int nmx_cdev_open(void *cookie, int open_id, int fflags)
     leave(prev);
 
     mtx_lock(&opens_mtx);
-    if (opens[(unsigned)open_id % OPEN_BUCKETS].tqh_last == NULL)
-        TAILQ_INIT(&opens[(unsigned)open_id % OPEN_BUCKETS]);
-    TAILQ_INSERT_HEAD(&opens[(unsigned)open_id % OPEN_BUCKETS], o, link);
+    if (opens[OPEN_BUCKET(open_id)].tqh_last == NULL)
+        TAILQ_INIT(&opens[OPEN_BUCKET(open_id)]);
+    TAILQ_INSERT_HEAD(&opens[OPEN_BUCKET(open_id)], o, link);
     mtx_unlock(&opens_mtx);
     return 0;
 }
@@ -316,11 +347,11 @@ int nmx_cdev_close(int open_id, int fflags)
 {
     struct nmx_open *o;
     mtx_lock(&opens_mtx);
-    TAILQ_FOREACH(o, &opens[(unsigned)open_id % OPEN_BUCKETS], link)
+    TAILQ_FOREACH(o, &opens[OPEN_BUCKET(open_id)], link)
         if (o->id == open_id)
             break;
     if (o != NULL)
-        TAILQ_REMOVE(&opens[(unsigned)open_id % OPEN_BUCKETS], o, link);
+        TAILQ_REMOVE(&opens[OPEN_BUCKET(open_id)], o, link);
     mtx_unlock(&opens_mtx);
     if (o == NULL)
         return EBADF;
@@ -444,6 +475,18 @@ vm_fault_t nmx_umap_insert(struct vm_area_struct *vma, unsigned long addr, unsig
         return VM_FAULT_SIGBUS;
     size_t idx = (addr - vma->vm_start) >> PAGE_SHIFT;
     int cache = (int)pgprot2cachemode(prot);
+    /*
+     * This GPU is integrated: it reads system memory without snooping the CPU caches, and a write-combining user
+     * mapping leaves the CPU's stores in this core's WC buffers until something drains them. A descriptor buffer
+     * written on one thread was then read as zeros by the GPU on the submit thread (page fault at VA 0 from client
+     * TCP, the shader's first descriptor load). Map BOs uncached by default; debug.nmx_umap_cache overrides:
+     * 0 = the driver's own attribute, 1 = uncached, 2 = write-combined.
+     */
+    extern int nmx_umap_cache;
+    if (nmx_umap_cache == 1)
+        cache = NMX_CACHE_UC;
+    else if (nmx_umap_cache == 2)
+        cache = NMX_CACHE_WC;
     if (!u->have_cache) {
         u->cache = cache;
         u->have_cache = 1;
@@ -508,8 +551,10 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
 {
     uint64_t fixed = (req->flags & NMX_DRM_MMAP_FIXED) ? req->addr : 0;
     req->addr = 0;
-    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & PAGE_MASK) != 0 || req->size == 0 ||
-        req->size > (1ULL << 40) || (fixed & PAGE_MASK) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
+    /* LinuxKPI's PAGE_MASK is Linux's ~(PAGE_SIZE - 1) here, not BSD's PAGE_SIZE - 1: test the in-page bits explicitly */
+    const uint64_t inpage = PAGE_SIZE - 1;
+    if ((req->flags & ~NMX_DRM_MMAP_FIXED) != 0 || (req->offset & inpage) != 0 || req->size == 0 ||
+        req->size > (1ULL << 40) || (fixed & inpage) != 0 || ((req->flags & NMX_DRM_MMAP_FIXED) && fixed == 0))
         return EINVAL;
     struct linux_file *filp = o->fp->f_data;
     if (o->fp->f_ops == NULL || filp == NULL || filp->f_op == NULL || filp->f_op->mmap == NULL)
@@ -570,6 +615,19 @@ static int nmx_mmap(struct nmx_open *o, struct nmx_drm_mmap *req)
 
     if (err == 0) {
         int writable = (vma->vm_flags & VM_WRITE) != 0;
+        /*
+         * The pages were zeroed through the kernel's write-back view, so they can still carry dirty lines when userland
+         * gets its uncached mapping. Those lines are written back later, on top of what userland stored, and the GPU
+         * (which does not snoop the CPU caches) then reads zeros. Drop them before the mapping is used;
+         * debug.nmx_umap_flush picks it.
+         */
+        {
+            extern int nmx_umap_flush_on_map;
+            extern void pmap_invalidate_cache(void);
+
+            if (nmx_umap_flush_on_map)
+                pmap_invalidate_cache();
+        }
         err = nmx_xnu_map_user(u->pages, u->npages, u->cache, writable, fixed, &u->uaddr, &u->xmap);
     }
     if (err) {

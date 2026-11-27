@@ -1,0 +1,13 @@
+--- a/drivers/gpu/drm/drm_syncobj.c	2026-11-07 15:03:15
++++ b/drivers/gpu/drm/drm_syncobj.c	2026-11-07 15:03:15
+@@ -1173,7 +1173,9 @@
+ 			goto done_waiting;
+ 
+ 		if (timeout == 0) {
+-			timeout = -ETIME;
++			/* macOS port (ga403wm Step80): LinuxKPI's ETIME is ETIMEDOUT (60); Mesa's vk_drm_syncobj
++			 * treats only errno == ETIME as VK_TIMEOUT, and macOS ETIME is 101. */
++			timeout = -101;
+ 			goto done_waiting;
+ 		}
+ 

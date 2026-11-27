@@ -1,12 +1,12 @@
 #!/bin/bash
 # all-npucore.sh [N]: NMXNPU's DRM core - drm-kmod's drm and dmabuf modules, as all.sh selects them, plus the DRM
 # helpers the NPU drivers use - compiled with CONFIG_DRM_ACCEL into obj-npucore/.
-X=/Volumes/MiniData/build/gpu-src/xkpi
-K=/Volumes/MiniData/build/gpu-src/kpi
+X=${GPU_SRC:-$HOME/develop/projects/gpu-src}/xkpi
+K=${GPU_SRC:-$HOME/develop/projects/gpu-src}/kpi
 cd "$X" || exit 1
 mkdir -p obj-npucore logs-npucore && rm -f logs-npucore/*.log logs-npucore/*.failed
 EXCLUDE="drm_gem_ttm_helper.c drm_writeback.c drm_hdcp_helper.c sync_file.c dma-fence-unwrap.c dma-buf.c dma-buf-kmod.c linux_fb.c vt_drmfb.c drm_os_freebsd.c"
-/opt/homebrew/bin/python3 srclist.py "$K/drm-kmod" amd.flags drm dmabuf 2>/dev/null > srcs-npucore.all
+python3 srclist.py "$K/drm-kmod" amd.flags drm dmabuf 2>/dev/null > srcs-npucore.all
 : > srcs-npucore.txt
 while read -r f; do
     case " $EXCLUDE " in *" $(basename "$f") "*) ;; *) echo "$f" >> srcs-npucore.txt ;; esac

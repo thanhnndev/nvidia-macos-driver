@@ -1,0 +1,22 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -1155,6 +1155,19 @@
+ 		if (r)
+ 			return r;
+ 	}
++
++	{
++		/* NullMoth: this GPU reads system memory without snooping the CPU caches, while the kernel's own view of
++		 * the same pages is write-back: a dirty line (a buffer zeroed through the cached view) can be written
++		 * back over what userland has already written through its uncached mapping, and the GPU then reads
++		 * zeros. Flushing every CPU cache before the submission is the blunt test for that mechanism;
++		 * debug.nmx_wbinvd picks it without a rebuild. */
++		extern int nmx_wbinvd_before_submit;
++		extern void pmap_invalidate_cache(void);
++
++		if (nmx_wbinvd_before_submit)
++			pmap_invalidate_cache();
++	}
+ 	return 0;
+ }
+ 

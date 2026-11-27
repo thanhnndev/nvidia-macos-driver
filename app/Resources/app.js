@@ -23,7 +23,7 @@ function render(m) {
   let why = "";
   if (m.arch !== "x86_64" || m.translated) why = "This Mac has Apple silicon. Its own graphics are already Apple's.";
   else if (![15, 26].includes(m.major)) why = `The driver is built for macOS 15 Sequoia and macOS 26 Tahoe (beta); this Mac runs ${esc(m.macos)}.`;
-  else if (!card && (m.gpuHiding || []).length) why = `No NVIDIA card is visible because this Mac starts with ${esc(m.gpuHiding.join(" "))}, which hides discrete GPUs. Remove it from boot-args in OpenCore's config.plist, restart, and open 1401 again.`;
+  else if (!card && (m.gpuHiding || []).some((a) => a !== "-wegnoigpu")) why = `No NVIDIA card is visible because this Mac starts with ${esc(m.gpuHiding.filter((a) => a !== "-wegnoigpu").join(" "))}, which hides discrete GPUs. Remove it from boot-args in OpenCore's config.plist, restart, and open 1401 again.`;
   else if (!card && (m.hiddenNvidia || []).length) why = `The NVIDIA card (${esc(m.hiddenNvidia.join(", "))}) is on the bus but switched off for macOS, usually by a disable-gpu property in OpenCore's DeviceProperties. Remove it, restart, and open 1401 again.`;
   else if (!card && /^MacBook/.test(m.hwModel || "")) why = "No NVIDIA card was found. On a laptop the card is often switched off before macOS starts: by the BIOS graphics mode (choose Hybrid/MSHybrid or Discrete, not iGPU only) or by a dGPU-off SSDT in OpenCore's ACPI folder. Fix that, restart, and open 1401 again.";
   else if (!card || !card.supported) why = "No supported NVIDIA card was found. The driver needs a GeForce RTX 20 series or newer.";
@@ -31,13 +31,30 @@ function render(m) {
 
   // Keep the checked package available when the driver is already running.
   const pk = m.packages.find((p) => p.ok === "yes"); if (pk) S.pkg = pk.path;
+  // Tahoe: only from macOS 15, on a Mac the driver can be installed on, with the checked package (it carries both drivers)
+  // (this scan's package, not S.pkg: an ejected disk image must not leave the button pointing at a path that is gone)
+  $("upd").disabled = !pk || m.major !== 15 || !!why;
+  $("updt").innerHTML = m.major === 26 ? "This Mac already runs macOS 26." : why ? "" : pk ? "" :
+    'Needs the driver package: <button type="button" class="b" id="dl3">Download the driver package</button>';
+  const d3 = $("dl3"); if (d3) d3.onclick = () => post({ act: "download" });
   if (on) {
-    $("verdict").innerHTML = `<p class="good">NullMoth components are loaded and an NVIDIA Metal device is visible.</p><p>Use Check for a newer driver to update the driver. To remove the driver, use Remove the driver below.</p>`;
+    $("verdict").innerHTML = `<p class="good">NullMoth components are loaded and an NVIDIA Metal device is visible.</p><p>Use Check for a newer driver to update the driver. To remove the driver, use Remove the driver below.${m.major === 15 ? " To move to macOS 26 Tahoe, use <b>Prepare this Mac for Tahoe</b> below." : ""}</p>`;
     $("steps").hidden = true; return;
   }
   // No NVIDIA card but an AMD or Intel GPU: the NVIDIA steps do not apply, the AMD/Intel test driver below does. It needs
   // the driver package (that is where the test driver ships), so the download stays offered.
   const other = !card && m.arch === "x86_64" && !m.translated && [15, 26].includes(m.major) && m.gpus.some((g) => g.vendor === "1002" || g.vendor === "8086");
+  // No GPU at all on an Intel-type Mac: OpenCore switched it off (disable-gpu or -wegnoigpu), and Lilu then takes it off
+  // macOS's PCI list entirely, so the table says "none found" (2.0.3, a Core Ultra laptop, chat photo 10-16). The test
+  // driver's setup turns an Intel GPU at the usual address back on, so it is offered here instead of the NVIDIA advice.
+  const hiddenOwn = !card && m.arch === "x86_64" && !m.translated && [15, 26].includes(m.major) && !m.gpus.length && !(m.hiddenNvidia || []).length
+    && !(m.gpuHiding || []).some((a) => a !== "-wegnoigpu");   // -wegnoegpu & co. hide the NVIDIA card: their advice stays
+  if (hiddenOwn) {
+    const pk3 = m.packages.find((p) => p.ok === "yes"); if (pk3) S.pkg = pk3.path;
+    $("verdict").innerHTML = `<p class="warn">macOS sees no GPU at all on this Mac.</p><p>OpenCore most likely switches it off (a disable-gpu property${(m.gpuHiding || []).includes("-wegnoigpu") ? ", and -wegnoigpu in boot-args" : ""}). For the processor's own Intel or AMD GPU, <b>AMD / Intel GPU and NPU driver (test)</b> below turns it back on with the test driver, and <b>Turn it off</b> switches it off again. ${S.pkg ? "The driver package is here and checked." : "Get the driver package first (it carries the test driver):"}</p>` + (S.pkg ? "" : '<p><button type="button" class="b" id="dl4">Download the driver package</button></p>');
+    const d4 = $("dl4"); if (d4) d4.onclick = () => $("dl").click();
+    $("steps").hidden = true; return;
+  }
   if (why && other) {
     const pk2 = m.packages.find((p) => p.ok === "yes"); if (pk2) S.pkg = pk2.path;
     $("verdict").innerHTML = `<p class="warn">No NVIDIA card, so the NVIDIA driver does not apply here.</p><p>This Mac's ${esc(m.gpus.filter((g) => g.vendor !== "10DE").map((g) => g.name).join(", "))} can try the experimental AMD / Intel GPU driver: see <b>AMD / Intel GPU and NPU driver (test)</b> below. ${S.pkg ? "The driver package is here and checked." : "Get the driver package first (it carries the test driver):"}</p>` + (S.pkg ? "" : '<p><button type="button" class="b" id="dl2">Download the driver package</button></p>');
@@ -120,7 +137,7 @@ const NM = {
     }
     if (event === "run") {
       const busy = data.state === "start";
-      ["dry", "go", "rm", "dl", "updchk", "upddrv"].forEach((b) => ($(b).disabled = busy));
+      ["dry", "go", "rm", "dl", "updchk", "upddrv", "upd", "updc"].forEach((b) => ($(b).disabled = busy));
       if (busy) { $("logwrap").hidden = false; $("log").textContent = ""; return; }
       if (data.why) { $("logwrap").hidden = false; logLine(data.why); }
       if (data.state === "cancelled") {
@@ -137,6 +154,11 @@ const NM = {
       }
       if (data.mode === "dry" && data.ok) { S.previewed = true; step(2, "done"); step(3, "now"); }
       if (data.mode === "install" && data.ok) { S.installed = true; step(3, "done"); step(4, "now"); $("rs").disabled = false; }
+      if (data.mode === "tahoe") {
+        if (data.ok) { $("swu").hidden = false; $("updt").textContent = "Ready for Tahoe. Open Software Update and install macOS 26."; logLine("OK ready for Tahoe - click Open Software Update and install macOS 26"); }
+        else $("updt").textContent = "Tahoe preparation stopped. Review the setup log above.";
+      }
+      if (data.mode === "tahoecancel") { $("swu").hidden = true; $("updt").textContent = data.ok ? "Tahoe preparation cancelled: the driver and the installer settings are back." : "Cancel stopped. Review the setup log above."; }
       post({ act: "scan" });
     }
   },
@@ -150,6 +172,9 @@ $("efi").onchange = () => {
   step(2, "now"); step(3, "waiting");
 };
 $("dl").onclick = () => post({ act: "download" });
+$("upd").onclick = () => post({ act: "osupdate", cancel: false, pkg: S.pkg, efi: efi() });
+$("swu").onclick = () => post({ act: "swupdate" });
+$("updc").onclick = () => post({ act: "osupdate", cancel: true, efi: efi() });
 $("updchk").onclick = () => { $("updr").textContent = "Checking..."; post({ act: "checkUpdate" }); };
 $("updapp").onclick = () => { $("updapp").disabled = true; post({ act: "updateApp" }); };
 $("upddrv").onclick = () => { S.driverUpdate = true; $("upddrv").disabled = true; $("updr").textContent = "Downloading the newest driver..."; post({ act: "updateDriver", efi: efi() }); };

@@ -40,7 +40,44 @@ struct big_rec {
     struct big_rec *next;
 };
 static struct big_rec *big_table[BIG_BUCKETS];
+/* Invariant: big_lock (a spin lock that does NOT disable interrupts) is never taken in primary interrupt context. No
+ * malloc/free of a block >= PAGE_SIZE runs there (LinuxKPI's GFP_ATOMIC allocations in IRQ handlers are small, and
+ * amdgpu's IRQ work runs in threads); one that did could spin forever on a lock its own CPU holds. Checked on
+ * every take (review of 0266402 / c53afe6): a hit is counted (debug.nmx_malloc_irq, last caller in
+ * debug.nmx_malloc_irq_caller) and logged with its caller (first 4, then every 1024th), and the lock is taken as
+ * before. It panics only in a build with -DNMX_MALLOC_IRQ_PANIC: never observed on this machine, so a hit at boot must
+ * not take the display driver down. */
 static lck_spin_t *big_lock;
+extern boolean_t ml_at_interrupt_context(void);
+volatile int64_t nmx_malloc_irq_hits;          /* read by debug.nmx_malloc_irq (nmx_kext.cpp) */
+volatile int64_t nmx_malloc_irq_caller;        /* return address of the last hit's malloc/free caller */
+static __attribute__((always_inline)) inline void big_lock_take(void)
+{
+    if (__builtin_expect(ml_at_interrupt_context(), 0)) {
+        void *ra = __builtin_return_address(0);     /* inlined: the caller of malloc / free / contig* */
+        const int64_t n = __atomic_add_fetch(&nmx_malloc_irq_hits, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&nmx_malloc_irq_caller, (int64_t)(uintptr_t)ra, __ATOMIC_RELAXED);
+        if (n <= 4 || (n & 1023) == 0)
+            printf("NullMoth xkpi: page-sized malloc/free in interrupt context (%lld so far), caller %p\n", (long long)n, ra);
+#ifdef NMX_MALLOC_IRQ_PANIC
+        panic("NullMoth xkpi: big_lock taken in interrupt context (malloc/free of a page-sized block), caller %p", ra);
+#endif
+    }
+    lck_spin_lock(big_lock);
+}
+
+/*
+ * Single-page blocks freed are kept (up to NMX_PAGE_KEEP) and handed out again, with their record, instead of an
+ * IOMallocAligned + IOMalloc and IOFreeAligned + IOFree pair each time (WS-CPU 9.3). Linux takes these from the
+ * kmalloc-4k slab. Every command submission makes and drops at least one: drm_exec_init's object array is
+ * PAGE_SIZE / sizeof(void *) pointers (amdgpu_cs_parser_bos, and the GEM paths that lock with drm_exec), and with it
+ * the bo list of a larger submit. In WindowServer's spindump drm_exec_init/fini were 18 of 119 samples of
+ * amdgpu_cs_ioctl. Kept blocks are out of big_table (a free of one is the same error as now) and go at unload.
+ */
+#define NMX_PAGE_KEEP 64
+static struct big_rec *page_keep[NMX_PAGE_KEEP];
+static unsigned page_keep_n;
+static uint64_t page_keep_hits, page_keep_misses;
 
 static unsigned big_bucket(const void *p)
 {
@@ -72,6 +109,26 @@ void *malloc(size_t size, struct malloc_type *type, int flags)
         size = 1;
     if (size >= PAGE_SIZE) {
         size_t rounded = round_page(size);
+        if (rounded == PAGE_SIZE) {
+            struct big_rec *kept = NULL;
+            big_lock_take();
+            if (page_keep_n) {
+                kept = page_keep[--page_keep_n];
+                page_keep_hits++;
+                kept->type = type;
+                unsigned b = big_bucket(kept->addr);
+                kept->next = big_table[b];
+                big_table[b] = kept;
+            } else
+                page_keep_misses++;
+            lck_spin_unlock(big_lock);
+            if (kept) {
+                if (flags & M_ZERO)
+                    bzero(kept->addr, PAGE_SIZE);
+                account(type, PAGE_SIZE);
+                return kept->addr;
+            }
+        }
         struct big_rec *rec = IOMalloc(sizeof(*rec));
         if (rec == NULL)
             return NULL;
@@ -87,7 +144,7 @@ void *malloc(size_t size, struct malloc_type *type, int flags)
         rec->type = type;
         rec->contig = 0;
         unsigned b = big_bucket(p);
-        lck_spin_lock(big_lock);
+        big_lock_take();
         rec->next = big_table[b];
         big_table[b] = rec;
         lck_spin_unlock(big_lock);
@@ -115,7 +172,7 @@ void *malloc(size_t size, struct malloc_type *type, int flags)
 static struct big_rec *big_take(void *addr)
 {
     unsigned b = big_bucket(addr);
-    lck_spin_lock(big_lock);
+    big_lock_take();
     for (struct big_rec **pp = &big_table[b]; *pp; pp = &(*pp)->next) {
         if ((*pp)->addr == addr) {
             struct big_rec *r = *pp;
@@ -132,7 +189,7 @@ static size_t big_size(const void *addr)
 {
     size_t size = 0;
     unsigned b = big_bucket(addr);
-    lck_spin_lock(big_lock);
+    big_lock_take();
     for (struct big_rec *r = big_table[b]; r; r = r->next)
         if (r->addr == addr) { size = r->size; break; }
     lck_spin_unlock(big_lock);
@@ -147,6 +204,17 @@ void free(void *addr, struct malloc_type *type)
         struct big_rec *r = big_take(addr);
         if (r) {
             account(r->type, -(int64_t)r->size);
+            if (!r->contig && r->size == PAGE_SIZE) {
+                int kept = 0;
+                big_lock_take();
+                if (page_keep_n < NMX_PAGE_KEEP) {
+                    page_keep[page_keep_n++] = r;
+                    kept = 1;
+                }
+                lck_spin_unlock(big_lock);
+                if (kept)
+                    return;
+            }
             if (r->contig)
                 kmem_free(r->addr, r->size);
             else
@@ -180,7 +248,7 @@ int nmx_malloc_note_contig(void *addr, size_t size, struct malloc_type *type)
     rec->type = type;
     rec->contig = 1;
     unsigned b = big_bucket(addr);
-    lck_spin_lock(big_lock);
+    big_lock_take();
     rec->next = big_table[b];
     big_table[b] = rec;
     lck_spin_unlock(big_lock);
@@ -388,6 +456,13 @@ void nmx_malloc_fini(void)
             leaked++;
     if (leaked)
         printf("NullMoth xkpi: %d large allocation(s) still held at unload\n", leaked);
+    printf("NullMoth xkpi: single-page blocks: %llu reused, %llu new; %u kept at unload, freed now\n",
+           (unsigned long long)page_keep_hits, (unsigned long long)page_keep_misses, page_keep_n);
+    while (page_keep_n) {
+        struct big_rec *r = page_keep[--page_keep_n];
+        IOFreeAligned(r->addr, r->size);
+        IOFree(r, sizeof(*r));
+    }
     lck_spin_free(big_lock, nmx_lck_grp);
     big_lock = NULL;
 }

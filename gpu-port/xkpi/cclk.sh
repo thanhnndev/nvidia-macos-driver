@@ -1,15 +1,15 @@
 #!/bin/bash
 # cc.sh <source.c> [extra flags]: compiles one drm-kmod source for the macOS kernel (x86_64) through the
 # FreeBSD-on-xnu layer (bsdcompat) and FreeBSD LinuxKPI. drm-kmod's GPL-only linuxkpi/gplv2 headers are NOT on the path.
-X=/Volumes/MiniData/build/gpu-src/xkpi
-K=/Volumes/MiniData/build/gpu-src/kpi
+X=${GPU_SRC:-$HOME/develop/projects/gpu-src}/xkpi
+K=${GPU_SRC:-$HOME/develop/projects/gpu-src}/kpi
 L=$K/freebsd-src/sys/compat/linuxkpi
 D=$K/drm-kmod
 A=$D/drivers/gpu/drm/amd
 SDK=$(xcrun --sdk macosx --show-sdk-path)
 KF=$SDK/System/Library/Frameworks/Kernel.framework/Headers
 src=$1; shift
-exec xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -ffile-prefix-map=/Volumes/MiniData/build/gpu-src=/src -mkernel -fapple-kext -nostdinc -std=gnu11 \
+exec xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -ffile-prefix-map=${GPU_SRC:-$HOME/develop/projects/gpu-src}=/src -mkernel -fapple-kext -nostdinc -std=gnu11 \
   -fno-builtin -fno-common -fno-strict-aliasing -fms-extensions -O2 -g0 \
   -Wno-pointer-sign -Wno-unused-parameter -Wno-microsoft-anon-tag -ferror-limit=80 \
   -D_KERNEL -DKERNEL -DKERNEL_PRIVATE -DLINUXKPI_VERSION=61400 -DNMXKPI=1 \

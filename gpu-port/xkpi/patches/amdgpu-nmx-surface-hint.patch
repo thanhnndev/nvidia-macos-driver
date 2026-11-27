@@ -1,0 +1,65 @@
+--- a/include/uapi/drm/amdgpu_drm.h	2026-11-08 20:32:30
++++ b/include/uapi/drm/amdgpu_drm.h	2026-11-08 20:32:30
+@@ -54,7 +54,9 @@
+ #define DRM_AMDGPU_VM			0x13
+ #define DRM_AMDGPU_FENCE_TO_HANDLE	0x14
+ #define DRM_AMDGPU_SCHED		0x15
++#define DRM_AMDGPU_NMX_SURFACE_HINT	0x5e	/* macOS port (ga403wm Step137): this user range is that IOSurface */
+ 
++#define DRM_IOCTL_AMDGPU_NMX_SURFACE_HINT DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_NMX_SURFACE_HINT, struct drm_amdgpu_nmx_surface_hint)
+ #define DRM_IOCTL_AMDGPU_GEM_CREATE	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE, union drm_amdgpu_gem_create)
+ #define DRM_IOCTL_AMDGPU_GEM_MMAP	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP, union drm_amdgpu_gem_mmap)
+ #define DRM_IOCTL_AMDGPU_CTX		DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_CTX, union drm_amdgpu_ctx)
+@@ -366,6 +368,19 @@
+ #define AMDGPU_GEM_USERPTR_VALIDATE	(1 << 2)
+ #define AMDGPU_GEM_USERPTR_REGISTER	(1 << 3)
+ 
++/*
++ * macOS port (ga403wm Step137): the caller says that its user range [addr, addr + size) maps IOSurface surface_id from
++ * the surface's first byte. The next userptr import of exactly that range then pins the IOSurface's own memory
++ * descriptor instead of faulting the range in through the process's map. The kernel checks the claim (the range's
++ * first page must be the surface's first page) and falls back to the plain userptr pin when it does not hold.
++ */
++struct drm_amdgpu_nmx_surface_hint {
++	__u64 addr;
++	__u64 size;
++	__u32 surface_id;
++	__u32 pad;
++};
++
+ struct drm_amdgpu_gem_userptr {
+ 	__u64		addr;
+ 	__u64		size;
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c	2026-11-08 20:32:30
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c	2026-11-08 20:32:30
+@@ -2911,7 +2911,20 @@
+ 	file = filp->private_data;
+ 	*fpriv = file->driver_priv;
+ 	return 0;
++}
++
++#ifdef NMXKPI
++int nmx_xnu_surface_hint(uint32_t surface_id, uint64_t addr, uint64_t size);	/* xnu/nmx_mm.cpp, Step137 */
++
++static int amdgpu_nmx_surface_hint_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
++{
++	struct drm_amdgpu_nmx_surface_hint *args = data;
++
++	if (args->pad != 0 || args->size == 0 || (args->addr & (PAGE_SIZE - 1)) != 0)
++		return -EINVAL;
++	return -nmx_xnu_surface_hint(args->surface_id, args->addr, args->size);
+ }
++#endif
+ 
+ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_CREATE, amdgpu_gem_create_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+@@ -2931,6 +2944,9 @@
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_VA, amdgpu_gem_va_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_OP, amdgpu_gem_op_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_USERPTR, amdgpu_gem_userptr_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
++#ifdef NMXKPI
++	DRM_IOCTL_DEF_DRV(AMDGPU_NMX_SURFACE_HINT, amdgpu_nmx_surface_hint_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
++#endif
+ };
+ 
+ static const struct drm_driver amdgpu_kms_driver = {

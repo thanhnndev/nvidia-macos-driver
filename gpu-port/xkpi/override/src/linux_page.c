@@ -102,6 +102,9 @@ linux_alloc_pages(gfp_t flags, unsigned int order)
 
 	if ((flags & M_ZERO) != 0)
 		req |= VM_ALLOC_ZERO;
+	/* ga403wm cs-enomem: a caller that may sleep waits for memory (Linux reclaims; FreeBSD loops on vm_wait) */
+	if ((flags & M_WAITOK) != 0 && (flags & __GFP_NORETRY) == 0)
+		req |= VM_ALLOC_WAITOK;
 	if (order == 0 && (flags & GFP_DMA32) == 0)
 		return (vm_page_alloc_noobj(req));
 	return (vm_page_alloc_noobj_contig(req, npages, 0,

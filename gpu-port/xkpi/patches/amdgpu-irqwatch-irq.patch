@@ -1,0 +1,16 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c	2026-11-07 15:14:12
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c	2026-11-07 15:15:25
+@@ -171,7 +171,12 @@
+ 	struct amdgpu_device *adev = drm_to_adev(dev);
+ 	irqreturn_t ret;
+ 
+-	ret = amdgpu_ih_process(adev, &adev->irq.ih);
++	{
++		/* ga403wm Step97 irqwatch: ring 0 is serialized so the fence fallback timer can drain it too */
++		extern int nmx_ih_guarded(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih);
++
++		ret = nmx_ih_guarded(adev, &adev->irq.ih);
++	}
+ 	if (ret == IRQ_HANDLED)
+ 		pm_runtime_mark_last_busy(dev->dev);
+ 
