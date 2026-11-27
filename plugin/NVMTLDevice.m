@@ -1081,7 +1081,19 @@ static struct { uint64_t hits, misses, fresh, otherKey, gone[8], shadowDrops, sh
                 // roadmap 4 F2 (2026-11-27): idle memory per distinct IOSurface (idleBytes above sums every entry: two planes or
                 // two keys of one surface count it twice), its age by MB, and when expired surfaces came back, finer
                 // F1: memory-pressure events and their drops
-                uint64_t idleSurfaces, idleSurfBytes, idleAgeBytes[5], expBack7[7], pressWarn, pressCrit, pressNormal, pressDrops, pressBytes, pressBack[2]; } nvmtl_sk;
+                uint64_t idleSurfaces, idleSurfBytes, idleAgeBytes[5], expBack7[7], pressWarn, pressCrit, pressNormal, pressDrops, pressBytes, pressBack[2];
+                // WS-CPU 9.9 adaptive keep timeout (per 30 s report)
+                uint64_t kaDrops, kaBack, kaSaved, kaRaise, kaDecay, kaPress, kaBeyondBytes; } nvmtl_sk;
+// WS-CPU 9.9 (2026-11-27 spindump, owner load): expired entries that came back cost ~0.65 ms per present in WindowServer
+// (re-import 0.30 on the main thread: pin + GPU map in the kernel; BO free 0.35 on the release queue), ~24 % of all driver
+// CPU there. Most came back 10-60 s after the NVMTL_KEEP_MS (30 s) drop. The idle timeout now adapts like the plane-shadow
+// one: every 10 s, if at least 4 expired surfaces came back whose reuse period (idle at the drop + gap) fits under the
+// ceiling, and they are a quarter of the expired drops or more, the timeout goes past the longest such period (and at
+// least doubles), up to NVMTL_KEEP_MAX_MS (120 s, a hard ceiling). A window with no such return and no hit on an entry idle
+// past the base timeout (one only the raise kept) halves it back toward NVMTL_KEEP_MS. A WARN / CRITICAL memory-pressure
+// event puts it back at the base at once (before its F1 sweep). NVMTL_KEEP_IDLE_MB / _MAX still bound the idle memory and
+// entry count exactly as before. NVMTL_KEEP_ADAPT=0: the fixed NVMTL_KEEP_MS. Under g_sk_lock.
+static struct { int on; long base, ceil, eff; uint64_t winStart, winBack, winDrops, winSaved, winNeed, lastAct; } nvmtl_ka = { .eff = 30000, .base = 30000, .ceil = 30000 };
 // surface ID -> (drop time ms << 20) | idle ms at the drop (clamped), so an expired miss says how long the entry had been
 // idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
 static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropAt;
@@ -1121,6 +1133,12 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
           nvmtl_sk.idleAgeBytes[4] >> 20, nvmtl_sk.expBack7[0], nvmtl_sk.expBack7[1], nvmtl_sk.expBack7[2], nvmtl_sk.expBack7[3],
           nvmtl_sk.expBack7[4], nvmtl_sk.expBack7[5], nvmtl_sk.expBack7[6], nvmtl_sk.pressWarn, nvmtl_sk.pressCrit, nvmtl_sk.pressNormal,
           nvmtl_sk.pressDrops, nvmtl_sk.pressBytes >> 20, nvmtl_sk.pressBack[0], nvmtl_sk.pressBack[1], (unsigned long long)(nvmtl_sk_cap_now(now) >> 20));
+    nvlog_report("surface keep: adaptive timeout: keep_ms %ld (base %ld, ceiling %ld, %s); last %llu s: expired drops %llu, expired returns "
+          "within the ceiling %llu, hits on entries only the raise kept %llu, raises %llu, decays %llu, pressure resets %llu; idle kept %llu MB "
+          "at the last sweep, of it idle past the base %llu MB",
+          nvmtl_ka.eff, nvmtl_ka.base, nvmtl_ka.ceil, nvmtl_ka.on ? "adaptive" : "fixed (NVMTL_KEEP_ADAPT=0)",
+          (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.kaDrops, nvmtl_sk.kaBack, nvmtl_sk.kaSaved, nvmtl_sk.kaRaise,
+          nvmtl_sk.kaDecay, nvmtl_sk.kaPress, nvmtl_sk.idleBytes >> 20, nvmtl_sk.kaBeyondBytes >> 20);
     const uint64_t logged = nvmtl_sk.logged;
     memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
 }
@@ -1154,6 +1172,12 @@ static void nvmtl_sk_miss(NSDictionary *keep, NVMTLSurfKey *key) {
                 if (st && sameTab && back < 10000) { st->winBack++; const uint64_t need = ((uint64_t)st->effMs + back) * 5 / 4 + 1000; if (need > st->winNeed) st->winNeed = need; }
             }
             if (g == NVMTL_GONE_EXPIRED) {
+                const uint64_t period = idleAtDrop + back;   // the surface's reuse gap, as the keep table saw it
+                // counted only when the current timeout would not have kept it (a return dropped under a lower, older
+                // timeout must not raise it again) and the ceiling would
+                if (nvmtl_ka.on && at && period >= (uint64_t)nvmtl_ka.eff && period < (uint64_t)nvmtl_ka.ceil) {
+                    nvmtl_ka.winBack++; nvmtl_sk.kaBack++; nvmtl_ka.lastAct = now;
+                    const uint64_t need = period * 5 / 4 + 1000; if (need > nvmtl_ka.winNeed) nvmtl_ka.winNeed = need; }
                 nvmtl_sk.expBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
                 nvmtl_sk.expBack7[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : back < 10000 ? 3 : back < 30000 ? 4 : back < 60000 ? 5 : 6]++;
                 if (nvmtl_sk.expLogged++ < 6)   // per 30 s report: which surfaces come back after expiring
@@ -1184,6 +1208,7 @@ static void nvmtl_sk_drop(NSMutableDictionary *keep, NVMTLSurfKey *k, unsigned w
     NVMTLSurfKeep *old = keep[k];
     if (old) { if (!nvmtl_sk_bag) nvmtl_sk_bag = [NSMutableArray new]; [nvmtl_sk_bag addObject:old]; }
     nvmtl_sk.drops++;
+    if (why == NVMTL_GONE_EXPIRED) { nvmtl_ka.winDrops++; nvmtl_sk.kaDrops++; }
     [keep removeObjectForKey:k];
     NSNumber *sid = @(k->_sid);
     [nvmtl_sk_live removeObject:sid];
@@ -1212,7 +1237,9 @@ static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
     pthread_mutex_lock(&g_sk_lock);
     NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     NVMTLSurfKeep *e = keep[key];
-    if (e) e->_last = e->_wrap = nvmtl_keep_now_ms();
+    if (e) { const uint64_t tn = nvmtl_keep_now_ms();
+             if (nvmtl_ka.eff > nvmtl_ka.base && tn - e->_last >= (uint64_t)nvmtl_ka.base) { nvmtl_ka.winSaved++; nvmtl_sk.kaSaved++; nvmtl_ka.lastAct = tn; }
+             e->_last = e->_wrap = tn; }
     nvmtl_sk.hits++;
     if (keep) nvmtl_sk_report(keep, e ? e->_last : nvmtl_keep_now_ms());
     pthread_mutex_unlock(&g_sk_lock);
@@ -1265,7 +1292,12 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
                       nvlog("surface keep: dead entries %s (NVMTL_KEEP_DEAD)", dropDead ? "dropped at once" : "kept to the idle rules");
                       nvlog("surface keep: idle entries kept for %ld ms, at least %ld, then up to %llu MB, at most %ld "
                             "(NVMTL_KEEP_MS / NVMTL_KEEP_IDLE / NVMTL_KEEP_IDLE_MB / NVMTL_KEEP_IDLE_MAX); drops released off the main thread",
-                            keepMs, keepIdle, (unsigned long long)(keepIdleBytes >> 20), keepIdleMax); }
+                            keepMs, keepIdle, (unsigned long long)(keepIdleBytes >> 20), keepIdleMax);
+                      e = getenv("NVMTL_KEEP_MAX_MS"); long mx = e ? atol(e) : 120000; if (mx > 120000) mx = 120000;   // hard ceiling
+                      e = getenv("NVMTL_KEEP_ADAPT");
+                      nvmtl_ka.base = nvmtl_ka.eff = keepMs; nvmtl_ka.ceil = MAX(keepMs, mx); nvmtl_ka.on = !(e && e[0] == '0') && nvmtl_ka.ceil > keepMs;
+                      nvlog("surface keep: idle timeout %s: %ld ms, raised up to %ld ms while expired surfaces come back (NVMTL_KEEP_ADAPT, NVMTL_KEEP_MAX_MS)",
+                            nvmtl_ka.on ? "adaptive" : "fixed", keepMs, nvmtl_ka.ceil); }
     NSMutableDictionary<NVMTLSurfKey *, NVMTLSurfKeep *> *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
     if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     if (!nvmtl_sk_live) { nvmtl_sk_live = [NSCountedSet new]; nvmtl_sk_gone = [NSMutableDictionary new]; }
@@ -1284,6 +1316,29 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         return;
     }
     lastSweep = now;
+    if (nvmtl_ka.on) {
+        if (press) {   // F1 overrides the adaptive window at once: back to the base before this pressure sweep
+            if (nvmtl_ka.eff != nvmtl_ka.base) { nvlog_report("surface keep: idle timeout %ld -> %ld ms (memory pressure)", nvmtl_ka.eff, nvmtl_ka.base); nvmtl_sk.kaPress++; }
+            nvmtl_ka.eff = nvmtl_ka.base; nvmtl_ka.winStart = now; nvmtl_ka.winBack = nvmtl_ka.winDrops = nvmtl_ka.winSaved = nvmtl_ka.winNeed = 0;
+        } else if (!nvmtl_ka.winStart) nvmtl_ka.winStart = now;
+        else if (now - nvmtl_ka.winStart >= 10000) {
+            const long old = nvmtl_ka.eff;
+            if (nvmtl_ka.winBack >= 4 && nvmtl_ka.winBack * 4 >= nvmtl_ka.winDrops)
+                nvmtl_ka.eff = (long)MIN((uint64_t)nvmtl_ka.ceil, MAX((uint64_t)old * 2, nvmtl_ka.winNeed));
+            // halved once per 10 s with no counted return and no hit only the raise kept, also for time no sweep saw (an
+            // empty table has no timer sweeps, so the window that held the last such event may be evaluated late)
+            else if (old > nvmtl_ka.base) {
+                const uint64_t quiet = (now - MAX(nvmtl_ka.winStart, nvmtl_ka.lastAct)) / 10000;
+                if (quiet) nvmtl_ka.eff = MAX(nvmtl_ka.base, old >> MIN((uint64_t)8, quiet)); }
+            if (nvmtl_ka.eff > old) nvmtl_sk.kaRaise++; else if (nvmtl_ka.eff < old) nvmtl_sk.kaDecay++;
+            if (nvmtl_ka.eff != old) nvlog_report("surface keep: idle timeout %ld -> %ld ms (last %llu s: %llu expired drops, %llu back within %ld ms, timeout they need %llu ms, "
+                                           "%llu hits only the raise kept)", old, nvmtl_ka.eff, (unsigned long long)((now - nvmtl_ka.winStart) / 1000),
+                                           nvmtl_ka.winDrops, nvmtl_ka.winBack, nvmtl_ka.ceil, nvmtl_ka.winNeed, nvmtl_ka.winSaved);
+            nvmtl_ka.winStart = now; nvmtl_ka.winBack = nvmtl_ka.winDrops = nvmtl_ka.winSaved = nvmtl_ka.winNeed = 0;
+        }
+    }
+    const long effMs = nvmtl_ka.on ? nvmtl_ka.eff : keepMs;
+    __block uint64_t beyondBytes = 0;   // idle entries past the base timeout (kept by the raise, or small)
     NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new], *dead = [NSMutableArray new], *unshadow = [NSMutableArray new],
                                   *pressed = [NSMutableArray new];
     // Unused plane shadows (2026-11-23, working load: Edge 4K 10-bit video): an x420 plane starts at +64 in its surface, so
@@ -1358,12 +1413,13 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
             nvmtl_sk.deadDrops++; nvmtl_sk.deadBytes += nvmtl_sk_bytes(b); [dead addObject:k]; return; }
         // Small surfaces (Electron / CoreAnimation tiles, <= NVMTL_KEEP_SMALL_KB) stay NVMTL_KEEP_SMALL_MS (120 s): on
         // 2026-11-08 1472x256 / 768x64 / 320x64 tiles came back 40-200 ms after a drop at ~28 s idle (CPU-THERMALS.md).
-        if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)((long)nvmtl_sk_bytes(b) <= smallBytes ? MAX(keepMs, keepSmallMs) : keepMs)) {
+        if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)((long)nvmtl_sk_bytes(b) <= smallBytes ? MAX(effMs, keepSmallMs) : effMs)) {
             // F1: under memory pressure an idle entry goes now (WARN: idle >= 5 s; CRITICAL: any idle one), but only one
             // that nothing else holds: retain count 1 on the texture = no live wrapper or view, and no command buffer in
             // flight (each retains its resources until it completes), so the BO cannot go under a CS or a present.
             // Everything above this rule (held, live wrapper, in use, dead, shadow) is untouched.
             if (press && CFGetRetainCount((__bridge CFTypeRef)b) == 1 && (press >= 2 || now - e->_last >= 5000)) { [pressed addObject:k]; return; }
+            if (now - e->_last >= (uint64_t)keepMs) beyondBytes += nvmtl_sk_bytes(b);
             [idle addObject:k]; return; }
         [gone addObject:k];
     }];
@@ -1429,7 +1485,7 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         CFRelease(seen);
         nvmtl_sk.idleSurfaces = ns; nvmtl_sk.idleSurfBytes = sb; memcpy(nvmtl_sk.idleAgeBytes, age, sizeof age);
     }
-    nvmtl_sk.idleBytes = idleBytes;
+    nvmtl_sk.idleBytes = idleBytes; nvmtl_sk.kaBeyondBytes = beyondBytes;
     if (nvmtl_sk.drops - drops0 > nvmtl_sk.maxSweepDrops) nvmtl_sk.maxSweepDrops = nvmtl_sk.drops - drops0;
     if (key) {
         NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
@@ -2182,9 +2238,9 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
         nvk_tess_desc td = { tpt, n, (uint32_t)d.tessellationPartitionMode, (uint32_t)d.tessellationOutputWindingOrder,
             (uint32_t)d.tessellationFactorStepFunction, d.isTessellationFactorScaleEnabled ? 1u : 0u, (uint32_t)d.tessellationControlPointIndexType,
             mf, rl ? rl.intValue : -1 };
-        prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, &td, &ps->_p);
+        { nvmtl_lower_src_hint(vf->_spirv, flk ?: ff->_spirv); prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, &td, &ps->_p); nvmtl_lower_src_hint(nil, nil); }
     } else
-        prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, NULL, &ps->_p);
+        { nvmtl_lower_src_hint(vf->_spirv, flk ?: ff->_spirv); prc = nvmtl_vk_pipeline_create_rt(vf->_spirv.bytes, vf->_spirv.length, fsb, fsl, &rt, vin.nattr ? &vin : NULL, rsc, NULL, &ps->_p); nvmtl_lower_src_hint(nil, nil); }
     if (prc) {
         nvlog("pipeline FAILED: %s / %s — see the vk: line above for the VkResult", vf->_fname.UTF8String ?: "?", ff->_fname.UTF8String ?: "?");
         return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: vkCreateGraphicsPipelines FAILED (%@ / %@)", vf->_fname, ff->_fname]); }

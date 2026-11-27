@@ -248,6 +248,12 @@ typedef struct { nvk_image *col[NVMTL_NCOL]; void *colview[NVMTL_NCOL]; uint32_t
     uint32_t colfmt[NVMTL_NCOL], resfmt[NVMTL_NCOL];
     uint32_t col_level[NVMTL_NCOL], col_layer[NVMTL_NCOL];  } nvk_pass;
 typedef struct { uint32_t ncol, cfmts[NVMTL_NCOL], has_depth, dfmt, samples; } nvk_rtsig;
+#ifdef __OBJC__
+@class NSData;
+/* the immutable NSData objects the next pipeline's two stages come from, for this thread (nil, nil after it): lets the
+   lowering memo keep its content key on them (nvmtl_vk.c, WS-CPU 9.9) */
+void nvmtl_lower_src_hint(NSData *vs, NSData *fs);
+#endif
 int  nvmtl_vk_pipeline_create_rt(const void *vs, size_t vn, const void *fs, size_t fn, const nvk_rt *rt, const void *vin, uint32_t samples,
                                  const nvk_tess_desc *td, void *out);
 int  nvmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p);

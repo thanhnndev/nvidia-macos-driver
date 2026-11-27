@@ -226,6 +226,7 @@ enum { MK_BUF_DEV, MK_BUF_HOST, MK_BUF_BAR1, MK_BUF_SPARSE, MK_BUF_IMPORT, MK_HE
 static _Atomic int64_t g_mk[MK_N], g_mk_n[MK_N];
 static inline int mk_buf_kind(const nvk_buffer *b) { return b->imported ? MK_BUF_IMPORT : b->bar1 ? MK_BUF_BAR1 : b->sparse ? MK_BUF_SPARSE : b->map ? MK_BUF_HOST : MK_BUF_DEV; }
 void nvmtl_lower_memo_stats(uint64_t *count, uint64_t *bytes, uint64_t *hit, uint64_t *miss, uint64_t *evict);
+void nvmtl_lower_key_stats(uint64_t *reuse, uint64_t *ver, uint64_t *bad);
 /* 2026-11-25 GFX power: what WindowServer draws per present. Render passes (attachment pixels; passes on an
    attachment of >= 4 Mpx, i.e. the 2880x1800 screen, split by colour-0 load: LOAD keeps the old pixels, CLEAR/DONTCARE
    repaints), draws and the scissored pixels per draw (the area a draw can touch; the attachment when CA set no scissor).
@@ -3876,16 +3877,17 @@ void nvmtl_vk_frame_census(int what)
                      "(%.2f keep its pixels, %.2f repaint), %.1f draws touching up to %.2f Mpx (scissor or whole attachment)",
                      dv[0] / p, dv[1] / p / 1e6, (dv[2] + dv[3]) / p, dv[2] / p, dv[3] / p, dv[4] / p, dv[5] / p / 1e6); }
     {   int64_t m[MK_N], n[MK_N]; for (int i = 0; i < MK_N; i++) { m[i] = atomic_load(&g_mk[i]) >> 20; n[i] = atomic_load(&g_mk_n[i]); }
-        uint64_t lc = 0, lb = 0, lh = 0, lm = 0, le = 0; nvmtl_lower_memo_stats(&lc, &lb, &lh, &lm, &le);
+        uint64_t lc = 0, lb = 0, lh = 0, lm = 0, le = 0, kr = 0, kv = 0, kx = 0; nvmtl_lower_memo_stats(&lc, &lb, &lh, &lm, &le); nvmtl_lower_key_stats(&kr, &kv, &kx);
         nvlog_report("frame census memory by kind (MB/count): images device %llu system %llu; buffers device %lld/%lld, host %lld/%lld, "
                      "BAR1 %lld/%lld, sparse %lld/%lld, imported caller pages %lld/%lld; heaps %lld/%lld, of them buffer-pool blocks "
                      "system %lld/%lld + VRAM %lld/%lld holding %llu MB of live ranges in %llu buffers; parked buffers %llu MB in %u; "
-                     "lowering memo %llu entries %llu MB (CPU heap; %llu hits, %llu misses, %llu evicted so far)",
+                     "lowering memo %llu entries %llu MB (CPU heap; %llu hits, %llu misses, %llu evicted so far; key memo %llu reuses, %llu verified, %llu mismatched)",
                      (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20),
                      m[MK_BUF_DEV], n[MK_BUF_DEV], m[MK_BUF_HOST], n[MK_BUF_HOST], m[MK_BUF_BAR1], n[MK_BUF_BAR1], m[MK_BUF_SPARSE], n[MK_BUF_SPARSE],
                      m[MK_BUF_IMPORT], n[MK_BUF_IMPORT], m[MK_HEAP], n[MK_HEAP], m[MK_POOL_SYS], n[MK_POOL_SYS], m[MK_POOL_VRAM], n[MK_POOL_VRAM],
                      (unsigned long long)(g_pool_bytes >> 20), (unsigned long long)g_pool_live,
-                     (unsigned long long)(g_bpark_bytes >> 20), (unsigned)g_bpark_n, (unsigned long long)lc, (unsigned long long)(lb >> 20), (unsigned long long)lh, (unsigned long long)lm, (unsigned long long)le); }
+                     (unsigned long long)(g_bpark_bytes >> 20), (unsigned)g_bpark_n, (unsigned long long)lc, (unsigned long long)(lb >> 20), (unsigned long long)lh, (unsigned long long)lm, (unsigned long long)le,
+                     (unsigned long long)kr, (unsigned long long)kv, (unsigned long long)kx); }
     nvmtl_churn_sites_dump(p);
 }
 /* *dyn gets the dynamic offset of binding 640 that goes with the returned set (0 unless the desc-cache reused a set
@@ -4487,6 +4489,32 @@ static NSData *nvmtl_address_shader_g(const void *data, size_t len, uint32_t fla
     t_pl_lower_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 - (t_lower_verify_ns - v0);
     return d;
 }
+/* WS-CPU 9.9 (2026-11-27 spindump): the lowering memo's key is a SHA-256 over the whole input module (~700 KB for a Core
+   Animation fragment), taken on every pipeline creation, hit or miss: 28 of the 55 samples of WindowServer's pipeline thread.
+   The caller names the immutable NSData objects the two stages come from (nvmtl_lower_src_hint, per thread, for the
+   duration of one pipeline creation); the key computed for such an object is kept on it (an associated object, so it dies
+   with the object and can never describe other bytes) and taken from there next time. The key, and so the memo entry and
+   the module the pipeline is built from, is the one the hash gives. NVMTL_LOWER_KEYMEMO=0 off; =2 verify (hash anyway, the
+   kept key must equal it; the census counts checks and mismatches). */
+static char g_lower_key_assoc[2];
+static _Atomic unsigned long long g_lower_key_reuse, g_lower_key_ver, g_lower_key_bad;
+static __thread __unsafe_unretained NSData *t_lower_src[2];
+static int nvmtl_lower_keymemo_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_LOWER_KEYMEMO"); on = !e ? 1 : *e == '0' ? 0 : *e == '2' ? 2 : 1;
+        nvlog("lowering key memo %s (NVMTL_LOWER_KEYMEMO)", on == 2 ? "ON, every reuse checked against the hash" : on ? "ON" : "OFF"); }
+    return on;
+}
+void nvmtl_lower_src_hint(NSData *vs, NSData *fs) {
+    const int on = nvmtl_lower_keymemo_on();
+    t_lower_src[0] = on ? vs : nil; t_lower_src[1] = on ? fs : nil;
+}
+static NSData *nvmtl_lower_src_of(const void *data, size_t len) {
+    for (int i = 0; i < 2; i++) { NSData *s = t_lower_src[i];
+        if (s && s.length == len && s.bytes == data && ![s isKindOfClass:[NSMutableData class]]) return s; }
+    return nil;
+}
+void nvmtl_lower_key_stats(uint64_t *reuse, uint64_t *ver, uint64_t *bad) { *reuse = g_lower_key_reuse; *ver = g_lower_key_ver; *bad = g_lower_key_bad; }
 static NSMutableDictionary *g_lower_memo; static pthread_mutex_t g_lower_memo_lk = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableArray *g_lower_memo_order;   /* keys of the entries that carry a module, oldest first */
 static uint64_t g_lower_memo_bytes;          /* keys (flags + length + SHA-256) + lowered modules + info, under g_lower_memo_lk */
@@ -4519,9 +4547,19 @@ static NSData *nvmtl_address_shader_g_body(const void *data, size_t len, uint32_
 #define cache g_lower_memo
 #define lk g_lower_memo_lk
     /* key: flags + length + SHA-256 of the input (was flags + a full copy of the input, ~700 KB per CA fragment module) */
-    uint8_t kb[4 + 8 + CC_SHA256_DIGEST_LENGTH]; const uint64_t ln = len; memcpy(kb, &flags, 4); memcpy(kb + 4, &ln, 8);
-    CC_SHA256(data, (CC_LONG)len, kb + 12);
-    NSData *key = [NSData dataWithBytes:kb length:sizeof kb];
+    NSData *src = flags <= 1 ? nvmtl_lower_src_of(data, len) : nil, *key = nil;
+    NSData *kept = src ? objc_getAssociatedObject(src, &g_lower_key_assoc[flags]) : nil;
+    if (kept && nvmtl_lower_keymemo_on() == 1) { key = kept; atomic_fetch_add(&g_lower_key_reuse, 1); }
+    else {
+        uint8_t kb[4 + 8 + CC_SHA256_DIGEST_LENGTH]; const uint64_t ln = len; memcpy(kb, &flags, 4); memcpy(kb + 4, &ln, 8);
+        CC_SHA256(data, (CC_LONG)len, kb + 12);
+        key = [NSData dataWithBytes:kb length:sizeof kb];
+        if (kept) {   /* verify mode: the kept key must be the content key of the bytes the module has now */
+            atomic_fetch_add(&g_lower_key_ver, 1);
+            if (![kept isEqualToData:key]) { atomic_fetch_add(&g_lower_key_bad, 1); nvlog_report("lowering key memo: MISMATCH (%zu B module, flags %u)", len, flags); }
+        }
+        if (src && !kept) objc_setAssociatedObject(src, &g_lower_key_assoc[flags], key, OBJC_ASSOCIATION_RETAIN);
+    }
     pthread_mutex_lock(&lk);
     NSArray *hit = cache[key];
     if (hit) g_lower_memo_hit++; else g_lower_memo_miss++;
