@@ -439,6 +439,29 @@ static int nmx_tt_census_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, nmx_tt_census, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
             nmx_tt_census_sysctl, "A",
             "FRAME-PATH 12.13 S1: per process resident GPU pages split pinned/userptr/idle/busy, BOs held by another thread (read-only; pressure: read kern.memorystatus_vm_pressure_level)");
+extern "C" int nmx_gpu_clients_format(char *buf, size_t size);
+/* Roadmap item 3 (a2): GPU time per DRM file (amdgpu_ctx_mgr_usage). Read-only; same shape as nmx_tt_census: a size
+ * probe returns the fixed size without walking the files, a cut is marked TRUNCATED. ga403wm-hackintosh's
+ * tools/890m/gpu-clients.py turns two reads into GPU ms/s per process. */
+static int nmx_gpu_clients_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 32 * 1024;
+    if (req->oldptr == USER_ADDR_NULL)
+        return SYSCTL_OUT(req, NULL, size);
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_gpu_clients_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
+    if (n < 0) n = 0;
+    if ((size_t)n > size) n = (int)size;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_gpu_clients, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_gpu_clients_sysctl, "A",
+            "roadmap 3 a2: per open DRM file: pid, name, GPU ring time in ns per hardware IP (amdgpu_ctx_mgr_usage, read-only)");
 extern "C" volatile SInt64 gNmxUserRecLive, gNmxUserRecMade, gNmxUserRecFreed, gNmxUserRecKept;
 NMX_CNT(nmx_userrec_live, gNmxUserRecLive, "Step138: page records of pinned user pages alive now (freed when unpinned)");
 NMX_CNT(nmx_userrec_made, gNmxUserRecMade, "Step138: user page records made");
@@ -577,6 +600,7 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_gpu_metrics,
     &sysctl__debug_nmx_pp_features,
     &sysctl__debug_nmx_tt_census,
+    &sysctl__debug_nmx_gpu_clients,
     &sysctl__debug_nmx_userrec_live,
     &sysctl__debug_nmx_userrec_made,
     &sysctl__debug_nmx_userrec_freed,

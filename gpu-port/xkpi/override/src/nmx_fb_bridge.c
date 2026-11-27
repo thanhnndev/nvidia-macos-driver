@@ -1791,6 +1791,76 @@ int nmx_tt_census_format(char *buf, size_t size)
     return (int)(o < size ? o : size);
 }
 
+/*
+ * Roadmap item 3 (a2, read-only, 2026-11-27): GPU time per open DRM file, so a reader can say which processes spend
+ * the GPU under the daily load without arming anything in WindowServer. The numbers are amdgpu's own per-client usage
+ * (amdgpu_ctx_mgr_usage, the source of Linux's drm-engine-* fdinfo keys): per hardware IP, the summed time from each
+ * job's scheduled fence to its finished fence, for finished jobs of contexts already freed (ctx_mgr time_spend) plus
+ * the jobs still tracked by live contexts. It is ring occupancy, as fdinfo's is: two clients' jobs overlapping on one
+ * ring are both counted, so per-client sums can exceed wall time. Monotonic per file while the file is open; a file
+ * that closes takes its total with it (the reader's delta script treats a vanished line as gone, not negative).
+ * Locks: filelist_mutex (as the other per-file tables here), then each file's ctx_mgr lock inside
+ * amdgpu_ctx_mgr_usage (a mutex, the order fdinfo uses under the file's own reference). Nothing here waits on the GPU.
+ * Output: one "now_ns" line (ktime_get, the clock the fence timestamps use), a header, one line per file with any
+ * time (client = drm_file client_id, unique per open, so a reader matches files across reads), and a total (files
+ * open, then the per-IP sums over all files). Columns are the AMDGPU_HW_IP_* order.
+ */
+int nmx_gpu_clients_format(char *buf, size_t size)
+{
+    size_t o = 0;
+    struct drm_device *dev;
+    struct drm_file *file;
+    ktime_t all[AMDGPU_HW_IP_NUM];
+    unsigned int ip, files = 0;
+
+#define G_P(...) do { if (o < size) o += (size_t)snprintf(buf + o, size - o, __VA_ARGS__); } while (0)
+    if (fbs[0].fb == NULL) {
+        G_P("not ready\n");
+        return (int)(o < size ? o : size);
+    }
+    dev = adev_to_drm(flip_adev(fbs[0].fb));
+    memset(all, 0, sizeof(all));
+    G_P("now_ns %lld\n", (long long)ktime_to_ns(ktime_get()));
+    G_P("client pid name gfx_ns compute_ns dma_ns uvd_ns vce_ns uvd_enc_ns vcn_dec_ns vcn_enc_ns vcn_jpeg_ns vpe_ns\n");
+    mutex_lock(&dev->filelist_mutex);
+    list_for_each_entry(file, &dev->filelist, lhead) {
+        struct amdgpu_fpriv *fpriv = file->driver_priv;
+        struct amdgpu_task_info *ti;
+        ktime_t usage[AMDGPU_HW_IP_NUM];
+        bool any = false;
+
+        if (fpriv == NULL)
+            continue;
+        files++;
+        memset(usage, 0, sizeof(usage));
+        amdgpu_ctx_mgr_usage(&fpriv->ctx_mgr, usage);
+        for (ip = 0; ip < AMDGPU_HW_IP_NUM; ip++) {
+            all[ip] = ktime_add(all[ip], usage[ip]);
+            if (usage[ip])
+                any = true;
+        }
+        if (!any)
+            continue;
+        ti = amdgpu_vm_get_task_info_vm(&fpriv->vm);
+        G_P("%llu %d %s", (unsigned long long)file->client_id, ti ? (int)ti->tgid : -1,
+            ti ? ti->process_name : "?");
+        for (ip = 0; ip < AMDGPU_HW_IP_NUM; ip++)
+            G_P(" %lld", (long long)ktime_to_ns(usage[ip]));
+        G_P("\n");
+        if (ti)
+            amdgpu_vm_put_task_info(ti);
+    }
+    mutex_unlock(&dev->filelist_mutex);
+    G_P("total %u", files);
+    for (ip = 0; ip < AMDGPU_HW_IP_NUM; ip++)
+        G_P(" %lld", (long long)ktime_to_ns(all[ip]));
+    G_P("\n");
+    if (o >= size && size > 32)          /* never silently short: the reader sees the cut */
+        snprintf(buf + size - 32, 32, "\nTRUNCATED (buffer %zu)\n", size);
+#undef G_P
+    return (int)(o < size ? o : size);
+}
+
 int nmx_gtt_format(char *buf, size_t size)
 {
     size_t o = 0;
