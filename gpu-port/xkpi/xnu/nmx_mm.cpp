@@ -294,6 +294,7 @@ static UserWire *wire_make(IOMemoryDescriptor *md, bool surface)
     return w;
 }
 
+#include "../bsdcompat/include/nmx_import_trace.h"     /* WS-CPU item 2 probes (C1-C5, D3) */
 /* 0 and the surface wiring's record in *handle, or an errno (the caller then wires the user range) */
 
 int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
@@ -301,6 +302,7 @@ int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write
     IOService *root = surf_root();
     if (root == nullptr)
         return ENODEV;
+    NMX_IMP_T0(it1);
     OSObject *surf = (OSObject *)_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(root, id, task);     /* retained */
     if (surf == nullptr) {
         __atomic_add_fetch(&gNmxSurfNoSurf, 1, __ATOMIC_RELAXED);
@@ -310,18 +312,23 @@ int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write
     if (md != nullptr)
         md->retain();       /* the BO keeps the memory, not the surface object */
     surf->release();
+    NMX_IMP_STAGE(NMX_IMP_C1_LOOKUP, it1, 0);
     if (md == nullptr || md->getLength() < npages * PAGE_SIZE) {
         __atomic_add_fetch(&gNmxSurfShort, 1, __ATOMIC_RELAXED);
         if (md != nullptr)
             md->release();
         return EINVAL;
     }
-    if (md->prepare() != kIOReturnSuccess) {
+    NMX_IMP_T0(it2);
+    IOReturn prc = md->prepare();
+    NMX_IMP_STAGE(NMX_IMP_C2_PREPARE, it2, npages);
+    if (prc != kIOReturnSuccess) {
         __atomic_add_fetch(&gNmxSurfPrepFail, 1, __ATOMIC_RELAXED);
         md->release();
         return EFAULT;
     }
     /* the check: the range's first page, wired through the process's map with the access asked for */
+    NMX_IMP_T0(it3);
     IOMemoryDescriptor *one = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)uaddr, PAGE_SIZE,
                                                                    write ? kIODirectionOutIn : kIODirectionOut, task);
     bool same = false;
@@ -335,12 +342,14 @@ int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write
         }
         one->release();
     }
+    NMX_IMP_STAGE(NMX_IMP_C3_FIRSTPAGE, it3, 1);
     if (!same) {
         __atomic_add_fetch(&gNmxSurfBadPage, 1, __ATOMIC_RELAXED);
         md->complete();
         md->release();
         return EPERM;
     }
+    NMX_IMP_T0(it4);
     for (size_t i = 0; i < npages; i++) {
         IOByteCount len = 0;
         addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
@@ -351,7 +360,10 @@ int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write
         }
         phys[i] = pa;
     }
+    NMX_IMP_STAGE(NMX_IMP_C4_PHYS, it4, npages);
+    NMX_IMP_T0(it5);
     UserWire *w = wire_make(md, true);
+    NMX_IMP_STAGE(NMX_IMP_C5_WIREMAKE, it5, 0);
     if (w == nullptr) {
         md->complete();
         md->release();
@@ -473,6 +485,7 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
     uint64_t wire_t0 = mach_absolute_time();
     IOReturn rc = md->prepare();
     nmx_ft_stall(3, wire_t0, npages);
+    if (NMX_IMP_ON()) nmx_imp_stage(NMX_IMP_C2_PREPARE, wire_t0, (uint32_t)npages);   /* clock already read */
     if (rc != kIOReturnSuccess && write) {
         /* ga403wm Step132: a writable wire of a fresh IOSurface (none of its pages resident yet) failed, and the
          * userptr ioctl then fell back to a read-only pin (Step96) of memory the GPU is asked to write: the write
@@ -519,6 +532,7 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         md->release();
         return EFAULT;
     }
+    NMX_IMP_T0(it4);
     for (size_t i = 0; i < npages; i++) {
         IOByteCount len = 0;
         addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
@@ -529,7 +543,10 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         }
         phys[i] = pa;
     }
+    NMX_IMP_STAGE(NMX_IMP_C4_PHYS, it4, npages);
+    NMX_IMP_T0(it5);
     UserWire *w = wire_make(md, false);
+    NMX_IMP_STAGE(NMX_IMP_C5_WIREMAKE, it5, 0);
     if (w == nullptr) {
         md->complete();
         md->release();
@@ -626,6 +643,7 @@ extern "C" int nmx_xnu_user_rewire(void *handle, size_t npages, uint64_t *phys)
         __atomic_add_fetch(&gNmxUserUnparks, 1, __ATOMIC_RELAXED);
         IOLockUnlock(gWireLock);
     }
+    NMX_IMP_T0(it4);
     for (size_t i = 0; i < npages; i++) {
         IOByteCount len = 0;
         addr64_t pa = w->md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
@@ -633,6 +651,7 @@ extern "C" int nmx_xnu_user_rewire(void *handle, size_t npages, uint64_t *phys)
             return EFAULT;
         phys[i] = pa;
     }
+    NMX_IMP_STAGE(NMX_IMP_C4_PHYS, it4, npages);
     return 0;
 }
 

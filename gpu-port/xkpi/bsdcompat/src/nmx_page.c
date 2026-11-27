@@ -688,6 +688,7 @@ static struct user_pin *page_pop_pin(vm_page_t m)
 
 static bool page_unref(vm_page_t m);
 
+#include "nmx_import_trace.h"   /* WS-CPU item 2 probes: C6 attach, D2 put_pages, D3 unwire, record counts */
 /* the record for a pinned user page, with one more reference; a new one is a BK_USER record (Step138) */
 static vm_page_t user_page_get(vm_paddr_t pa)
 {
@@ -698,8 +699,11 @@ static vm_page_t user_page_get(vm_paddr_t pa)
     if (m != NULL)
         __atomic_add_fetch(&m->ref_count, 1, __ATOMIC_SEQ_CST);
     lck_spin_unlock(l);
-    if (m != NULL)
+    if (m != NULL) {
+        NMX_IMP_COUNT(NMX_IMPC_REC_REUSED, 1);
         return m;
+    }
+    NMX_IMP_COUNT(NMX_IMPC_REC_NEW, 1);
     struct backing *bk = malloc(sizeof(*bk) + sizeof(struct vm_page), M_NMXPAGE, M_WAITOK | M_ZERO);
     struct reg_entry *e = malloc(sizeof(*e), M_NMXPAGE, M_WAITOK);
     if (bk == NULL || e == NULL) {
@@ -810,6 +814,7 @@ static bool page_unref(vm_page_t m)
     }
     lck_spin_unlock(l);
     if (e != NULL) {
+        NMX_IMP_COUNT(NMX_IMPC_REC_FREED, 1);
         free(e, M_NMXPAGE);
         free(bk, M_NMXPAGE);
         __atomic_sub_fetch(&gNmxUserRecLive, 1, __ATOMIC_RELAXED);
@@ -850,6 +855,7 @@ void vm_page_unwire(vm_page_t m, uint8_t queue)
 /* page records for phys[0..npages) with one entry each naming pin; 0, or ENOMEM with nothing left behind */
 static int pin_attach(struct user_pin *pin, const uint64_t *phys, int npages, vm_page_t *pages)
 {
+    NMX_IMP_T0(it6);
     struct pin_ref **refs = malloc(sizeof(*refs) * (size_t)npages, M_NMXPAGE, M_WAITOK | M_ZERO);
     int i;
     if (refs == NULL)
@@ -878,6 +884,7 @@ static int pin_attach(struct user_pin *pin, const uint64_t *phys, int npages, vm
         lck_spin_unlock(l);
     }
     free(refs, M_NMXPAGE);
+    NMX_IMP_STAGE(NMX_IMP_C6_ATTACH, it6, npages);
     return 0;
 fail:
     for (i = 0; i < npages; i++)
@@ -900,7 +907,10 @@ static struct user_pin *page_take_pin(vm_page_t m, struct user_pin *pin)
     r = *pp;
     if (r != NULL)
         *pp = r->next;
+    bool others = m->nmx_pins != NULL;      /* the page is still pinned by another request */
     lck_spin_unlock(l);
+    if (others)
+        NMX_IMP_COUNT(NMX_IMPC_PIN_MULTI, 1);
     if (r == NULL)
         return NULL;
     struct user_pin *got = r->pin;
@@ -940,6 +950,7 @@ out:
 
 void nmx_upin_put_pages(void *p, vm_page_t *pages, int npages)
 {
+    NMX_IMP_T0(itd2);
     struct user_pin *pin = p;
     for (int i = 0; i < npages; i++) {
         vm_page_t m = pages[i];
@@ -954,6 +965,7 @@ void nmx_upin_put_pages(void *p, vm_page_t *pages, int npages)
         if (page_unref(m))
             vm_page_free(m);
     }
+    NMX_IMP_STAGE(NMX_IMP_D2_PUTPAGES, itd2, npages);
 }
 
 uint32_t nmx_xnu_user_sid(void *handle);    /* xnu/nmx_mm.cpp */
@@ -1003,7 +1015,9 @@ void nmx_upin_destroy(void *p)
     struct user_pin *pin = p;
     if (pin == NULL)
         return;
+    NMX_IMP_T0(itd3);
     nmx_xnu_user_unwire(pin->handle);
+    NMX_IMP_STAGE(NMX_IMP_D3_UNWIRE, itd3, pin->npages);
     free(pin, M_NMXPAGE);
 }
 

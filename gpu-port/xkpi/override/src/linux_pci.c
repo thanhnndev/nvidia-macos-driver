@@ -85,6 +85,7 @@
 
 #include "backlight_if.h"
 #include "pcib_if.h"
+#include "nmx_import_trace.h"
 
 /* Undef the linux function macro defined in linux/pci.h */
 #undef pci_get_class
@@ -2129,7 +2130,11 @@ linux_dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
 
 	priv = dev->dma_priv;
 
-	DMA_PRIV_LOCK(priv);
+	{
+		NMX_IMP_T0(it9a);	/* WS-CPU item 2: time spent waiting for the device-wide DMA lock */
+		DMA_PRIV_LOCK(priv);
+		NMX_IMP_STAGE(NMX_IMP_C9A_DMALOCK, it9a, nents);
+	}
 
 	/* create common DMA map in the first S/G entry */
 	if (bus_dmamap_create(priv->dmat, 0, &sgl->dma_map) != 0) {

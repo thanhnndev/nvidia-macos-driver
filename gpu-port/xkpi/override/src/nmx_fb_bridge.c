@@ -1327,6 +1327,207 @@ static size_t st_format(char *buf, size_t size)
     return o < size ? o : size;
 }
 
+/*
+ * ---- WS-CPU item 2: per-import cost trace (nmx_import_trace.h; debug.nmx_import_trace, debug.nmx_import_cost) ----
+ * Records are opened on the calling thread (16 slots, keyed by current_thread); a stage on that thread is added to the
+ * record, and the record's stages are summed per row (WindowServer / other process) when it closes. A stage on a thread
+ * with no open record is summed at once in row "none" (Step142 restores in CS, delayed BO frees on a worker). Closed
+ * records go to a ring of the last 256. Everything is static; the gate write (nmx_kext.cpp) resets it all.
+ * Racy by design where noted (trace only): a reader may see a ring entry being written.
+ */
+#include "nmx_import_trace.h"
+extern struct thread *current_thread(void);     /* already imported (no new undefined symbol) */
+extern void proc_name(int pid, char *buf, int size);
+int nmx_imp_on;
+#define IMP_ROWS 3
+#define IMP_SLOTS 16
+#define IMP_RING 256u
+static const char *const imp_row_name[IMP_ROWS] = { "ws", "other", "none" };
+static const char *const imp_side_name[NMX_IMP_SIDES] = { "import", "map", "unmap", "free" };
+static const char *const imp_stage_name[NMX_IMP_STAGES] = {
+    "C0_total", "C1_lookup", "C2_prepare", "C3_firstpage", "C4_phys", "C5_wiremake", "C6_attach", "C7_validate",
+    "C8_sgtable", "C9_dmamap", "C9a_dmalock", "C10_dmaaddr", "C11_handle",
+    "V0_total", "V1_tree", "V2_clearfreed", "V3_boupdate", "V4_pdes", "V5_sdma",
+    "D0_total", "D1_dmaunmap", "D2_putpages", "D3_unwire" };
+static const char *const imp_count_name[NMX_IMPC_COUNTS] = {
+    "rec_new", "rec_reused", "pin_multi", "rec_freed", "flushtlb_update", "flushtlb_freed", "flushtlb_other",
+    "tlb_seq", "vmflush_job", "pasid_flush", "ptes", "sdma_jobs", "sdma_dw" };
+struct imp_rec {
+    uint64_t t0;
+    uint32_t dur_ns, pages, nents, mask;    /* mask: stages this record reached */
+    int32_t pid;
+    uint8_t side, row, keep, pad;
+    uint32_t ns[NMX_IMP_STAGES], units[NMX_IMP_STAGES];
+};
+static struct {
+    uint64_t n[IMP_ROWS][NMX_IMP_STAGES], sum_ns[IMP_ROWS][NMX_IMP_STAGES], max_ns[IMP_ROWS][NMX_IMP_STAGES],
+             units[IMP_ROWS][NMX_IMP_STAGES], hist[IMP_ROWS][NMX_IMP_STAGES][6];
+    uint64_t cnt[NMX_IMPC_COUNTS];
+    uint64_t opened, dropped, busy;          /* records opened, closed unkept (VA of a non-userptr BO), no free slot */
+    uint64_t head;
+    struct imp_rec ring[IMP_RING];
+} imp;
+static struct { void *volatile thr; struct imp_rec r; } imp_slot[IMP_SLOTS];
+
+static void imp_sum(int row, int stage, uint64_t d, uint64_t units)
+{
+    int b = d < 100000ULL ? 0 : d < 1000000ULL ? 1 : d < 10000000ULL ? 2 : d < 100000000ULL ? 3 : d < 1000000000ULL ? 4 : 5;
+    uint64_t m;
+    __atomic_fetch_add(&imp.n[row][stage], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&imp.sum_ns[row][stage], d, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&imp.units[row][stage], units, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&imp.hist[row][stage][b], 1, __ATOMIC_RELAXED);
+    m = __atomic_load_n(&imp.max_ns[row][stage], __ATOMIC_RELAXED);
+    while (d > m && !__atomic_compare_exchange_n(&imp.max_ns[row][stage], &m, d, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
+}
+static struct imp_rec *imp_mine(void)
+{
+    void *t = current_thread();
+    for (int i = 0; i < IMP_SLOTS; i++)
+        if (imp_slot[i].thr == t)
+            return &imp_slot[i].r;
+    return NULL;
+}
+void nmx_imp_open(int side, uint32_t pages, int keep)
+{
+    void *t = current_thread();
+    char who[24] = "";
+    if (side < 0 || side >= NMX_IMP_SIDES || imp_mine() != NULL)   /* nested (a free inside a failed import): outer only */
+        return;
+    for (int i = 0; i < IMP_SLOTS; i++) {
+        void *exp = NULL;
+        if (imp_slot[i].thr == NULL &&
+            __atomic_compare_exchange_n(&imp_slot[i].thr, &exp, t, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            struct imp_rec *r = &imp_slot[i].r;
+            memset(r, 0, sizeof(*r));
+            r->side = (uint8_t)side;
+            r->pages = pages;
+            r->keep = keep ? 1 : 0;
+            r->pid = proc_pid(current_proc());
+            proc_name(r->pid, who, (int)sizeof(who));
+            r->row = strncmp(who, "WindowServer", sizeof(who)) == 0 ? 0 : 1;
+            __atomic_fetch_add(&imp.opened, 1, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+    __atomic_fetch_add(&imp.busy, 1, __ATOMIC_RELAXED);
+}
+void nmx_imp_keep(void)
+{
+    struct imp_rec *r = imp_mine();
+    if (r != NULL)
+        r->keep = 1;
+}
+void nmx_imp_units2(uint32_t nents)
+{
+    struct imp_rec *r = imp_mine();
+    if (r != NULL)
+        r->nents = nents;
+}
+static const int imp_total_stage[NMX_IMP_SIDES] = { NMX_IMP_C0_TOTAL, NMX_IMP_V0_TOTAL, NMX_IMP_V0_TOTAL, NMX_IMP_D0_TOTAL };
+void nmx_imp_close(int side, uint64_t t0, uint32_t pages)
+{
+    uint64_t t1 = mach_absolute_time(), d = t1 > t0 ? t1 - t0 : 0;
+    void *t = current_thread();
+    for (int i = 0; i < IMP_SLOTS; i++) {
+        if (imp_slot[i].thr != t)
+            continue;
+        struct imp_rec *r = &imp_slot[i].r;
+        if (r->side == side) {
+            if (r->keep) {
+                int ts = imp_total_stage[side];
+                r->t0 = t0;
+                r->dur_ns = d > 0xffffffffULL ? 0xffffffffU : (uint32_t)d;
+                if (pages)
+                    r->pages = pages;
+                r->ns[ts] = r->dur_ns;
+                r->units[ts] = r->pages;
+                r->mask |= 1u << ts;
+                for (int s = 0; s < NMX_IMP_STAGES; s++)
+                    if (r->mask & (1u << s))
+                        imp_sum(r->row, s, r->ns[s], r->units[s]);
+                uint64_t k = __atomic_fetch_add(&imp.head, 1, __ATOMIC_ACQ_REL) % IMP_RING;
+                imp.ring[k] = *r;
+            } else {
+                __atomic_fetch_add(&imp.dropped, 1, __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(&imp_slot[i].thr, NULL, __ATOMIC_RELEASE);
+        }
+        return;
+    }
+}
+void nmx_imp_stage(int stage, uint64_t t0, uint32_t units)
+{
+    uint64_t t1 = mach_absolute_time(), d = t1 > t0 ? t1 - t0 : 0;
+    if (stage < 0 || stage >= NMX_IMP_STAGES)
+        return;
+    struct imp_rec *r = imp_mine();
+    if (r == NULL) {
+        imp_sum(2, stage, d, units);
+        return;
+    }
+    uint64_t s = (uint64_t)r->ns[stage] + d;
+    r->ns[stage] = s > 0xffffffffULL ? 0xffffffffU : (uint32_t)s;
+    r->units[stage] += units;
+    r->mask |= 1u << stage;
+}
+void nmx_imp_count(int ctr, uint64_t n)
+{
+    if (ctr >= 0 && ctr < NMX_IMPC_COUNTS)
+        __atomic_fetch_add(&imp.cnt[ctr], n, __ATOMIC_RELAXED);
+}
+/* the gate write: on 1, everything starts from zero (open records are abandoned: their close finds no slot) */
+void nmx_imp_reset(void)
+{
+    memset(&imp, 0, sizeof(imp));
+    memset(imp_slot, 0, sizeof(imp_slot));
+}
+/* debug.nmx_import_cost: bounded by size; a cut output ends with "TRUNCATED" */
+int nmx_import_cost_format(char *buf, __SIZE_TYPE__ size)
+{
+    size_t o = 0;
+    uint64_t head = __atomic_load_n(&imp.head, __ATOMIC_ACQUIRE), n = head < IMP_RING ? head : IMP_RING;
+    if (size < 16)
+        return 0;
+    size -= 16;     /* room for the TRUNCATED mark */
+#define IMP_P(...) do { if (o < size) o += (size_t)snprintf(buf + o, size - o, __VA_ARGS__); } while (0)
+    IMP_P("import_trace %d opened %llu dropped %llu busy %llu records %llu\n", nmx_imp_on,
+          (unsigned long long)imp.opened, (unsigned long long)imp.dropped, (unsigned long long)imp.busy,
+          (unsigned long long)head);
+    IMP_P("# stage <name> <row ws|other|none> n sum_us max_us units hist_ms_0.1_1_10_100_1000_inf\n");
+    for (int row = 0; row < IMP_ROWS; row++)
+        for (int s = 0; s < NMX_IMP_STAGES; s++)
+            if (imp.n[row][s])
+                IMP_P("stage %s %s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n", imp_stage_name[s],
+                      imp_row_name[row], (unsigned long long)imp.n[row][s],
+                      (unsigned long long)(imp.sum_ns[row][s] / 1000), (unsigned long long)(imp.max_ns[row][s] / 1000),
+                      (unsigned long long)imp.units[row][s], (unsigned long long)imp.hist[row][s][0],
+                      (unsigned long long)imp.hist[row][s][1], (unsigned long long)imp.hist[row][s][2],
+                      (unsigned long long)imp.hist[row][s][3], (unsigned long long)imp.hist[row][s][4],
+                      (unsigned long long)imp.hist[row][s][5]);
+    for (int c = 0; c < NMX_IMPC_COUNTS; c++)
+        IMP_P("count %s %llu\n", imp_count_name[c], (unsigned long long)imp.cnt[c]);
+    IMP_P("# rec <side> <t0> <pid> <row> <pages> <nents> <total_us> then stage=us,units for each stage reached\n");
+    for (uint64_t k = head - n; k < head && o < size; k++) {
+        const struct imp_rec *r = &imp.ring[k % IMP_RING];
+        IMP_P("rec %s %llu %d %s %u %u %u", r->side < NMX_IMP_SIDES ? imp_side_name[r->side] : "?",
+              (unsigned long long)r->t0, r->pid, r->row < IMP_ROWS ? imp_row_name[r->row] : "?", r->pages, r->nents,
+              r->dur_ns / 1000);
+        for (int s = 0; s < NMX_IMP_STAGES; s++)
+            if ((r->mask & (1u << s)) && s != imp_total_stage[r->side < NMX_IMP_SIDES ? r->side : 0])
+                IMP_P(" %s=%u,%u", imp_stage_name[s], r->ns[s] / 1000, r->units[s]);
+        IMP_P("\n");
+    }
+#undef IMP_P
+    if (o >= size) {
+        /* the cut line's NUL is at size - 1: write the mark over it, so a reader sees it (16 bytes were kept back) */
+        o = size > 0 ? size - 1 : 0;
+        o += (size_t)snprintf(buf + o, 17, "\nTRUNCATED\n");
+    }
+    return (int)o;
+}
+
 /* debug.nmx_frametrace: a text dump, newest record last; times relative to sub0 in microseconds */
 int nmx_ft_format(char *buf, size_t size)
 {

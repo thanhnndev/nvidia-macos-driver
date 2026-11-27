@@ -1,0 +1,364 @@
+# WS-CPU item 2 (ga403wm 2026-11-27): per-import cost trace probes, debug.nmx_import_trace (default 0), xkpi nmx_import_trace.h
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-27 21:58:07
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c	2026-11-27 22:00:51
+@@ -84,12 +84,31 @@
+ 	.access = ttm_bo_vm_access
+ };
+ 
++#ifdef NMXKPI
++#include "nmx_import_trace.h"	/* WS-CPU item 2: import / GEM_VA / free records (debug.nmx_import_trace) */
++#endif
+ static void amdgpu_gem_object_free(struct drm_gem_object *gobj)
+ {
+ 	struct amdgpu_bo *aobj = gem_to_amdgpu_bo(gobj);
++#ifdef NMXKPI
++	/* a userptr BO's free: one record (D0) around the put; its unpopulate runs here when the BO is idle (D1-D3 in
++	 * the record), otherwise on the delayed-delete worker (row "none") */
++	NMX_IMP_T0(itd0);
++	uint32_t ipg = 0;
++	if (itd0 && aobj->tbo.ttm && amdgpu_ttm_tt_is_userptr(aobj->tbo.ttm)) {
++		ipg = aobj->tbo.ttm->num_pages;
++		nmx_imp_open(NMX_IMP_FREE, ipg, 1);
++	} else {
++		itd0 = 0;
++	}
++#endif
+ 
+ 	amdgpu_hmm_unregister(aobj);
+ 	ttm_bo_put(&aobj->tbo);
++#ifdef NMXKPI
++	if (itd0)
++		nmx_imp_close(NMX_IMP_FREE, itd0, ipg);
++#endif
+ }
+ 
+ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+@@ -462,7 +481,11 @@
+ 			return r;
+ 		}
+ 		amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
+-		r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++		{
++			NMX_IMP_T0(it7);
++			r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++			NMX_IMP_STAGE(NMX_IMP_C7_VALIDATE, it7, n);
++		}
+ 		amdgpu_bo_unreserve(bo);
+ 		if (r) {
+ 			/* not bound; unpopulate skips the NULL entries if the TT was populated */
+@@ -471,7 +494,11 @@
+ 			return r;
+ 		}
+ 	}
+-	r = drm_gem_handle_create(filp, &bo->tbo.base, handle);
++	{
++		NMX_IMP_T0(it11);
++		r = drm_gem_handle_create(filp, &bo->tbo.base, handle);
++		NMX_IMP_STAGE(NMX_IMP_C11_HANDLE, it11, 0);
++	}
+ 	if (r) {
+ 		/* the pages stay with the BO; the caller's put destroys it and unpopulate drops them */
+ 		nmx_userptr_say("handle FAILED", args->addr, args->size, r);
+@@ -505,9 +532,31 @@
+ 	return r;
+ }
+ #endif
++
++#ifdef NMXKPI
++static int amdgpu_gem_userptr_ioctl_body(struct drm_device *dev, void *data, struct drm_file *filp);
++/* WS-CPU item 2: the import record (C0) around the whole ioctl */
++int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
++			     struct drm_file *filp)
++{
++	struct drm_amdgpu_gem_userptr *args = data;
++	uint32_t pg = (uint32_t)(args->size >> PAGE_SHIFT);
++	NMX_IMP_T0(it0);
++	int r;
+ 
++	if (it0)
++		nmx_imp_open(NMX_IMP_IMPORT, pg, 1);
++	r = amdgpu_gem_userptr_ioctl_body(dev, data, filp);
++	if (it0)
++		nmx_imp_close(NMX_IMP_IMPORT, it0, pg);
++	return r;
++}
++static int amdgpu_gem_userptr_ioctl_body(struct drm_device *dev, void *data,
++			     struct drm_file *filp)
++#else
+ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
+ 			     struct drm_file *filp)
++#endif
+ {
+ 	struct ttm_operation_ctx ctx = { true, false };
+ 	struct amdgpu_device *adev = drm_to_adev(dev);
+@@ -753,18 +802,40 @@
+ 	if (!amdgpu_vm_ready(vm))
+ 		return;
+ 
++#ifdef NMXKPI
++	{
++		NMX_IMP_T0(itv2);
++		r = amdgpu_vm_clear_freed(adev, vm, NULL);
++		NMX_IMP_STAGE(NMX_IMP_V2_CLEARFREED, itv2, 0);
++	}
++#else
+ 	r = amdgpu_vm_clear_freed(adev, vm, NULL);
++#endif
+ 	if (r)
+ 		goto error;
+ 
+ 	if (operation == AMDGPU_VA_OP_MAP ||
+ 	    operation == AMDGPU_VA_OP_REPLACE) {
++#ifdef NMXKPI
++		NMX_IMP_T0(itv3);
+ 		r = amdgpu_vm_bo_update(adev, bo_va, false);
++		NMX_IMP_STAGE(NMX_IMP_V3_BOUPDATE, itv3, 0);
++#else
++		r = amdgpu_vm_bo_update(adev, bo_va, false);
++#endif
+ 		if (r)
+ 			goto error;
+ 	}
+ 
++#ifdef NMXKPI
++	{
++		NMX_IMP_T0(itv4);
++		r = amdgpu_vm_update_pdes(adev, vm, false);
++		NMX_IMP_STAGE(NMX_IMP_V4_PDES, itv4, 0);
++	}
++#else
+ 	r = amdgpu_vm_update_pdes(adev, vm, false);
++#endif
+ 
+ error:
+ 	if (r && r != -ERESTARTSYS)
+@@ -881,9 +952,33 @@
+ }
+ #endif
+ 
++#ifdef NMXKPI
++static int amdgpu_gem_va_ioctl_body(struct drm_device *dev, void *data, struct drm_file *filp);
++/* WS-CPU item 2: a GEM_VA record (V0), kept only for a userptr BO (the body calls nmx_imp_keep) */
+ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+ 			  struct drm_file *filp)
+ {
++	struct drm_amdgpu_gem_va *args = data;
++	int side = (args->operation == AMDGPU_VA_OP_MAP || args->operation == AMDGPU_VA_OP_REPLACE) ?
++		   NMX_IMP_VA_MAP : NMX_IMP_VA_UNMAP;
++	uint32_t pg = (uint32_t)(args->map_size >> PAGE_SHIFT);
++	NMX_IMP_T0(itv0);
++	int r;
++
++	if (itv0)
++		nmx_imp_open(side, pg, 0);
++	r = amdgpu_gem_va_ioctl_body(dev, data, filp);
++	if (itv0)
++		nmx_imp_close(side, itv0, pg);
++	return r;
++}
++static int amdgpu_gem_va_ioctl_body(struct drm_device *dev, void *data,
++			  struct drm_file *filp)
++#else
++int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
++			  struct drm_file *filp)
++#endif
++{
+ 	const uint32_t valid_flags = AMDGPU_VM_DELAY_UPDATE |
+ 		AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
+ 		AMDGPU_VM_PAGE_EXECUTABLE | AMDGPU_VM_MTYPE_MASK |
+@@ -953,6 +1048,10 @@
+ 		if (gobj == NULL)
+ 			return -ENOENT;
+ 		abo = gem_to_amdgpu_bo(gobj);
++#ifdef NMXKPI
++		if (NMX_IMP_ON() && abo->tbo.ttm && amdgpu_ttm_tt_is_userptr(abo->tbo.ttm))
++			nmx_imp_keep();
++#endif
+ 	} else {
+ 		gobj = NULL;
+ 		abo = NULL;
+@@ -986,6 +1085,9 @@
+ 		bo_va = NULL;
+ 	}
+ 
++#ifdef NMXKPI
++	NMX_IMP_T0(itv1);
++#endif
+ 	switch (args->operation) {
+ 	case AMDGPU_VA_OP_MAP:
+ 		va_flags = amdgpu_gem_va_map_flags(adev, args->flags);
+@@ -1012,6 +1114,7 @@
+ 		break;
+ 	}
+ #ifdef NMXKPI
++	NMX_IMP_STAGE(NMX_IMP_V1_TREE, itv1, 0);
+ 	if (!r) {
+ 		if (args->operation == AMDGPU_VA_OP_MAP || args->operation == AMDGPU_VA_OP_REPLACE) {
+ 			if (args->operation == AMDGPU_VA_OP_REPLACE)
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c	2026-11-27 21:58:07
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c	2026-11-27 21:59:10
+@@ -1087,6 +1087,14 @@
+  *
+  * Called by amdgpu_ttm_backend_bind()
+  **/
++#ifdef NMXKPI
++#include "nmx_import_trace.h"	/* WS-CPU item 2: C8-C10 (sg table, dma map) and D1 (dma unmap) */
++#else
++#define NMX_IMP_T0(v) uint64_t v = 0
++#define NMX_IMP_STAGE(st, v, units) do { } while (0)
++#define NMX_IMP_ON() 0
++static inline void nmx_imp_units2(uint32_t n) { }
++#endif
+ static int amdgpu_ttm_tt_pin_userptr(struct ttm_device *bdev,
+ 				     struct ttm_tt *ttm)
+ {
+@@ -1098,20 +1106,28 @@
+ 	int r;
+ 
+ 	/* Allocate an SG array and squash pages into it */
++	NMX_IMP_T0(it8);
+ 	r = sg_alloc_table_from_pages(ttm->sg, ttm->pages, ttm->num_pages, 0,
+ 				      (u64)ttm->num_pages << PAGE_SHIFT,
+ 				      GFP_KERNEL);
++	NMX_IMP_STAGE(NMX_IMP_C8_SGTABLE, it8, ttm->num_pages);
+ 	if (r)
+ 		goto release_sg;
++	if (NMX_IMP_ON())
++		nmx_imp_units2(ttm->sg->nents);
+ 
+ 	/* Map SG to device */
++	NMX_IMP_T0(it9);
+ 	r = dma_map_sgtable(adev->dev, ttm->sg, direction, 0);
++	NMX_IMP_STAGE(NMX_IMP_C9_DMAMAP, it9, ttm->sg->nents);
+ 	if (r)
+ 		goto release_sg_table;
+ 
+ 	/* convert SG to linear array of pages and dma addresses */
++	NMX_IMP_T0(it10);
+ 	drm_prime_sg_to_dma_addr_array(ttm->sg, gtt->ttm.dma_address,
+ 				       ttm->num_pages);
++	NMX_IMP_STAGE(NMX_IMP_C10_DMAADDR, it10, ttm->num_pages);
+ 
+ 	return 0;
+ 
+@@ -1140,8 +1156,10 @@
+ 		return;
+ 
+ 	/* unmap the pages mapped to the device */
++	NMX_IMP_T0(itd1);
+ 	dma_unmap_sgtable(adev->dev, ttm->sg, direction, 0);
+ 	sg_free_table(ttm->sg);
++	NMX_IMP_STAGE(NMX_IMP_D1_DMAUNMAP, itd1, ttm->num_pages);
+ }
+ 
+ /*
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c	2026-11-27 21:58:07
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c	2026-11-27 21:59:44
+@@ -750,6 +750,13 @@
+  * Returns:
+  * 0 on success, errno otherwise.
+  */
++#ifdef NMXKPI
++#include "nmx_import_trace.h"	/* WS-CPU item 2 counters (debug.nmx_import_trace) */
++#else
++#define NMX_IMP_COUNT(c, n) do { } while (0)
++#define NMX_IMP_T0(v) uint64_t v = 0
++#define NMX_IMP_STAGE(st, v, units) do { } while (0)
++#endif
+ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job,
+ 		    bool need_pipe_sync)
+ {
+@@ -819,6 +826,7 @@
+ 	if (vm_flush_needed) {
+ 		trace_amdgpu_vm_flush(ring, job->vmid, job->vm_pd_addr);
+ 		amdgpu_ring_emit_vm_flush(ring, job->vmid, job->vm_pd_addr);
++		NMX_IMP_COUNT(NMX_IMPC_VMFLUSH_JOB, 1);
+ 	}
+ 
+ 	if (pasid_mapping_needed)
+@@ -1008,6 +1016,7 @@
+ 
+ 	tlb_cb = container_of(cb, typeof(*tlb_cb), cb);
+ 	atomic64_inc(&tlb_cb->vm->tlb_seq);
++	NMX_IMP_COUNT(NMX_IMPC_TLBSEQ, 1);
+ 	kfree(tlb_cb);
+ }
+ 
+@@ -1335,6 +1344,9 @@
+ 
+ 		trace_amdgpu_vm_bo_update(mapping);
+ 
++		NMX_IMP_COUNT(NMX_IMPC_PTES, mapping->last - mapping->start + 1);
++		if (flush_tlb)
++			NMX_IMP_COUNT(NMX_IMPC_FLUSHTLB_UPDATE, 1);
+ 		r = amdgpu_vm_update_range(adev, vm, false, false, flush_tlb,
+ 					   !uncached, &sync, mapping->start,
+ 					   mapping->last, update_flags,
+@@ -1807,6 +1819,7 @@
+ 		nmx_vafree_note(vm->pasid, mapping->start, mapping->last);
+ #endif
+ 
++		NMX_IMP_COUNT(NMX_IMPC_FLUSHTLB_FREED, 1);
+ 		r = amdgpu_vm_update_range(adev, vm, false, false, true, false,
+ 					   &sync, mapping->start, mapping->last,
+ 					   0, 0, 0, NULL, NULL, &f);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_sdma.c	2026-11-27 21:58:06
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm_sdma.c	2026-11-27 21:59:44
+@@ -102,6 +102,13 @@
+  * Returns:
+  * Negativ errno, 0 for success.
+  */
++#ifdef NMXKPI
++#include "nmx_import_trace.h"	/* WS-CPU item 2 counters (debug.nmx_import_trace) */
++#else
++#define NMX_IMP_COUNT(c, n) do { } while (0)
++#define NMX_IMP_T0(v) uint64_t v = 0
++#define NMX_IMP_STAGE(st, v, units) do { } while (0)
++#endif
+ static int amdgpu_vm_sdma_commit(struct amdgpu_vm_update_params *p,
+ 				 struct dma_fence **fence)
+ {
+@@ -115,11 +122,17 @@
+ 	WARN_ON(ib->length_dw == 0);
+ 	amdgpu_ring_pad_ib(ring, ib);
+ 
+-	if (p->needs_flush)
++	if (p->needs_flush) {
+ 		atomic64_inc(&p->vm->tlb_seq);
++		NMX_IMP_COUNT(NMX_IMPC_TLBSEQ, 1);
++	}
++	NMX_IMP_COUNT(NMX_IMPC_SDMA_JOBS, 1);
++	NMX_IMP_COUNT(NMX_IMPC_SDMA_DW, ib->length_dw);
+ 
+ 	WARN_ON(ib->length_dw > p->num_dw_left);
++	NMX_IMP_T0(itv5);
+ 	f = amdgpu_job_submit(p->job);
++	NMX_IMP_STAGE(NMX_IMP_V5_SDMA, itv5, ib->length_dw);
+ 
+ 	if (p->unlocked) {
+ 		struct dma_fence *tmp = dma_fence_get(f);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c	2026-11-27 21:58:05
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c	2026-11-27 21:59:44
+@@ -674,6 +674,13 @@
+ 	dev_err(adev->dev, "Error flushing GPU TLB using the SDMA (%d)!\n", r);
+ }
+ 
++#ifdef NMXKPI
++#include "nmx_import_trace.h"	/* WS-CPU item 2 counters (debug.nmx_import_trace) */
++#else
++#define NMX_IMP_COUNT(c, n) do { } while (0)
++#define NMX_IMP_T0(v) uint64_t v = 0
++#define NMX_IMP_STAGE(st, v, units) do { } while (0)
++#endif
+ int amdgpu_gmc_flush_gpu_tlb_pasid(struct amdgpu_device *adev, uint16_t pasid,
+ 				   uint32_t flush_type, bool all_hub,
+ 				   uint32_t inst)
+@@ -683,6 +690,8 @@
+ 	struct amdgpu_ring *ring = &adev->gfx.kiq[inst].ring;
+ 	struct amdgpu_kiq *kiq = &adev->gfx.kiq[inst];
+ 	unsigned int ndw;
++
++	NMX_IMP_COUNT(NMX_IMPC_PASID_FLUSH, 1);
+ 	int r;
+ 	uint32_t seq;
+ 

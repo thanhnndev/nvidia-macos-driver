@@ -209,6 +209,42 @@ static int nmx_frametrace_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, nmx_frametrace, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
             0, 0, nmx_frametrace_sysctl, "A",
             "frame-path trace: last 512 flips (submit, commit return, armed, pageflip IRQ, status seen), vblank, VBL timer phase, IPS");
+/* WS-CPU item 2 (ws-cpu-item2-import-trace-plan-2026-11-27.md): per-import cost trace. debug.nmx_import_trace (default 0)
+ * turns the probes on; a write of 1 starts every sum and the ring from zero. debug.nmx_import_cost reads it: per-stage
+ * sums by row (WindowServer / other / no record), counters, the last 256 records. Fixed-size output (a size probe
+ * returns the size without formatting; a cut is marked TRUNCATED). */
+#include "../bsdcompat/include/nmx_import_trace.h"
+extern "C" void nmx_imp_reset(void);
+static int nmx_import_trace_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = nmx_imp_on;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (v != 0 && v != 1) return EINVAL;
+    if (v) { nmx_imp_on = 0; nmx_imp_reset(); }
+    nmx_imp_on = v;
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_import_trace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_import_trace_sysctl, "I", "WS-CPU item 2: 1 = time userptr imports, GEM_VA and userptr BO frees per stage (a write of 1 resets); 0 = off (default)");
+static int nmx_import_cost_sysctl SYSCTL_HANDLER_ARGS
+{
+    const size_t size = 128 * 1024;
+    if (req->oldptr == USER_ADDR_NULL)
+        return SYSCTL_OUT(req, NULL, size);
+    char *buf = (char *)IOMalloc(size);
+    if (!buf) return ENOMEM;
+    int n = -1, eerr;
+    { NmxEntry entry; eerr = entry.err; if (!eerr) n = nmx_import_cost_format(buf, size); }
+    if (eerr) { IOFree(buf, size); return eerr; }
+    if (n < 0) n = 0;
+    if ((size_t)n > size) n = (int)size;
+    int err = SYSCTL_OUT(req, buf, (size_t)n);
+    IOFree(buf, size);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_import_cost, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_import_cost_sysctl, "A", "WS-CPU item 2: per-stage import/map/free cost, counters, last 256 records (debug.nmx_import_trace)");
 static int nmx_userwire_by_kind_sysctl SYSCTL_HANDLER_ARGS
 {
     char buf[1024];
@@ -538,6 +574,8 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_userwire_pages,
     &sysctl__debug_nmx_userwire_by_kind,
     &sysctl__debug_nmx_frametrace,
+    &sysctl__debug_nmx_import_trace,
+    &sysctl__debug_nmx_import_cost,
     &sysctl__debug_nmx_surfwire_count,
     &sysctl__debug_nmx_surfwire_pages,
     &sysctl__debug_nmx_userwire_parked,
