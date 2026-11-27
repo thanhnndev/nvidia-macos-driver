@@ -691,8 +691,9 @@ static void flip_refresh(void)
 }
 
 static struct dma_fence *surf_fence_get(uint32_t sid, uint64_t after, uint64_t *set_ns);
-static uint64_t col_apply(struct drm_crtc_state *cs);     /* hardware colour stages (end of file) */
+static uint64_t col_apply(struct drm_crtc_state *cs, bool *changed);     /* hardware colour stages (end of file) */
 static void col_applied(uint64_t gen);
+static void col_rejected(uint64_t gen, int e);
 
 static uint32_t flip_submit(struct nmx_flipreq *r)
 {
@@ -703,6 +704,7 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
     struct drm_crtc_commit *commit = NULL;
     struct dma_fence *kf = NULL;        /* out-31 row 1: the surface's last GPU job, waited in the commit */
     uint64_t colgen = 0;                /* colour state generation this commit carries (0 = none staged) */
+    bool colchg = false, nocol = false; /* the commit changes the CRTC colour state; retrying without it */
     int e = -ENOMEM;
 
     if (!nfbp)
@@ -755,8 +757,19 @@ static uint32_t flip_submit(struct nmx_flipreq *r)
                 e = PTR_ERR(cs);
                 goto deadlk;
             }
-            colgen = col_apply(cs);     /* staged DEGAMMA_LUT / CTM / GAMMA_LUT ride this flip (no-op when unchanged) */
+            colgen = 0;
+            colchg = false;
+            if (!nocol)                 /* staged DEGAMMA_LUT / CTM / GAMMA_LUT ride this flip (no-op when unchanged) */
+                colgen = col_apply(cs, &colchg);
             e = drm_atomic_nonblocking_commit(state);
+            if (e && e != -EDEADLK && e != -EBUSY && colchg) {
+                /* DM refused the flip with the new colour state: mark that generation refused (never attached again)
+                 * and put the frame up without it. NMXAccel sees the refusal through nmxFlipColor's sync. */
+                col_rejected(colgen, e);
+                nocol = true;
+                drm_atomic_state_clear(state);
+                continue;
+            }
             if (!e) {
                 if (colgen)
                     col_applied(colgen);
@@ -1815,11 +1828,13 @@ int nmx_gtt_format(char *buf, size_t size)
  */
 #include "nmx_fb_color.h"
 
-uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors;
+uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors, gNmxColorRejected;
 
 static struct {
     int lock;                           /* hand-rolled like sf: usable before any init hook */
     uint64_t gen, applied;              /* staged generation; the last one a successful commit carried */
+    uint64_t rejected;                  /* the last generation DM refused (never attached again) */
+    int rejected_err;
     struct drm_property_blob *degamma, *ctm, *gamma;
 } col;
 
@@ -1883,7 +1898,7 @@ int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm,
 }
 
 /* put the staged stages into a CRTC state being built; returns the generation carried, 0 = nothing staged */
-static uint64_t col_apply(struct drm_crtc_state *cs)
+static uint64_t col_apply(struct drm_crtc_state *cs, bool *chg)
 {
     struct drm_property_blob *d, *c, *g;
     uint64_t gen;
@@ -1891,6 +1906,8 @@ static uint64_t col_apply(struct drm_crtc_state *cs)
 
     col_lock();
     gen = col.gen;
+    if (gen && gen == col.rejected)
+        gen = 0;                        /* refused once: the CRTC keeps its last accepted colour state */
     d = col.degamma ? drm_property_blob_get(col.degamma) : NULL;
     c = col.ctm ? drm_property_blob_get(col.ctm) : NULL;
     g = col.gamma ? drm_property_blob_get(col.gamma) : NULL;
@@ -1907,7 +1924,20 @@ static uint64_t col_apply(struct drm_crtc_state *cs)
     drm_property_blob_put(d);
     drm_property_blob_put(c);
     drm_property_blob_put(g);
+    *chg = changed;
     return gen;
+}
+
+static void col_rejected(uint64_t gen, int e)
+{
+    col_lock();
+    if (gen > col.rejected) {
+        col.rejected = gen;
+        col.rejected_err = e;
+    }
+    col_unlock();
+    __atomic_add_fetch(&gNmxColorRejected, 1, __ATOMIC_RELAXED);
+    FLIP_LOG("NMX flip: colour state %llu refused by DM (%d): kept the last accepted one\n", (unsigned long long)gen, e);
 }
 
 static void col_applied(uint64_t gen)
@@ -1933,9 +1963,13 @@ int nmx_fb_color_commit(void)
     gen = col.gen;
     if (gen == col.applied)
         gen = 0;
+    else if (gen == col.rejected)
+        gen = (uint64_t)-1;
     col_unlock();
     if (!gen)
         return 0;                       /* a flip already carried it */
+    if (gen == (uint64_t)-1)
+        return EINVAL;                  /* refused before: not tried again */
     drm_modeset_acquire_init(&ctx, 0);
     state = drm_atomic_state_alloc(flip.nfb->client.dev);
     if (state) {
@@ -1945,11 +1979,16 @@ int nmx_fb_color_commit(void)
             if (IS_ERR(cs)) {
                 e = PTR_ERR(cs);
             } else {
-                gen = col_apply(cs);
+                bool chg = false;
+
+                gen = col_apply(cs, &chg);
                 e = drm_atomic_commit(state);
                 if (!e) {
                     col_applied(gen);
                     __atomic_add_fetch(&gNmxColorAlone, 1, __ATOMIC_RELAXED);
+                } else if (e != -EDEADLK && e != -EINTR && e != -ERESTARTSYS && e != -ENOMEM && chg) {
+                    col_rejected(gen, e);
+                    e = -EINVAL;
                 }
             }
             if (e != -EDEADLK)
@@ -1973,7 +2012,8 @@ int nmx_fb_color_commit(void)
  */
 struct nmx_colorreq {
     unsigned int version;               /* 1 */
-    unsigned int flags;                 /* 1 degamma, 2 ctm, 4 gamma (absent = bypass), 8 commit now */
+    unsigned int flags;                 /* 1 degamma, 2 ctm, 4 gamma (absent = bypass), 8 commit now,
+                                         * 16 sync: stage nothing, commit what is staged unless a flip carried it */
     const struct nmx_color_lut *degamma;
     const uint64_t *ctm;
     const struct nmx_color_lut *gamma;
@@ -1987,9 +2027,16 @@ static long long col_call(void *req)
     struct nmx_colorreq *r = req;
     int e;
 
-    if (!r || r->version != 1 || (r->flags & ~0xfu) ||
+    if (!r || r->version != 1 || (r->flags & ~0x1fu) ||
         ((r->flags & 1) && !r->degamma) || ((r->flags & 2) && !r->ctm) || ((r->flags & 4) && !r->gamma))
         return FLIP_R_BADARG;
+    if (r->flags & 16) {
+        /* after a present: the colour reaches the screen also when no flip carried it (same surface, CPU copy path,
+         * busy drop). 0 = on screen; EINVAL = DM refused it (the last accepted state stays); EAGAIN = not ready */
+        e = r->flags & 0xf ? EINVAL : nmx_fb_color_commit();
+        r->err = e;
+        return e == 0 ? FLIP_R_OK : e == EAGAIN ? FLIP_R_NOTREADY : FLIP_R_ERROR;
+    }
     e = nmx_fb_color_stage(r->flags & 1 ? r->degamma : NULL, r->flags & 2 ? r->ctm : NULL,
                            r->flags & 4 ? r->gamma : NULL);
     if (!e && (r->flags & 8))

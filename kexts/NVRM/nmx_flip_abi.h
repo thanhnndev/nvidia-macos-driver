@@ -117,6 +117,8 @@ enum {
     NMX_COLOR_CTM     = 2u,   // ctm: 9 x u64, S31.32 sign-magnitude, row-major (drm_color_ctm)
     NMX_COLOR_GAMMA   = 4u,   // gamma: as degamma
     NMX_COLOR_COMMIT  = 8u,   // commit now (blocking) instead of with the next flip
+    NMX_COLOR_SYNC    = 16u,  // alone: stage nothing; commit what is staged unless a flip carried it (after a present).
+                              // err EINVAL = DM refused that state (the screen keeps the last accepted one)
 };
 /* NMXGPU's struct nmx_colorreq (nmx_fb_bridge.c) must match */
 struct NMXColorRequest {

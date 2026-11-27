@@ -41,7 +41,7 @@ int nmx_fb_power(void *dev, int on);
 struct nmx_color_lut;
 int nmx_fb_color_stage(const struct nmx_color_lut *degamma, const uint64_t *ctm, const struct nmx_color_lut *gamma);
 int nmx_fb_color_commit(void);
-extern uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors;
+extern uint64_t gNmxColorStaged, gNmxColorFlip, gNmxColorAlone, gNmxColorErrors, gNmxColorRejected;
 
 #ifdef __cplusplus
 }
