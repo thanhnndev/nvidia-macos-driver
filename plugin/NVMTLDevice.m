@@ -1,3 +1,5 @@
+#include <sys/mount.h>
+#include <os/lock.h>
 /*
  * NullMoth NVIDIA driver for macOS
  * Copyright (c) 2026 NullMoth Systems.
@@ -9,6 +11,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,14 +98,31 @@ const char *nvmtl_log_path(void) {
     }
     return path;
 }
+static void nvlog_emit(uint64_t rep, int report, const char *fmt, va_list a);
 void nvlog(const char *fmt, ...) {
     uint64_t rep; if (nvlog_dropped(fmt, &rep)) return;
-    char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
-    char t[640];
+    va_list a; va_start(a, fmt); nvlog_emit(rep, 0, fmt, a); va_end(a);
+}
+// Periodic reports (the 30 s surface-keep and pipelines lines) are rate-limited by their callers; through nvlog they
+// stopped after 8 lines per format (2026-11-19 out-39: no surface-keep report after 4 min of uptime). Release builds
+// keep them too (review of 43ccb65: the frame census, like the surface-keep and pipelines lines, was filtered out by
+// nvmtl_log_failure): one line per 30 s per report per process.
+void nvlog_report(const char *fmt, ...) {
+    va_list a; va_start(a, fmt); nvlog_emit(0, 1, fmt, a); va_end(a);
+}
+// Lines whose caller caps them (not periodic, e.g. the 32 "fc cache: slow miss" lines): no 8-per-format limit, and,
+// like nvlog, not in the release syslog unless they report a failure (review of fa238db)
+void nvlog_capped(const char *fmt, ...) {
+    va_list a; va_start(a, fmt); nvlog_emit(0, 0, fmt, a); va_end(a);
+}
+static void nvlog_emit(uint64_t rep, int report, const char *fmt, va_list a) {
+    char b[1024]; vsnprintf(b, sizeof b, fmt, a);
+    char t[1152];
     if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
     else     snprintf(t, sizeof t, "%s", b);
 #if NVMTL_RELEASE
     if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
+    else if (report) syslog(LOG_NOTICE, "NullMoth: %s", t);
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
     FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
@@ -361,6 +381,52 @@ static bool nvmtl_process_is_allowed(void)
     return ok;
 }
 
+// Surface-wrapper keys for -newTextureWithDescriptor:iosurface:plane: (see nvmtl_surface_keep).
+@interface NVMTLSurfKey : NSObject <NSCopying> { @public uint32_t _sid, _plane; uint64_t _w, _h, _fmt, _ropt, _fbo, _drawable; NSUInteger _hash; }
+@end
+@implementation NVMTLSurfKey
+- (id)copyWithZone:(NSZone *)zone { (void)zone; return self; }   // immutable
+- (NSUInteger)hash { return _hash; }
+- (BOOL)isEqual:(id)o {
+    if (o == self) return YES;
+    if (!o || object_getClass(o) != object_getClass(self)) return NO;
+    const NVMTLSurfKey *k = o;
+    return k->_sid == _sid && k->_plane == _plane && k->_w == _w && k->_h == _h && k->_fmt == _fmt && k->_ropt == _ropt
+        && k->_fbo == _fbo && k->_drawable == _drawable;
+}
+@end
+static inline uint64_t nvmtl_mix64(uint64_t x) {   // splitmix64 finaliser
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; return x ^ (x >> 31); }
+static NVMTLSurfKey *nvmtl_surf_key(uint32_t sid, uint32_t plane, uint64_t w, uint64_t h, uint64_t fmt, uint64_t ropt,
+                                    uint64_t fbo, uint64_t drawable) {
+    NVMTLSurfKey *k = [NVMTLSurfKey new];
+    k->_sid = sid; k->_plane = plane; k->_w = w; k->_h = h; k->_fmt = fmt; k->_ropt = ropt; k->_fbo = fbo; k->_drawable = drawable;
+    uint64_t x = nvmtl_mix64(((uint64_t)sid << 32) | plane);
+    x = nvmtl_mix64(x ^ (w << 32 | (h & 0xffffffffull)));
+    x = nvmtl_mix64(x ^ fmt ^ (ropt << 20) ^ (fbo << 40) ^ (drawable << 41));
+    k->_hash = (NSUInteger)x;
+    return k;
+}
+@interface NVMTLSurfKeep : NSObject { @public NVMTLTexture *_tex; uint64_t _last, _wrap; }
+@end
+@implementation NVMTLSurfKeep
+@end
+// Per keep table: the unused-plane-shadow rule's own clock and its adaptive timeout (see the sweep). effMs starts at
+// NVMTL_KEEP_SHADOW_MS; a window in which dropped frames came back (a pool whose reuse period is longer than the
+// timeout: each return is a full re-import and a new shadow) raises it past the measured period; it halves back toward
+// the base only after a window in which nothing came back and no entry sat between the base and the raised timeout (so a
+// slow pool the raise protects does not lose it every other window).
+@interface NVMTLShadowState : NSObject { @public uint64_t lastSweep, winStart, winDrops, winBack, winNeed, winHeld; long effMs; }
+@end
+@implementation NVMTLShadowState
+@end
+static char nvmtl_shadow_state_key;
+static NVMTLShadowState *nvmtl_shadow_state(NSDictionary *keep, long baseMs) {
+    NVMTLShadowState *st = objc_getAssociatedObject(keep, &nvmtl_shadow_state_key);
+    if (!st) { st = [NVMTLShadowState new]; st->effMs = baseMs; objc_setAssociatedObject(keep, &nvmtl_shadow_state_key, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    return st;
+}
+
 @implementation NVMTLDevice
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
@@ -479,14 +545,27 @@ static void nvmtl_install_hw_resource_pools(id dev)
 
 static void nvmtl_zero_new_buffer(NVMTLBuffer *b, NSUInteger len);
 static __thread int gZeroSkip;
+// Managed buffers in one CPU-visible allocation, no VRAM copy: the default on an integrated GPU, where VRAM and system
+// memory are the same DRAM and the copy only costs bandwidth. WindowServer's CoreAnimation vertex buffers are Managed:
+// ~430k uploads (14 GB) in its first 4 minutes on the 890M, ~21 per submit (docs/890M-TRACE.md part 11).
+// NVMTL_MANAGED_SYSMEM=0 keeps the VRAM copy, =1 forces one allocation on a discrete GPU too.
+int nvmtl_managed_sysmem(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_MANAGED_SYSMEM"); const int igpu = nvmtl_vk_integrated();
+        on = e ? (e[0] != '0') : igpu;
+        nvlog("managed buffers: %s (NVMTL_MANAGED_SYSMEM=%s, %s GPU)", on ? "ONE CPU-visible allocation, no VRAM copy" : "VRAM copy + CPU shadow, uploaded by didModifyRange",
+              e ? e : "unset", igpu ? "integrated" : "discrete"); }
+    return on;
+}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt {
     if (nvmtl_vk_init()) return nil;
     if (nvmtl_alloc_blocked()) return nil;
     NVMTLBuffer *b = [NVMTLBuffer new];
     b->_storage = (MTLStorageMode)((opt >> MTLResourceStorageModeShift) & 0xF);
     b->_ropt = opt & ((MTLResourceOptions)0xF | ((MTLResourceOptions)0x3 << MTLResourceHazardTrackingModeShift));
-    int hv = (b->_storage == MTLStorageModeShared) || (b->_storage == MTLStorageModeManaged && getenv("NVMTL_MANAGED_SYSMEM"));
-    if (nvmtl_vk_buffer_create(len, (hv && b->_storage == MTLStorageModeShared) ? 2 : hv, &b->_b)) {
+    const int msys = b->_storage == MTLStorageModeManaged && nvmtl_managed_sysmem();
+    int hv = (b->_storage == MTLStorageModeShared) || msys;
+    if (nvmtl_vk_buffer_create(len, hv ? 2 : 0, &b->_b)) {
         if (hv) { nvmtl_alloc_failed("newBufferWithLength"); nvlog("newBufferWithLength: FAILED"); return nil; }
         nvlog("newBufferWithLength:%lu private: VRAM refused - placing it in system memory", (unsigned long)len);
         if (nvmtl_vk_buffer_create(len, 1, &b->_b)) { nvmtl_alloc_failed("newBufferWithLength"); nvlog("newBufferWithLength: FAILED"); return nil; }
@@ -654,6 +733,11 @@ static NSData *nvmtl_varying_link(NVMTLFunction *vf, NVMTLFunction *ff) {
               vf->_fname.UTF8String ?: "?", ff->_fname.UTF8String ?: "?", moved, unmatched, told);
     return md;
 }
+// Core Image uses drawable identity to choose screen-oriented output coordinates (Photo Booth preview, upstream #471).
+static BOOL nvmtl_desc_drawable(MTLTextureDescriptor *d) {
+    SEL s = sel_registerName("isDrawable");
+    return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
+}
 static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     SEL s = sel_registerName("framebufferOnly");
     return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
@@ -672,7 +756,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     NVMTLTexture *t = [NVMTLTexture new];
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
-    t->_fbo = nvmtl_desc_fbo(d);
+    t->_fbo = nvmtl_desc_fbo(d); t->_drawable = nvmtl_desc_drawable(d);
     t->_fmt = d.pixelFormat;
     uint32_t dvk = 0, dasp = 0;
     if (nvmtl_depthfmt(d.pixelFormat, &dvk, &dasp) == 0) {
@@ -692,8 +776,14 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
         if (wantStex) { static _Atomic unsigned long msw; const unsigned long k = atomic_fetch_add(&msw, 1) + 1;
             if (!(k & (k - 1))) nvlog("newTextureWithDescriptor: %lu multisample texture(s) asked for ShaderWrite - created like Apple (M1/D300 create them); no storage view", k); }
         if (nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
-    } else
-    if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    } else {
+    const uint32_t lay = nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth);
+    const uint32_t key[NVMTL_IPARK_KEYN] = { 0x4950524bu, (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)a8,
+        d.mipmapLevelCount ? (uint32_t)d.mipmapLevelCount : 1u, (uint32_t)wantStex, (uint32_t)d.textureType, lay };
+    if (nvmtl_vk_image_unpark(key, &t->_i) &&
+        nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, lay, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    memcpy(t->_pkey, key, sizeof key); t->_dparkable = YES;
+    }
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
     t->_stex = t->_i.storage != 0;
@@ -740,9 +830,192 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
-static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
-                                      uint32_t vkf, uint32_t bpp, int a8, int stex)
+// Planes of a multi-plane surface (camera and video frames: 420v/420f/x420 from CoreMediaIO and VideoToolbox) on an
+// AMD APU: like the single-plane path below, the GPU reads the plane in the surface's own pages, here one host import of
+// the whole surface per plane wrapper, with the image at the plane's offset. Their rows are rarely 256 B multiples
+// (Photo Booth's 1920x1080 camera frames: 2884-2904 B), so the image is a shadow (nvmtl_btsh in nvmtl_vk.c): each
+// command buffer that uses it copies the plane's rows into it on the GPU before it runs. Before this every plane
+// wrapper was a private image filled on the CPU, a submit and a wait per copy: ~400 copies and ~600 MB/s in Photo Booth
+// at 30 fps (docs/890M-TRACE.md). A wrapper whose descriptor allows writes (RenderTarget, ShaderWrite or Unknown) also
+// copies its rows back at the end of each command buffer; a read-only one never touches the surface.
+// On in WindowServer too (2026-11-08): it composites every app's video planes, and with private images each 1080p60
+// NV12 frame was two CPU uploads (G13 surface-in, ~118 a second) with a submit and a wait each on its main thread,
+// WindowServer ~66 % CPU for one local VP9 clip in Chrome. A compositor wrapper only reads, so the import is read-only
+// and nothing is written back. NVMTL_PLANE_HOST=0 or NVMTL_NO_PLANE_HOST=1 keeps the private images.
+static int nvmtl_plane_host_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_PLANE_HOST");
+                  on = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST") && !getenv("NVMTL_NO_PLANE_HOST")
+                       && (e ? e[0] == '1' : 1);
+                  nvlog("surface planes: %s", on ? "host import of the surface's own pages, shadowed on the GPU (NVMTL_NO_PLANE_HOST=1: private copies)"
+                                                   : "private images copied in and out"); }
+    return on;
+}
+static unsigned long long g_plane_host, g_plane_host_ro;
+// Whether this process may write every page of [base, base + span). A surface another process owns can be mapped
+// read-only here (mediaanalysisd running Live Text on a Preview screenshot, 2026-11-07 23:18). The kernel then pins
+// those pages read-only for the GPU (amdgpu userptr, fork Step96: a write pin that fails is retried read-only), so a
+// writable wrapper over them made the GPU write read-only PTEs: gfxhub PERMISSION_FAULTS, a hung GFX ring, and
+// WindowServer's backend gave up after 5 s (its next screen capture aborted). NVMTL_SURF_RO_CHECK=0 skips the check.
+static int nvmtl_span_writable(uintptr_t base, size_t span) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_RO_CHECK"); on = !(e && e[0] == '0'); }
+    if (!on) return 1;
+    mach_vm_address_t a = base; const mach_vm_address_t end = base + span;
+    while (a < end) {
+        mach_vm_address_t ra = a; mach_vm_size_t rs = 0; vm_region_basic_info_data_64_t info; mach_port_t obj = MACH_PORT_NULL;
+        mach_msg_type_number_t n = VM_REGION_BASIC_INFO_COUNT_64;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &n, &obj) != KERN_SUCCESS) return 0;
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+        if (ra > a || !(info.protection & VM_PROT_WRITE)) return 0;   // a hole, or a page this process cannot write
+        a = ra + rs;
+    }
+    return 1;
+}
+static unsigned long long g_surf_ro_maps, g_surf_prefault;
+// Fault every page of a writable span in for writing before a writable host import, without changing a byte (lock or
+// of 0). The kernel pins a userptr for writing only over resident, writable pages; a fresh IOSurface's untouched pages
+// failed that pin, the kernel retried it read-only (amdgpu userptr, fork Step96: `userptr_ro_retry -> 0`, dozens per
+// boot in WindowServer) and the GPU then wrote read-only PTEs: mediaanalysisd's own new 420f surface, 2026-11-08
+// 12:42:49, gfxhub PERMISSION_FAULTS, GFX ring hung 3 s. Only after nvmtl_span_writable said yes (a read-only page
+// would take SIGBUS here). NVMTL_PREFAULT=0 skips it.
+static void nvmtl_prefault_write(uintptr_t base, size_t span) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_PREFAULT"); on = !(e && e[0] == '0'); }
+    if (!on || !span) return;
+    const size_t pg = (size_t)getpagesize();
+    for (uintptr_t p = base & ~(uintptr_t)(pg - 1); p < base + span; p += pg)
+        __asm__ volatile("lock orb $0, (%0)" :: "r"(p) : "memory");
+    g_surf_prefault++;
+    if (g_surf_prefault == 1 || g_surf_prefault % 5000 == 0)
+        nvlog("surface prefault: %llu writable host imports faulted in for writing first (%zu KB this one)", g_surf_prefault, span >> 10);
+}
+// ga403wm Step137: tell NMXGPU that [base, base + span) is this IOSurface, so the userptr import that follows pins the
+// surface's own memory descriptor instead of faulting the range in through this process's map (one VM fault per page
+// here in the prefault and again in the kernel wire: ~7 % of a core in WindowServer while an app animates). The
+// kernel checks the claim (the range's first page must be the surface's first page) and otherwise wires the range as
+// before. Only that first page is faulted in here. A kernel without the ioctl (before NMXGPU out-18) answers EINVAL
+// once, and the hint is then off for the process. NVMTL_SURF_HINT=0 turns it off.
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <errno.h>
+struct nvmtl_surf_hint_args { uint64_t addr, size; uint32_t surface_id, pad; };
+#define NVMTL_DRM_IOCTL_SURF_HINT _IOW('d', 0x40 + 0x5e, struct nvmtl_surf_hint_args)
+static unsigned long long g_surf_hint_ok, g_surf_hint_fail;
+// ga403wm video-lag: a browser GPU process's sandbox refuses /dev/dri, so the plain open() left the hint off there and
+// every decoded video frame took the per-page prefault (98 of 999 Chrome GPU main-thread samples, YouTube 1080p60).
+// The node is opened and the hint sent through the same wrappers RADV uses (nvmtl_drm_xnu.h, below): the real node
+// where the sandbox allows it, else an NMXAccel NMDR connection whose ioctls run on the caller's thread, which is what
+// the kernel's per-task hint needs.
+static int nvmtl_drmx_w_open(const char *path, int flags, ...);
+static int nvmtl_drmx_w_ioctl(int fd, unsigned long cmd, ...);
+static int nvmtl_drmx_w_close(int fd);
+static int nvmtl_surface_hint(IOSurfaceRef surf, uintptr_t base, size_t span, int write) {
+    static int fd = -2;
+    if (fd == -2) {
+        const char *e = getenv("NVMTL_SURF_HINT");
+        fd = (e && e[0] == '0') ? -1 : nvmtl_drmx_w_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        nvlog("surface hint: %s", fd >= 0 ? "on (NMXGPU pins the IOSurface's own memory)" : "off");
+    }
+    if (fd < 0 || !surf || !span) return -1;
+    if (write) nvmtl_prefault_write(base, (size_t)getpagesize());   // the kernel's check wires this page for writing
+    struct nvmtl_surf_hint_args a = { base, span, (uint32_t)IOSurfaceGetID(surf), 0 };
+    if (nvmtl_drmx_w_ioctl(fd, NVMTL_DRM_IOCTL_SURF_HINT, &a) != 0) {
+        int err = errno;
+        if (++g_surf_hint_fail <= 4) nvlog("surface hint: refused (%s)%s", strerror(err), err == EINVAL || err == ENOTTY || err == ENOTSUP ? ", off for this process" : "");
+        if (err == EINVAL || err == ENOTTY || err == ENOTSUP) { nvmtl_drmx_w_close(fd); fd = -1; }
+        return -1;
+    }
+    if (++g_surf_hint_ok == 1 || g_surf_hint_ok % 5000 == 0) nvlog("surface hint: %llu imports hinted (%zu KB this one)", g_surf_hint_ok, span >> 10);
+    return 0;
+}
+static void nvmtl_surf_ro_log(IOSurfaceRef surf, NSUInteger plane, int rw) {
+    g_surf_ro_maps++;
+    static unsigned said; if (said++ < 8 || g_surf_ro_maps % 1000 == 0)
+        nvlog("surface %u plane %lu: mapping is read-only in this process, %s (%llu so far)", (unsigned)IOSurfaceGetID(surf),
+              (unsigned long)plane, rw ? "writable wrapper uses a private image" : "read-only host import", g_surf_ro_maps);
+}
+static int nvmtl_plane_host_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
+                                   uint32_t vkf, uint32_t bpp, int a8, int stex, int rw)
 {
+    if (!bpp) bpp = 4;
+    const size_t al = nvmtl_vk_host_import_align(), alloc = IOSurfaceGetAllocSize(surf);
+    const uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surf), pb = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surf, (uint32_t)plane);
+    const size_t row = IOSurfaceGetBytesPerRowOfPlane(surf, (uint32_t)plane);
+    const char *why = NULL;
+    if (!base || !pb || !al || !alloc) why = "no base address";
+    else if (base & (al - 1)) why = "base not page aligned";
+    else if (pb < base || pb - base >= alloc) why = "plane outside the allocation";
+    else if (!row || row < (size_t)w * bpp || row % bpp || (pb - base) % bpp) why = "row pitch";
+    else if (h > IOSurfaceGetHeightOfPlane(surf, (uint32_t)plane) || (size_t)w > IOSurfaceGetWidthOfPlane(surf, (uint32_t)plane)) why = "image larger than the plane";
+    else if ((pb - base) + row * (h - 1) + (size_t)w * bpp > alloc) why = "rows pass the allocation";
+    if (why) { static unsigned said; if (said++ < 8) nvlog("surface %u plane %lu %ux%u: no host import (%s; row %zu, offset %zu, alloc %zu)",
+                   (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, why, row, (size_t)(pb - base), alloc); return -1; }
+    const size_t span = (alloc + al - 1) & ~(al - 1);
+    // WS-CPU item 4 (2026-11-19): every refusal below says why. WindowServer's 3840x2160 two-plane 10-bit surfaces (row
+    // 11524) fell to private images (two CPU uploads per frame) with none of the checks above logging a reason.
+    static _Atomic unsigned nlate;
+#define NVMTL_PLANE_LATE(WHY) do { if (atomic_fetch_add(&nlate, 1) < 16) nvlog("surface %u plane %lu %ux%u fmt '%.4s' vk %u bpp %u: no host import (%s; row %zu, offset %zu, alloc %zu, span %zu, rw %d)", \
+        (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, (const char *)&(uint32_t){ OSSwapHostToBigInt32(IOSurfaceGetPixelFormat(surf)) }, vkf, bpp, \
+        (WHY), row, (size_t)(pb - base), alloc, span, rw); } while (0)
+    if (!nvmtl_span_writable(base, span)) { nvmtl_surf_ro_log(surf, plane, rw); if (rw) { NVMTL_PLANE_LATE("writable wrapper over a read-only mapping"); return -1; } }
+    else if (rw && nvmtl_surface_hint(surf, base, span, 1)) nvmtl_prefault_write(base, span);
+    if (!rw) (void)nvmtl_surface_hint(surf, base, span, 0);
+    nvk_buffer hb;
+    if (nvmtl_vk_buffer_import_host((void *)base, span, &hb)) { NVMTL_PLANE_LATE("host-pointer import"); return -1; }
+    if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, rw && stex, rw, &hb, pb - base, row, &t->_i)) {
+        NVMTL_PLANE_LATE("linear alias or shadow image");
+        nvmtl_vk_buffer_destroy(&hb); return -1; }
+#undef NVMTL_PLANE_LATE
+    t->_hostBuf = hb; t->_hostOn = YES; t->_hostRO = !rw; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+    t->_hostSL = nvmtl_vk_surface_list_mark(&t->_hostBuf) ? YES : NO;
+    // a read-only shadow (plane start or pitch not on 256 B) copies only when the surface's seed moved (WS-CPU 8.6)
+    if (!rw) (void)nvmtl_vk_image_btsh_watch_surface(&t->_i, (void *)surf);
+    g_plane_host++; g_plane_host_ro += !rw;
+    static unsigned said; if (said++ < 8 || g_plane_host % 2000 == 0)
+        nvlog("surface %u plane %lu %ux%u pitch %zu at +%zu (%zu plane(s), fmt '%.4s') -> its own pages (host import, %s; %llu planes, %llu read-only)",
+              (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h, row, (size_t)(pb - base), IOSurfaceGetPlaneCount(surf),
+              (const char *)&(uint32_t){ OSSwapHostToBigInt32(IOSurfaceGetPixelFormat(surf)) }, rw ? "written back after each command buffer" : "read-only",
+              g_plane_host, g_plane_host_ro);
+    return 0;
+}
+static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
+                                      uint32_t vkf, uint32_t bpp, int a8, int stex, int rw)
+{
+    // AMD APU (Radeon 780M): the GPU renders and samples the IOSurface's own pages, a linear image over the surface's
+    // allocation imported as host memory (VK_EXT_external_memory_host), so nothing is copied in or out. Without it
+    // WindowServer read each composited 2560x1600 frame back with memmove: ~12 ms and ~1.3 GB/s of its CPU, and the
+    // panel then copied the write-combined result again (2026-10-20). NVMTL_NO_SURFACE_HOST=1 keeps the copies.
+    static int hostOn = -1;
+    if (hostOn < 0) hostOn = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST");
+    if (hostOn && surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1) {
+        void *base = IOSurfaceGetBaseAddress(surf);
+        const size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
+        // the surface is mapped in whole pages: its allocation rounded up to the import alignment is still its own
+        const size_t alloc = IOSurfaceGetAllocSize(surf), span = al ? (alloc + al - 1) & ~(al - 1) : 0;
+        if (base && al && !((uintptr_t)base & (al - 1)) && alloc && (size_t)w * (bpp ? bpp : 4) <= row
+            && h <= sh && row % 32 == 0 && row * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
+            // read-only mapping: a read-only wrapper still imports (read-only, never widened), a writable one goes on
+            const int wr = nvmtl_span_writable((uintptr_t)base, span);
+            if (!wr) nvmtl_surf_ro_log(surf, plane, rw);
+            // this path's image is always writable; a hinted import pins the surface's memory and needs no prefault
+            if (nvmtl_surface_hint(surf, (uintptr_t)base, span, wr) && wr) nvmtl_prefault_write((uintptr_t)base, span);
+            nvk_buffer hb;
+            if ((wr || !rw) && !nvmtl_vk_buffer_import_host(base, span, &hb)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, wr ? stex : 0, wr, &hb, 0, row, &t->_i)) {
+                    t->_hostBuf = hb; t->_hostOn = YES; t->_hostRO = !wr; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+                    t->_hostSL = nvmtl_vk_surface_list_mark(&t->_hostBuf) ? YES : NO;
+                    static unsigned long long nh; static unsigned said;
+                    if (said++ < 8 || ++nh % 2000 == 0)
+                        nvlog("surface %u %ux%u pitch %zu -> its own pages (host import, no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
+                    return 0;
+                }
+                nvmtl_vk_buffer_destroy(&hb);
+            }
+        }
+    }
+    if (surf && (plane != 0 || IOSurfaceGetPlaneCount(surf) > 1) && nvmtl_plane_host_on()
+        && !nvmtl_plane_host_create(t, surf, plane, w, h, vkf, bpp, a8, stex, rw)) return 0;
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
@@ -777,7 +1050,404 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
 }
 
-static char nvmtl_surface_cache_key;
+static char nvmtl_surface_cache_key, nvmtl_surface_keep_key;
+// A surface's backing (a private image, or the surface's own pages imported for the GPU) lives as long as the application
+// keeps the surface, not just as long as one of its wrappers: CoreImage makes a new MTLTexture for every pass over a
+// pooled IOSurface and lets the previous one go first, and with only the weak cache entry the next pass would get a fresh
+// image uploaded from the surface's memory rather than the image the previous pass wrote. CoreAnimation's flatten cache
+// does the same every frame, and each new wrapper imported 0.5-4 MB again (wired, GPU-mapped, unmapped, freed: ~2.5 per
+// frame, a sixth of WindowServer's frame time, 2026-10-21). The backing holds the surface, so its ID cannot be reused
+// while the entry stands; entries whose surface only the backing still holds are dropped at the next insert.
+// Called under @synchronized(device).
+//
+// A host-imported backing (the surface's own pages, pinned and GPU-mapped by the kernel) is also kept for a while after
+// the application lets the surface go. Clients render into a pool of 2-3 IOSurfaces and WindowServer only holds the
+// one on screen, so dropping an entry as soon as its surface is unheld re-imported a 2880x1800 surface (5085 pages
+// pinned, then put) every frame: ~20% of WindowServer's main thread on the 890M (docs/890M-TRACE.md Step93). Unheld
+// host entries stay for NVMTL_KEEP_MS (default 30000) and at most NVMTL_KEEP_IDLE (default 48) of them; the backing
+// still holds the surface, so its memory and ID stay valid meanwhile.
+//
+// The maps are keyed by NVMTLSurfKey, not by an NSArray of NSNumbers: -[NSArray hash] is the element count, so every
+// 7-field key hashed to 7 and each lookup was a linear scan of isEqualToArray: compares. With the sweep below doing
+// two lookups per entry on every insert, one miss cost O(n^2) NSNumber compares: 2.5 ms at 200 entries, 10.5 ms at
+// 400, ~63 % of WindowServer's main thread during 60 fps Edge video (docs/890M-TRACE.md, Edge video lag part 2).
+// The last-used time lives in the keep entry itself (the old separate `used` map also kept a stamp for every key
+// ever touched after its keep entry went).
+// Miss accounting, so a boot log says why WindowServer imports a surface again (a new surface, the same surface
+// under another key, or a surface whose entry the sweep dropped, and why). Under @synchronized(device) like the rest.
+enum { NVMTL_GONE_UNHELD = 1, NVMTL_GONE_EXPIRED = 2, NVMTL_GONE_CAP = 3, NVMTL_GONE_DEAD = 4, NVMTL_GONE_SHADOW = 5 };
+static struct { uint64_t hits, misses, fresh, otherKey, gone[6], shadowDrops, shadowBytes, shadowBack[4], deadDrops, deadBytes, sweeps, sweepNsMax, sweepNsSum, logged, lastLogMs, drops, idleBytes, maxSweepDrops,
+                expBack[4], expLogged, heldRefresh, viewRefresh, useRefresh, capBack[4], capLogged, sweepSkips, okLogged; } nvmtl_sk;
+// surface ID -> (drop time ms << 20) | idle ms at the drop (clamped), so an expired miss says how long the entry had been
+// idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
+static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropAt;
+static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_gone;   // surface ID -> why its last entry went
+static NSMutableDictionary<NSNumber *, NSNumber *> *nvmtl_sk_dropTab; // surface ID -> the keep table that dropped it (a
+                                                                      // return counts toward that table's raise only)
+static NSCountedSet<NSNumber *> *nvmtl_sk_live;                      // surface IDs with an entry in keep
+static uint64_t nvmtl_keep_now_ms(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull; }
+static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
+    if (!nvmtl_sk.lastLogMs) { nvmtl_sk.lastLogMs = now; return; }
+    if (now - nvmtl_sk.lastLogMs < 30000) return;
+    nvlog_report("surface keep: %llu s: hits %llu, misses %llu (new surface %llu, same surface other key %llu, after drop: "
+          "unheld %llu, expired %llu, idle cap %llu, dead %llu), %lu entries, sweep avg %llu us max %llu us; %llu dropped (released off the "
+          "main thread), idle %llu MB at the last sweep, slowest sweep dropped %llu; expired came back < 250 ms %llu, < 1 s %llu, "
+          "< 3 s %llu, later %llu; held entries refreshed %llu (by a live wrapper %llu, by IOSurfaceIsInUse %llu); idle-cap drops came back < 250 ms %llu, "
+          "< 1 s %llu, < 3 s %llu, later %llu; sweeps skipped (rate limit) %llu; dead entries dropped at once %llu (%llu MB); "
+          "unused plane shadows dropped %llu (%llu MB), came back < 1 s %llu, < 3 s %llu, < 10 s %llu, later %llu; their timeout %ld ms",
+          (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.hits, nvmtl_sk.misses, nvmtl_sk.fresh,
+          nvmtl_sk.otherKey, nvmtl_sk.gone[NVMTL_GONE_UNHELD], nvmtl_sk.gone[NVMTL_GONE_EXPIRED], nvmtl_sk.gone[NVMTL_GONE_CAP], nvmtl_sk.gone[NVMTL_GONE_DEAD],
+          (unsigned long)keep.count, nvmtl_sk.sweeps ? nvmtl_sk.sweepNsSum / nvmtl_sk.sweeps / 1000 : 0,
+          nvmtl_sk.sweepNsMax / 1000, nvmtl_sk.drops, nvmtl_sk.idleBytes >> 20, nvmtl_sk.maxSweepDrops,
+          nvmtl_sk.expBack[0], nvmtl_sk.expBack[1], nvmtl_sk.expBack[2], nvmtl_sk.expBack[3], nvmtl_sk.heldRefresh, nvmtl_sk.viewRefresh, nvmtl_sk.useRefresh,
+          nvmtl_sk.capBack[0], nvmtl_sk.capBack[1], nvmtl_sk.capBack[2], nvmtl_sk.capBack[3], nvmtl_sk.sweepSkips, nvmtl_sk.deadDrops, nvmtl_sk.deadBytes >> 20,
+          nvmtl_sk.shadowDrops, nvmtl_sk.shadowBytes >> 20, nvmtl_sk.shadowBack[0], nvmtl_sk.shadowBack[1], nvmtl_sk.shadowBack[2], nvmtl_sk.shadowBack[3],
+          ((NVMTLShadowState *)objc_getAssociatedObject(keep, &nvmtl_shadow_state_key)) ? ((NVMTLShadowState *)objc_getAssociatedObject(keep, &nvmtl_shadow_state_key))->effMs : 0L);
+    const uint64_t logged = nvmtl_sk.logged;
+    memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
+}
+static void nvmtl_sk_miss(NSDictionary *keep, NVMTLSurfKey *key) {
+    nvmtl_sk.misses++;
+    NSNumber *sid = @(key->_sid);
+    const char *why;
+    if ([nvmtl_sk_live countForObject:sid]) { nvmtl_sk.otherKey++; why = "same surface, other key";
+        if (nvmtl_sk.okLogged++ < 6)   // per 30 s report: which key field differs from the entry already kept for this surface
+            for (NVMTLSurfKey *o in keep) if (o->_sid == key->_sid) {
+                nvlog("surface keep: other-key miss: surface %u: new plane %u %llux%llu fmt %llu ropt 0x%llx fbo %llu drawable %llu; "
+                      "kept plane %u %llux%llu fmt %llu ropt 0x%llx fbo %llu drawable %llu", key->_sid,
+                      key->_plane, (unsigned long long)key->_w, (unsigned long long)key->_h, (unsigned long long)key->_fmt,
+                      (unsigned long long)key->_ropt, (unsigned long long)key->_fbo, (unsigned long long)key->_drawable,
+                      o->_plane, (unsigned long long)o->_w, (unsigned long long)o->_h, (unsigned long long)o->_fmt,
+                      (unsigned long long)o->_ropt, (unsigned long long)o->_fbo, (unsigned long long)o->_drawable);
+                break; } }
+    else {
+        const unsigned g = [nvmtl_sk_gone[sid] unsignedIntValue];
+        if (g >= 1 && g <= 5) { nvmtl_sk.gone[g]++; why = g == NVMTL_GONE_UNHELD ? "dropped: unheld" : g == NVMTL_GONE_EXPIRED ? "dropped: expired" : g == NVMTL_GONE_DEAD ? "dropped: dead"
+                                     : g == NVMTL_GONE_SHADOW ? "dropped: unused plane shadow" : "dropped: idle cap";
+            const uint64_t at = [nvmtl_sk_dropAt[sid] unsignedLongLongValue], now = nvmtl_keep_now_ms();
+            const uint64_t back = at ? now - (at >> 20) : 0, idleAtDrop = at & 0xfffff;
+            if (g == NVMTL_GONE_SHADOW) {
+                nvmtl_sk.shadowBack[back < 1000 ? 0 : back < 3000 ? 1 : back < 10000 ? 2 : 3]++;
+                // A frame back within 10 s of its drop: the pool cycles slower than the timeout. Its reuse period is about
+                // the timeout it was dropped at plus this gap; the sweep's window check raises the timeout past it.
+                // The raise is per keep table (one per device), not per pool: every pool the table holds shares it.
+                NVMTLShadowState *st = objc_getAssociatedObject(keep, &nvmtl_shadow_state_key);
+                const BOOL sameTab = [nvmtl_sk_dropTab[sid] unsignedLongLongValue] == (unsigned long long)(uintptr_t)(__bridge void *)keep;
+                if (st && sameTab && back < 10000) { st->winBack++; const uint64_t need = ((uint64_t)st->effMs + back) * 5 / 4 + 1000; if (need > st->winNeed) st->winNeed = need; }
+            }
+            if (g == NVMTL_GONE_EXPIRED) {
+                nvmtl_sk.expBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
+                if (nvmtl_sk.expLogged++ < 6)   // per 30 s report: which surfaces come back after expiring
+                    nvlog("surface keep: expired miss: surface %u plane %u %llux%llu fmt %llu fbo %llu, idle %llu ms at the drop, back after %llu ms",
+                          key->_sid, key->_plane, (unsigned long long)key->_w, (unsigned long long)key->_h, (unsigned long long)key->_fmt,
+                          (unsigned long long)key->_fbo, (unsigned long long)idleAtDrop, (unsigned long long)back);
+            } else if (g == NVMTL_GONE_CAP) {
+                nvmtl_sk.capBack[back < 250 ? 0 : back < 1000 ? 1 : back < 3000 ? 2 : 3]++;
+                if (nvmtl_sk.capLogged++ < 6)   // per 30 s report: which surfaces the idle cap pushed out and got back
+                    nvlog("surface keep: idle-cap miss: surface %u plane %u %llux%llu fmt %llu fbo %llu, idle %llu ms at the drop, back after %llu ms",
+                          key->_sid, key->_plane, (unsigned long long)key->_w, (unsigned long long)key->_h, (unsigned long long)key->_fmt,
+                          (unsigned long long)key->_fbo, (unsigned long long)idleAtDrop, (unsigned long long)back);
+            } }
+        else { nvmtl_sk.fresh++; why = "new surface"; }
+    }
+    if (nvmtl_sk.logged < 12) { nvmtl_sk.logged++;
+        nvlog("surface keep: miss (%s): surface %u plane %u %llux%llu fmt %llu ropt 0x%llx fbo %llu", why, key->_sid,
+              key->_plane, (unsigned long long)key->_w, (unsigned long long)key->_h, (unsigned long long)key->_fmt,
+              (unsigned long long)key->_ropt, (unsigned long long)key->_fbo); }
+}
+// A dropped entry's texture is released on a background queue: its dealloc unpins and unmaps the surface's pages and
+// frees the BO (ioctls, tens of ms for a burst of 2880x1800 surfaces), and the sweep runs on WindowServer's main
+// thread under @synchronized(device): 69-95 ms sweeps in the 30 s reports (docs/890M-TRACE.md part 10).
+static NSMutableArray *nvmtl_sk_bag;
+static void nvmtl_sk_drop(NSMutableDictionary *keep, NVMTLSurfKey *k, unsigned why) {
+    NVMTLSurfKeep *old = keep[k];
+    if (old) { if (!nvmtl_sk_bag) nvmtl_sk_bag = [NSMutableArray new]; [nvmtl_sk_bag addObject:old]; }
+    nvmtl_sk.drops++;
+    [keep removeObjectForKey:k];
+    NSNumber *sid = @(k->_sid);
+    [nvmtl_sk_live removeObject:sid];
+    if (nvmtl_sk_gone.count > 4096) [nvmtl_sk_gone removeAllObjects];
+    nvmtl_sk_gone[sid] = @(why);
+    if (!nvmtl_sk_dropAt || nvmtl_sk_dropAt.count > 4096) nvmtl_sk_dropAt = [NSMutableDictionary new];
+    const uint64_t now = nvmtl_keep_now_ms(), idle = old ? MIN(now - old->_last, (uint64_t)0xfffff) : 0;
+    nvmtl_sk_dropAt[sid] = @((now << 20) | idle);
+    if (!nvmtl_sk_dropTab || nvmtl_sk_dropTab.count > 4096) nvmtl_sk_dropTab = [NSMutableDictionary new];
+    nvmtl_sk_dropTab[sid] = @((unsigned long long)(uintptr_t)(__bridge void *)keep);
+}
+// The nvmtl_sk* statistics and bookkeeping (and the sweep's statics) are process-wide while each device's table is
+// guarded by @synchronized(device): two devices in one process (review of 7ceff16) would mutate them concurrently, so
+// they take this lock too, always inside the device lock (device -> g_sk_lock, never the other way).
+static pthread_mutex_t g_sk_lock = PTHREAD_MUTEX_INITIALIZER;
+// Inserting over an existing entry would release the old texture (its Vulkan image and IOSurface) right here, under
+// the device lock and g_sk_lock: the old entry goes to the bag first, released off this thread (review of 5246c6f).
+static void nvmtl_sk_put(NSMutableDictionary *keep, NVMTLSurfKey *key, NVMTLSurfKeep *e) {
+    NVMTLSurfKeep *old = keep[key];
+    if (old) { if (!nvmtl_sk_bag) nvmtl_sk_bag = [NSMutableArray new]; [nvmtl_sk_bag addObject:old]; }
+    else [nvmtl_sk_live addObject:@(key->_sid)];
+    keep[key] = e;
+}
+static void nvmtl_sk_release_bag(void);
+static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
+    pthread_mutex_lock(&g_sk_lock);
+    NSMutableDictionary *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
+    NVMTLSurfKeep *e = keep[key];
+    if (e) e->_last = e->_wrap = nvmtl_keep_now_ms();
+    nvmtl_sk.hits++;
+    if (keep) nvmtl_sk_report(keep, e ? e->_last : nvmtl_keep_now_ms());
+    pthread_mutex_unlock(&g_sk_lock);
+}
+static void nvmtl_sk_release_bag(void) {
+    if (!nvmtl_sk_bag.count) return;
+    /* The bag moves into the block's __block storage (the only strong reference once this frame returns) and the block
+       drops it itself on q: the release, and the textures' deallocs, run there, never on the caller (review of 27611e6). */
+    __block NSArray *bag = nvmtl_sk_bag; nvmtl_sk_bag = nil;
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.surface-keep.release", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    dispatch_async(q, ^{ bag = nil; });
+}
+static size_t nvmtl_sk_bytes(NVMTLTexture *b) { return b->_surf ? IOSurfaceGetAllocSize(b->_surf) : 0; }
+// Idle (unheld, host-imported) entries: at least NVMTL_KEEP_IDLE (48), then up to NVMTL_KEEP_IDLE_MB (1024 MB) of
+// surface memory, never more than NVMTL_KEEP_IDLE_MAX (2048; was 512, which keep30 hit at 600 entries / 503 MB). With 48 flat, a desktop with many windows (each app
+// rendering into a pool of 2-3 surfaces, WindowServer holding only the one on screen) evicted surfaces that came
+// back a frame later: ~1000 re-imports per 30 s, each a pin + GPU map + unmap + free. NVMTL_KEEP_MS (3 s) still drops
+// every idle entry the GPU has not touched for that long, so the extra room only holds surfaces in use.
+// 2026-11-08 YouTube spindump: 46 % of the WS main thread was re-imports of entries idle 4-9 s at the drop (mostly
+// 2880x1800 layers) that came back right after; NVMTL_KEEP_MS is now 30 s, NVMTL_KEEP_IDLE_MAX / _MB still bound it.
+static void nvmtl_surface_keep_timer(id dev);
+static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t);
+// key == nil: a sweep only (the idle timer below), nothing inserted and no miss counted. Called under @synchronized(dev).
+static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
+    pthread_mutex_lock(&g_sk_lock);
+    nvmtl_surface_keep_locked(dev, key, t);
+    pthread_mutex_unlock(&g_sk_lock);
+}
+static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
+    static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1, sweepMs = -1, keepSmallMs = -1, smallBytes = -1, keepShadowMs = 0; static uint64_t keepIdleBytes, lastSweep; static int dropDead = -1; static long keepShadowMaxMs = 0;
+    if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 30000;
+                      e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48;
+                      e = getenv("NVMTL_KEEP_IDLE_MAX"); keepIdleMax = e ? atol(e) : 2048; if (keepIdleMax < keepIdle) keepIdleMax = keepIdle;
+                      e = getenv("NVMTL_KEEP_IDLE_MB"); keepIdleBytes = (uint64_t)(e ? atol(e) : 1024) << 20;
+                      e = getenv("NVMTL_KEEP_VIEW_MS"); keepViewMs = e ? atol(e) : 60000;
+                      e = getenv("NVMTL_KEEP_SWEEP_MS"); sweepMs = e ? atol(e) : 100;
+                      e = getenv("NVMTL_KEEP_SMALL_MS"); keepSmallMs = e ? atol(e) : 120000;
+                      e = getenv("NVMTL_KEEP_SMALL_KB"); smallBytes = (e ? atol(e) : 2048) * 1024;
+                      // Dead entries (see the sweep) go at once outside WindowServer; NVMTL_KEEP_DEAD=0/1 overrides.
+                      e = getenv("NVMTL_KEEP_DEAD"); dropDead = e ? e[0] == '1' : strcmp(getprogname(), "WindowServer") != 0;
+                      e = getenv("NVMTL_KEEP_SHADOW_MS"); keepShadowMs = e ? atol(e) : 3000;
+                      e = getenv("NVMTL_KEEP_SHADOW_MAX_MS"); keepShadowMaxMs = e ? atol(e) : keepViewMs; if (keepShadowMaxMs < keepShadowMs) keepShadowMaxMs = keepShadowMs;
+                      if (keepShadowMaxMs > 3600000) keepShadowMaxMs = 3600000;   /* 1 h: keeps old * 2 below in range (review of 84e17be) */
+                      nvlog("surface keep: a read-only plane's GPU shadow (plane start or pitch off 256 B: a full copy of the plane) is dropped "
+                            "%ld ms after its last use by a command buffer, held or not (NVMTL_KEEP_SHADOW_MS, 0 = never); raised up to %ld ms while dropped "
+                            "frames come back (NVMTL_KEEP_SHADOW_MAX_MS)", keepShadowMs, keepShadowMaxMs);
+                      nvlog("surface keep: dead entries %s (NVMTL_KEEP_DEAD)", dropDead ? "dropped at once" : "kept to the idle rules");
+                      nvlog("surface keep: idle entries kept for %ld ms, at least %ld, then up to %llu MB, at most %ld "
+                            "(NVMTL_KEEP_MS / NVMTL_KEEP_IDLE / NVMTL_KEEP_IDLE_MB / NVMTL_KEEP_IDLE_MAX); drops released off the main thread",
+                            keepMs, keepIdle, (unsigned long long)(keepIdleBytes >> 20), keepIdleMax); }
+    NSMutableDictionary<NVMTLSurfKey *, NVMTLSurfKeep *> *keep = objc_getAssociatedObject(dev, &nvmtl_surface_keep_key);
+    if (!keep) { keep = [NSMutableDictionary new]; objc_setAssociatedObject(dev, &nvmtl_surface_keep_key, keep, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    if (!nvmtl_sk_live) { nvmtl_sk_live = [NSCountedSet new]; nvmtl_sk_gone = [NSMutableDictionary new]; }
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW), now = t0 / 1000000ull;
+    nvmtl_surface_keep_timer(dev);
+    if (key) nvmtl_sk_miss(keep, key);
+    // The sweep walks every entry (849 us average at 600 entries, YouTube 2026-11-08). Once per NVMTL_KEEP_SWEEP_MS
+    // (100 ms) is enough for 30 s idle times; a table well over the cap sweeps at once.
+    if (key && now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8) {
+        nvmtl_sk.sweepSkips++;
+        NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
+        nvmtl_sk_put(keep, key, e);
+        nvmtl_sk_release_bag();
+        nvmtl_sk_report(keep, now);
+        return;
+    }
+    lastSweep = now;
+    NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new], *dead = [NSMutableArray new], *unshadow = [NSMutableArray new];
+    // Unused plane shadows (2026-11-23, working load: Edge 4K 10-bit video): an x420 plane starts at +64 in its surface, so
+    // each read-only plane texture carries a full GPU copy of the plane (nvmtl_btsh; a 4K frame's two planes = 25 MB of
+    // GTT pages, wired). The entries below that a held surface keeps alive for NVMTL_KEEP_VIEW_MS after their last wrap
+    // held 70 such frames in WindowServer (1.74 GB, the whole of its 1.76 GB of idle GPU memory) while the decoder cycled
+    // far fewer. A frame that comes back after the drop is imported again, and its rows are copied in as they would be
+    // anyway after a new decode (the seed moved). Only entries nothing else holds a texture of (retain count 1), checked
+    // once a second per table (a linear scan of the plugin's shadow list for each such entry: a few hundred entries).
+    // Thrash bound: a pool whose reuse period is longer than the timeout would drop and re-import every frame (a 4K
+    // pool of 72+ at 24 fps: ~600 MB/s of wired allocation churn). Every 10 s: if dropped frames came back within 10 s
+    // (at least 4 and a quarter of the drops), the timeout goes past the period they showed (and at least doubles), up
+    // to NVMTL_KEEP_SHADOW_MAX_MS; a window with none, and with no entry idle between the base and the raised timeout,
+    // halves it back toward NVMTL_KEEP_SHADOW_MS.
+    NVMTLShadowState *sst = keepShadowMs > 0 ? nvmtl_shadow_state(keep, keepShadowMs) : nil;
+    const int shadowSweep = sst && now - sst->lastSweep >= 1000;
+    if (shadowSweep) {
+        sst->lastSweep = now;
+        if (!sst->winStart) sst->winStart = now;
+        if (now - sst->winStart >= 10000) {
+            const long old = sst->effMs;
+            if (sst->winBack >= 4 && sst->winBack * 4 >= sst->winDrops) sst->effMs = (long)MIN((uint64_t)keepShadowMaxMs, MAX((uint64_t)old * 2, sst->winNeed));
+            else if (!sst->winBack && !sst->winHeld && old > keepShadowMs) sst->effMs = MAX(keepShadowMs, old / 2);
+            if (sst->effMs != old) nvlog("surface keep: unused-plane-shadow timeout %ld -> %ld ms (last 10 s: %llu dropped, %llu back within 10 s, "
+                                         "longest reuse seen %llu ms, %llu kept only by the raise)", old, sst->effMs, sst->winDrops, sst->winBack, sst->winNeed, sst->winHeld);
+            sst->winStart = now; sst->winDrops = sst->winBack = sst->winNeed = sst->winHeld = 0;
+        }
+    }
+    const long shadowMs = sst ? sst->effMs : 0;
+    // Each kept backing holds one retain on its surface (nvmtlNewSurfaceTexture). A surface can have several entries: one
+    // per plane (two-plane video, 420v/x420: plane 0 and plane 1 are separate keys) or one per key variant (other-key
+    // misses). Counted against "retain count > 1", those entries saw each other's retains as an outside holder and
+    // refreshed each other forever: WindowServer kept every Aerial wallpaper frame it ever composited (4K 10-bit
+    // two-plane, ~18 BOs / ~330 MB per clip, never released; the surfaces themselves stayed alive, which is the decoder
+    // service's growing "unmapped" footprint). So the retains our own entries hold are counted first, without retaining
+    // (a CFBag with NULL callbacks), and only retains beyond them mean the surface is held elsewhere.
+    CFMutableBagRef own = CFBagCreateMutable(NULL, 0, NULL);
+    [keep enumerateKeysAndObjectsUsingBlock:^(NVMTLSurfKey *k, NVMTLSurfKeep *e, BOOL *stop) {
+        (void)k; (void)stop; __unsafe_unretained NVMTLTexture *b = e->_tex;
+        if (b->_surf && b->_surfOwned) CFBagAddValue(own, b->_surf); }];
+    [keep enumerateKeysAndObjectsUsingBlock:^(NVMTLSurfKey *k, NVMTLSurfKeep *e, BOOL *stop) {
+        (void)stop; __unsafe_unretained NVMTLTexture *b = e->_tex;   // no extra retain: the retain count below must see only real holders
+        if (shadowSweep && b->_hostRO && CFGetRetainCount((__bridge CFTypeRef)b) == 1) {
+            uint64_t sb = 0; const long long ims = nvmtl_vk_image_btsh_watched_idle_ms(&b->_i, &sb);
+            if (ims >= shadowMs) { nvmtl_sk.shadowDrops++; nvmtl_sk.shadowBytes += sb; sst->winDrops++; [unshadow addObject:k]; return; }
+            if (ims >= keepShadowMs) sst->winHeld++;   // idle past the base timeout, kept by a raised one
+        }
+        // Held elsewhere (WindowServer layer contents): in use now, so its idle time starts when it is released. Without
+        // this, a surface on screen for > NVMTL_KEEP_MS without a new wrap expired at the first sweep after its release.
+        if (b->_surf && CFGetRetainCount(b->_surf) > MAX((CFIndex)1, CFBagGetCountOfValue(own, b->_surf))) {
+            if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; } return; }
+        // A live wrapper (the backing itself handed out, or a view of it: views hold their parent) is in use too.
+        // WindowServer keeps its MTLTexture for a surface across frames without wrapping it again or holding the
+        // IOSurface: 2026-11-08 boot, ~1500 expired misses per 30 s, half back within 250 ms of the drop. Only for
+        // NVMTL_KEEP_VIEW_MS (60 s) after the last wrap, so a reference that never goes cannot pin a surface forever.
+        if (b->_surf && b->_hostOn && CFGetRetainCount((__bridge CFTypeRef)b) > 1 && now - e->_wrap < (uint64_t)keepViewMs) {
+            if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; nvmtl_sk.viewRefresh++; } return; }
+        // In use by this process through another IOSurfaceRef or a mach port, or by the window server (use count).
+        // IOSurfaceLookupFromMachPort returns a new IOSurfaceRef on every lookup, so the retain count above misses a
+        // surface the caller keeps as a port and looks up per use (Chrome's GPU process: GpuMemoryBuffer handles).
+        // IOSurfaceIsInUse sees that (a port or a second object in this process, or a non-zero use count), costs ~4 ns
+        // (no kernel call) and does not see other processes' references, so WindowServer does not hold every client
+        // surface through it (docs/890M-TRACE.md part 31). Same NVMTL_KEEP_VIEW_MS bound after the last wrap as above.
+        if (b->_surf && b->_hostOn && IOSurfaceIsInUse(b->_surf) && now - e->_wrap < (uint64_t)keepViewMs) {
+            if (e->_last != now) { e->_last = now; nvmtl_sk.heldRefresh++; nvmtl_sk.useRefresh++; } return; }
+        // Dead: nothing in this process holds the surface but this entry (retain 1, IOSurfaceIsInUse 0: no port, no
+        // second object, no use count) and nothing holds the texture (no wrapper). It cannot come back here except as a
+        // new lookup, so keeping it only holds pinned pages. Chrome's GPU process in a maximised window makes ~10-19 new
+        // 3392x1536 surfaces/s and releases them; the idle cap then held ~1 GB of them pinned (docs/890M-TRACE.md part 32).
+        // Not in WindowServer: it gets client surfaces per frame without keeping them, and they do come back.
+        if (dropDead && b->_surf && CFGetRetainCount((__bridge CFTypeRef)b) == 1) {
+            nvmtl_sk.deadDrops++; nvmtl_sk.deadBytes += nvmtl_sk_bytes(b); [dead addObject:k]; return; }
+        // Small surfaces (Electron / CoreAnimation tiles, <= NVMTL_KEEP_SMALL_KB) stay NVMTL_KEEP_SMALL_MS (120 s): on
+        // 2026-11-08 1472x256 / 768x64 / 320x64 tiles came back 40-200 ms after a drop at ~28 s idle (CPU-THERMALS.md).
+        if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)((long)nvmtl_sk_bytes(b) <= smallBytes ? MAX(keepMs, keepSmallMs) : keepMs)) {
+            [idle addObject:k]; return; }
+        [gone addObject:k];
+    }];
+    CFRelease(own);
+    for (NVMTLSurfKey *k in dead) nvmtl_sk_drop(keep, k, NVMTL_GONE_DEAD);
+    for (NVMTLSurfKey *k in unshadow) nvmtl_sk_drop(keep, k, NVMTL_GONE_SHADOW);
+    for (NVMTLSurfKey *k in gone) {
+        NVMTLTexture *b = keep[k]->_tex;
+        nvmtl_sk_drop(keep, k, (b->_surf && b->_hostOn) ? NVMTL_GONE_EXPIRED : NVMTL_GONE_UNHELD);
+    }
+    const uint64_t drops0 = nvmtl_sk.drops;
+    uint64_t idleBytes = 0;
+    for (NVMTLSurfKey *k in idle) idleBytes += nvmtl_sk_bytes(keep[k]->_tex);
+    if ((long)idle.count > keepIdle && ((long)idle.count > keepIdleMax || idleBytes > keepIdleBytes)) {
+        // Drop order. Large surfaces (> NVMTL_KEEP_SMALL_KB) go before small tiles: plain LRU dropped tiles idle ~28 s (back
+        // in 40-200 ms) while the byte cap was full of 20 MB display-size surfaces, and re-importing a tile costs as much
+        // fixed overhead as a big one. Small tiles among themselves: idle age x bytes, costliest first.
+        // Large surfaces among themselves: bytes first, then the most recently idle first (MRU). A browser compositor
+        // cycles a pool larger than the cap: Chrome's GPU process on 2026-11-09, ~65 window-size 2816x1472 surfaces in
+        // turn while a video plays, idle 3-4 s each at the drop and back < 1 s. Oldest-first dropped exactly the next one
+        // to come back: 0 hits, ~14 re-imports/s, ~56k page records/s made and freed in NMXGPU. Dropping the newest idle
+        // keeps a fixed part of the cycle resident, so only the overflow re-imports. A large surface that is really gone
+        // still leaves at NVMTL_KEEP_MS.
+        [idle sortUsingComparator:^NSComparisonResult(NVMTLSurfKey *a, NVMTLSurfKey *b) {
+            const uint64_t ba = nvmtl_sk_bytes(keep[a]->_tex), bb = nvmtl_sk_bytes(keep[b]->_tex);
+            const int la = (long)ba > smallBytes, lb = (long)bb > smallBytes;
+            if (la != lb) return la ? NSOrderedAscending : NSOrderedDescending;
+            if (la) {
+                if (ba != bb) return ba > bb ? NSOrderedAscending : NSOrderedDescending;
+                const uint64_t xa = keep[a]->_last, xb = keep[b]->_last;    // newest idle (largest _last) first
+                return xa > xb ? NSOrderedAscending : xa < xb ? NSOrderedDescending : NSOrderedSame;
+            }
+            const double ca = (double)(now - keep[a]->_last + 1) * (double)(ba + 65536),
+                         cb = (double)(now - keep[b]->_last + 1) * (double)(bb + 65536);
+            return ca > cb ? NSOrderedAscending : ca < cb ? NSOrderedDescending : NSOrderedSame; }];
+        NSUInteger i = 0, n = idle.count;   // costliest first, until both the count and the bytes fit (never below keepIdle)
+        while (n - i > (NSUInteger)keepIdle && ((long)(n - i) > keepIdleMax || idleBytes > keepIdleBytes)) {
+            idleBytes -= MIN(idleBytes, (uint64_t)nvmtl_sk_bytes(keep[idle[i]]->_tex));
+            nvmtl_sk_drop(keep, idle[i], NVMTL_GONE_CAP); i++;
+        }
+    }
+    nvmtl_sk.idleBytes = idleBytes;
+    if (nvmtl_sk.drops - drops0 > nvmtl_sk.maxSweepDrops) nvmtl_sk.maxSweepDrops = nvmtl_sk.drops - drops0;
+    if (key) {
+        NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
+        nvmtl_sk_put(keep, key, e);
+    }
+    nvmtl_sk_release_bag();
+    const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    nvmtl_sk.sweeps++; nvmtl_sk.sweepNsSum += dt; if (dt > nvmtl_sk.sweepNsMax) nvmtl_sk.sweepNsMax = dt;
+    nvmtl_sk_report(keep, now);
+}
+// 2026-11-22: the sweep above ran only when a new wrapper was inserted (a keep miss). With the display asleep or a static
+// desktop nothing is inserted, so entries past NVMTL_KEEP_MS were never dropped: WindowServer kept 79 entries for
+// 10+ minutes after the display slept (the surfaces' memory stays allocated while a backing holds it, and their GPU
+// shadows stay in GTT: 810 MB gtt_resident with the screen off). A timer now sweeps every NVMTL_KEEP_TIMER_MS (5000,
+// 0 = off) while the table has entries, under the same @synchronized(device) as the insert path; drops are released
+// off this queue as before. Started by the first insert; it stops itself when the table is empty and the next insert
+// starts it again.
+// One timer per device (an associated object, tested and set under @synchronized(device) like the table): with one
+// static timer a second device in the process got none while the first table had entries (review of 7ceff16).
+// The handler holds the device strongly only for one sweep; if that is the last reference the device is released on
+// this utility queue (dealloc is queue-agnostic).
+static char nvmtl_surface_keep_timer_key;
+static void nvmtl_surface_keep_timer(id dev) {
+    static long periodMs = -1;
+    if (periodMs < 0) { const char *e = getenv("NVMTL_KEEP_TIMER_MS"); periodMs = e ? atol(e) : 5000; }
+    if (periodMs <= 0 || objc_getAssociatedObject(dev, &nvmtl_surface_keep_timer_key)) return;
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.surface-keep.sweep", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    __weak id wdev = dev;
+    dispatch_source_t s = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(s, dispatch_time(DISPATCH_TIME_NOW, (int64_t)periodMs * NSEC_PER_MSEC), (uint64_t)periodMs * NSEC_PER_MSEC,
+                              (uint64_t)periodMs * NSEC_PER_MSEC / 2);   // wide leeway: coalesced with other wakeups
+    __weak dispatch_source_t ws = s;
+    dispatch_source_set_event_handler(s, ^{
+        dispatch_source_t me = ws;
+        id d = wdev;
+        if (!d) { if (me) dispatch_source_cancel(me); return; }   // the device is gone, and its timer with it
+        @synchronized (d) {   // the insert path tests and sets the timer under this lock too
+            NSMutableDictionary *keep = objc_getAssociatedObject(d, &nvmtl_surface_keep_key);
+            if (keep.count) nvmtl_surface_keep(d, nil, nil);
+            if (!keep.count) { if (me) dispatch_source_cancel(me); objc_setAssociatedObject(d, &nvmtl_surface_keep_timer_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        }
+    });
+    objc_setAssociatedObject(dev, &nvmtl_surface_keep_timer_key, s, OBJC_ASSOCIATION_RETAIN_NONATOMIC);   // the device keeps its timer alive
+    dispatch_resume(s);
+}
+// Whether a shader can write this surface texture: a storage image, or one nvmtl_storage_view_for (NVMTLObjects.m) can
+// write through an optimal-tiled storage twin. Same eligibility as that function, so Core Image sees what will work.
+static BOOL nvmtl_surface_can_shader_write(NVMTLTexture *t) {
+    if (t->_stex) return YES;
+    nvk_image *im = [t nvi];
+    if (t->_parent || !im || !im->img || !im->w || !im->h || (im->mips ? im->mips : 1) > 1 || (im->layers ? im->layers : 1) > 1
+        || im->mtl_type != 2 || (im->samples ? im->samples : 1) > 1 || im->bw > 1) return NO;
+    return nvmtl_vk_format_is_storage(im->fmt) != 0;
+}
+// A CAMetalLayer drawable with framebufferOnly=NO is, on real Metal, usable as a render target AND a compute/Core Image
+// destination. QuartzCore hands this driver a descriptor whose usage is only ShaderRead for it, so Core Image refuses the
+// texture ("texture usage must include MTLTextureUsageShaderWrite") and Photo Booth's preview stays black (upstream #433,
+// #471). WindowServer keeps the usage it asked for: it wraps hundreds of surfaces a second, none of them Core Image
+// targets. Unknown (0) is never narrowed to read/render-only: that would also forbid the storage twin ImageIO's linear
+// RGBA16Unorm outputs are written through.
+static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL writable) {
+    if (usage == MTLTextureUsageUnknown && !writable) return usage;
+    static int ws = -1;
+    if (ws < 0) { const char *me = getprogname(), *e = getenv("NVMTL_SURF_WIDEN");
+                  ws = (me && !strcmp(me, "WindowServer")) || (e && e[0] == '0'); }   // NVMTL_SURF_WIDEN=0: old usage
+    if (!fbo && !ws) {
+        usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        if (writable) usage |= MTLTextureUsageShaderWrite;
+    }
+    return usage;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
         NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
@@ -794,34 +1464,43 @@ static char nvmtl_surface_cache_key;
     NVMTLTexture *t = [NVMTLTexture new];
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
-    t->_fbo = nvmtl_desc_fbo(d);
+    t->_fbo = nvmtl_desc_fbo(d); t->_drawable = nvmtl_desc_drawable(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    NVMTLSurfKey *key = surf ? nvmtl_surf_key((uint32_t)IOSurfaceGetID(surf), (uint32_t)plane, w, h, (uint64_t)d.pixelFormat,
+                                            (uint64_t)t->_ropt, (uint64_t)t->_fbo, (uint64_t)t->_drawable) : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
     // whether a wrapper reads it or writes it (the image is made writable).
     // Weak entries do not pin the image after the application's last wrapper.
+    const int rw = d.usage == MTLTextureUsageUnknown || (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
+    // a read-only plane import never copies its rows back: a wrapper that may write gets its own (it replaces the entry)
+    if (backing && backing->_hostRO && rw) backing = nil;
     if (backing && !backing->_vramOn) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
-            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            nvmtl_surface_touch(self, key);
+            { static unsigned long long hits; if (++hits <= 4 || hits % 20000 == 0) nvlog("surface keep: hit #%llu (surface %u, %s)", hits,
+                  (unsigned)IOSurfaceGetID(surf), backing->_hostOn ? "own pages" : "private image"); }
+            alias->_viewParent = nil; alias->_usage = backing->_hostRO ? d.usage : nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(alias)); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo; alias->_drawable = t->_drawable;
             nvmtl_texture_desc_swizzle(alias, d);
             return alias;
         }
     }
-    if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
+    if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex, rw)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
     t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage != 0;
-    t->_usage = d.usage;
+    t->_usage = t->_hostRO ? d.usage : nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(t));
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && !t->_vramOn) [cache setObject:t forKey:key];
+    if (key && !t->_vramOn) [cache setObject:t forKey:key];   // host-backed ones too: one image per surface
+    { static int keepOff = -1; if (keepOff < 0) { const char *e = getenv("NVMTL_KEEP_OFF"); keepOff = e && e[0] == '1'; }
+      if (key && !t->_vramOn && !keepOff) nvmtl_surface_keep(self, key, t); }   // NVMTL_KEEP_OFF=1: weak cache only
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
@@ -1145,7 +1824,23 @@ static void nvmtl_stitch_dump(const char *what, NSString *dag, NSArray *fns, id 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)err {
     if (err) *err = nil;
     NSString *fp = url.isFileURL ? url.absoluteURL.path : nil; struct stat s0; int st0 = fp ? stat(fp.fileSystemRepresentation, &s0) : -1;
-    NSData *d = [NSData dataWithContentsOfURL:url];
+    /* 2026-11-23 WindowServer memory: a library on the sealed system volume (Core Animation's QuartzCore default.metallib,
+       153 MB) was read whole into malloc and kept in _raw for the library's life: 153 MB of dirty heap in every process
+       that renders with CA, WindowServer's MALLOC_LARGE. A file on a read-only mount cannot change while mapped, so map
+       it: clean file-backed pages the kernel can drop, not footprint. The test is the mount, not the path: statfs follows
+       symlinks, ".." and firmlinks to the real volume (/System/Volumes/Data, /System/Library/Caches and AssetsV2 are
+       writable), and only the booted sealed system snapshot qualifies: local, read-only, root file system, APFS
+       (QuartzCore's file: apfs on / from disk1s4s1, rdonly local rootfs). A read-only DMG, network share or translocated
+       app is read-only too but can vanish under a mapping (eject, drop): those keep the plain read. Anything else keeps the plain read: a file rewritten in place under a mapping is SIGBUS when _raw is
+       read later (extern names, MTLB dynamic info, the Sass digest). NVMTL_LIB_NOMAP=1: always the plain read. */
+    NSData *d = nil;
+    struct statfs sf;
+    if (fp && st0 == 0 && S_ISREG(s0.st_mode) && !getenv("NVMTL_LIB_NOMAP") && statfs(fp.fileSystemRepresentation, &sf) == 0 &&
+        (sf.f_flags & (MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS)) == (MNT_RDONLY | MNT_LOCAL | MNT_ROOTFS) && !strcmp(sf.f_fstypename, "apfs")) {
+        d = [NSData dataWithContentsOfFile:fp options:NSDataReadingMappedIfSafe error:NULL];
+        static int said; if (d && said++ < 4) nvlog("newLibraryWithURL: %s mapped (%lu bytes, not copied)", fp.lastPathComponent.UTF8String, (unsigned long)d.length);
+    }
+    if (!d) d = [NSData dataWithContentsOfURL:url];
     if (!d && url.path.length) {
         fp = url.path; st0 = stat(fp.fileSystemRepresentation, &s0);
         d = [NSData dataWithContentsOfFile:url.path];
@@ -1583,8 +2278,48 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
           s->_sb[0], s->_sb[1], s->_sb[2], s->_sb[3], s->_sb[4], s->_sb[5]);
     return s; }
 
+/* Sampler-state cache (Step101b). WindowServer asks for new sampler states every frame (equal descriptors); each was a
+   new VkSampler, and its destroy bumped the desc-cache image epoch (retiring every cached set holding an image) and
+   gave the sampler-variant fast path a new pointer to miss on. A sampler state is immutable: equal unlabelled
+   descriptors now get the same object. Held for the process lifetime, at most 1024. Off: NVMTL_NO_SAMPCACHE=1. */
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)sd {
+    static int off = -1; if (off < 0) off = getenv("NVMTL_NO_SAMPCACHE") != NULL;
+    if (off || !sd || sd.label.length) return [self nvmtlNewSamplerStateUncached:sd];
+    struct { uint32_t f[12]; float lo, hi, bias; } k;
+    memset(&k, 0, sizeof k);
+    k.f[0] = (uint32_t)sd.minFilter; k.f[1] = (uint32_t)sd.magFilter; k.f[2] = (uint32_t)sd.mipFilter; k.f[3] = (uint32_t)sd.maxAnisotropy;
+    k.f[4] = (uint32_t)sd.sAddressMode; k.f[5] = (uint32_t)sd.tAddressMode; k.f[6] = (uint32_t)sd.rAddressMode; k.f[7] = (uint32_t)sd.borderColor;
+    k.f[8] = (uint32_t)sd.reductionMode; k.f[9] = (uint32_t)sd.normalizedCoordinates | (uint32_t)sd.lodAverage << 1 | (uint32_t)sd.supportArgumentBuffers << 2;
+    k.f[10] = (uint32_t)sd.compareFunction; k.lo = sd.lodMinClamp; k.hi = sd.lodMaxClamp; k.bias = sd.lodBias;
+    NSData *kd = [NSData dataWithBytes:&k length:sizeof k];
+    static NSMutableDictionary *cache; static os_unfair_lock cl = OS_UNFAIR_LOCK_INIT; static _Atomic uint64_t hit, made;
+    os_unfair_lock_lock(&cl); id<MTLSamplerState> got = cache[kd]; os_unfair_lock_unlock(&cl);
+    if (got) { const uint64_t h = atomic_fetch_add(&hit, 1) + 1;
+        if (!(h & (h - 1))) nvlog("sampler cache: hit %llu, %llu made", (unsigned long long)h, (unsigned long long)atomic_load(&made));
+        return got; }
+    got = [self nvmtlNewSamplerStateUncached:sd];
+    if (!got) return nil;
+    os_unfair_lock_lock(&cl);
+    if (!cache) cache = [NSMutableDictionary new];
+    id<MTLSamplerState> raced = cache[kd];
+    if (raced) got = raced; else if (cache.count < 1024) { cache[kd] = got; atomic_fetch_add(&made, 1); }
+    os_unfair_lock_unlock(&cl);
+    return got;
+}
+- (id<MTLSamplerState>)nvmtlNewSamplerStateUncached:(MTLSamplerDescriptor *)sd {
     if (nvmtl_vk_init()) return nil;
+    // WindowServer: every sampler filters linearly. Liquid Glass came out in 4-pixel blocks - its quarter-resolution
+    // backdrop reached the panel through a nearest sampler in CoreAnimation's fixed_frag_lpf_cpf (the uber shader reads
+    // its textures through the bindless heap; which binding goes wrong is not pinned down yet). For the compositor's
+    // 1:1 copies linear and nearest sample the same texel centres (menu text compared pixel for pixel), and scaled
+    // content (glass, Mission Control) comes out smooth as on Apple's GPUs. Apps keep nearest (pixel art).
+    // NVMTL_WS_NEAREST=1 keeps WindowServer's own filters; NVMTL_FORCE_LINEAR_DYN=1 forces linear in any process.
+    static int forceLinear = -1;
+    if (forceLinear < 0) { const char *me = getprogname();
+        forceLinear = getenv("NVMTL_FORCE_LINEAR_DYN") || (me && !strcmp(me, "WindowServer") && !getenv("NVMTL_WS_NEAREST"));
+        if (forceLinear) nvlog("samplers: nearest filters made linear in %s (compositor; NVMTL_WS_NEAREST=1 keeps them)", me ?: "?"); }
+    if (forceLinear && (sd.minFilter != MTLSamplerMinMagFilterLinear || sd.magFilter != MTLSamplerMinMagFilterLinear)) {
+        sd = [sd copy]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; }
     NVMTLSamplerState *s = [NVMTLSamplerState new];
     s->_label = [sd.label copy];
     if (!sd.normalizedCoordinates) {
@@ -1599,7 +2334,20 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
             @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
             @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN((NSUInteger)sd.borderColor,2u)],
             @"reduction":@"WeightedAverage",@"lod_bias":@0};
-        nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
+        /* Intern (Step101b): WindowServer makes new sampler states every frame; equal descriptors now share one
+           _pixelState object, so the sampler-variant fast path (keyed by these pointers) hits across frames. */
+        { struct { uint32_t f[8]; float lo, hi; } k = { { (uint32_t)sd.minFilter, (uint32_t)sd.magFilter, (uint32_t)sd.mipFilter,
+              (uint32_t)sd.sAddressMode, (uint32_t)sd.tAddressMode, (uint32_t)sd.rAddressMode, (uint32_t)sd.compareFunction,
+              (uint32_t)sd.maxAnisotropy | (uint32_t)sd.borderColor << 16 }, sd.lodMinClamp, sd.lodMaxClamp };
+          static NSMutableDictionary *intern; static os_unfair_lock il = OS_UNFAIR_LOCK_INIT;
+          NSData *kd = [NSData dataWithBytes:&k length:sizeof k]; NSDictionary *was = nil; BOOL fresh = NO;
+          os_unfair_lock_lock(&il);
+          if (!intern) intern = [NSMutableDictionary new];
+          was = intern[kd];
+          if (!was && intern.count < 4096) { intern[kd] = s->_pixelState; fresh = YES; }
+          os_unfair_lock_unlock(&il);
+          if (was) s->_pixelState = was;
+          else if (fresh) nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String); }
     }
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);

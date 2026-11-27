@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+/* LOWER CACHE: this pass shapes what the lowering cache (low2) stores. Bump NVMTL_LOWER_PASSES_VERSION (nvmtl_vk.c) whenever
+   its output for a given input can change, or every process keeps loading the old result from disk. */
 static NSData *nvmtl_preserve_readonly_metadata(NSData *input) {
     const uint32_t *w=input.bytes; size_t n=input.length/4;
     if(input.length%4||n<5||w[0]!=0x07230203||!w[3]||w[3]>4194304)return input;
     uint32_t bound=w[3],next=bound; size_t firsttype=0,firstfn=0;
     uint32_t *typeoff=calloc(bound,4),*readonly=calloc(bound,4),*replacement=calloc(bound,4);
-    if(!typeoff||!readonly||!replacement){free(typeoff);free(readonly);free(replacement);return input;}
+    /* no memory: the input goes on unchanged this time only, so the lowering is not stored (t_lower_transient, nvmtl_vk.c) */
+    if(!typeoff||!readonly||!replacement){free(typeoff);free(readonly);free(replacement);t_lower_transient=1;return input;}
     BOOL valid=YES,logical=NO;
     for(size_t i=5;i<n;){uint32_t c=w[i]>>16,op=w[i]&65535;
         if(!c||i+c>n){valid=NO;break;}

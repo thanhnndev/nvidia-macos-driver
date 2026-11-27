@@ -98,8 +98,17 @@ static NSArray<NSArray *> *nvmtl_static_samplers(NVMTLFunction *fn)
         cached = objc_getAssociatedObject(fn, NVMTL_SSAMP_KEY);
         if (cached) return cached;
         char e[512] = { 0 };
-        NSData *d = (fn->_air && fn->_stage.length && nvmtl_xlate_ready() && xlate_refl)
-                  ? nvmtl_reflect_air_cached(fn, fn->_air, fn->_stage, e, sizeof e) : nil;
+        // A function made from a library's cached SPIR-V can come without its AIR text; its library may still hold it.
+        // Without reflection the constexpr samplers stay unbound and the draw samples with whatever sampler the slot
+        // kept from an earlier draw (Liquid Glass read its blurred backdrop nearest-filtered, in 4-pixel blocks).
+        NSString *air = fn->_air;
+        if (!air.length && [fn->_lib isKindOfClass:[NVMTLLibrary class]] && fn->_fname)
+            air = ((NVMTLLibrary *)fn->_lib)->_airs[fn->_fname];
+        NSData *d = (air.length && fn->_stage.length && nvmtl_xlate_ready() && xlate_refl)
+                  ? nvmtl_reflect_air_cached(fn, air, fn->_stage, e, sizeof e) : nil;
+        if (!d) nvlog("static sampler: %s NOT reflected (AIR %lu B%s, stage '%s'%s%s) - its constexpr samplers stay unbound",
+                      fn->_fname.UTF8String ?: "?", (unsigned long)air.length, fn->_air.length ? "" : air.length ? " from its library" : "",
+                      fn->_stage.UTF8String ?: "", e[0] ? ": " : "", e);
         NSDictionary *refl = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
         NSArray *all = [refl isKindOfClass:[NSDictionary class]] ? refl[@"bindings"] : nil;
         for (NSDictionary *b in [all isKindOfClass:[NSArray class]] ? all : @[]) {

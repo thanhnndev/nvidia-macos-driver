@@ -20,6 +20,8 @@
 extern char **environ;
 
 void nvlog(const char *fmt, ...);
+void nvlog_report(const char *fmt, ...);
+void nvlog_capped(const char *fmt, ...);
 
 #import <CommonCrypto/CommonDigest.h>
 #define NVMTL_AIR_OPT   "/Library/GPUBundles/nvmtl/air-opt"
@@ -45,6 +47,8 @@ typedef int (*nvmtl_lower_fn)(const uint8_t *, size_t, uint8_t **, size_t *, cha
 static nvmtl_lower_fn xlate_lower;
 typedef int (*nvmtl_lower_ex_fn)(const uint8_t *, size_t, uint32_t, uint8_t **, size_t *, uint32_t *, char *, size_t);
 static nvmtl_lower_ex_fn xlate_lower_ex;
+typedef int (*nvmtl_kept_mask_fn)(const uint8_t *, size_t, uint32_t *);
+static nvmtl_kept_mask_fn xlate_kept_mask;   /* bindings address lowering keeps on descriptors (translator LOWER_ALL = 16 lowers them too) */
 static nvmtl_translate_fn xlate;
 static char gXlateTag[80] = "untagged";
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
@@ -114,6 +118,7 @@ static int nvmtl_xlate_ready(void) {
                 xlate ? "" : " - it has NO nvmtl_translate"); }
         xlate_lower = (nvmtl_lower_fn)dlsym(h, "nvmtl_lower_buffer_addresses");
         xlate_lower_ex = (nvmtl_lower_ex_fn)dlsym(h, "nvmtl_lower_buffer_addresses_ex");
+        xlate_kept_mask = (nvmtl_kept_mask_fn)dlsym(h, "nvmtl_kept_descriptor_mask");
         xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
         xlate_sampler = (nvmtl_sampler_fn)dlsym(h, "nvmtl_translate_samplers");
         xlate_tglen = (nvmtl_tglen_fn)dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
@@ -290,6 +295,14 @@ static void nvmtl_spvcache_trim_async(NSString *dir) {
 // The SPIR-V cache folder is chosen once, by creating it and writing to it. Sandboxed agents (iconservicesagent) could
 // not create the folder beside their AIR cache; every store failed with "folder doesn't exist" and every launch
 // translated its shaders again. The process's own temporary folder is always writable inside its sandbox.
+// A cache hit moves the entry's times so the trimmer keeps its age order. A sandbox that may write the cache but not
+// file times (iconservicesagent: deny file-write-times) refused every one of them, and each refusal is a sandbox
+// violation report the kernel files: hundreds a minute. After the first refusal this process stops touching.
+static _Atomic int nvmtl_touch_refused;
+static void nvmtl_cache_touch(const char *path) {
+    if (atomic_load_explicit(&nvmtl_touch_refused, memory_order_relaxed)) return;
+    if (utimes(path, NULL) != 0 && (errno == EPERM || errno == EACCES)) atomic_store(&nvmtl_touch_refused, 1);
+}
 static BOOL nvmtl_dir_writable(NSString *d) {
     if (!d || ![[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
     NSString *probe = [d stringByAppendingPathComponent:[NSString stringWithFormat:@".probe-%d", getpid()]];
@@ -364,6 +377,47 @@ static BOOL nvmtl_is_spirv(NSData *d) {
     if (d.length < 20 || d.length % 4) return NO;
     memcpy(&magic, d.bytes, 4);
     return magic == 0x07230203;
+}
+/* Sealed cache file (review of 0f2a94a): a file torn on a word boundary or with flipped bits after a hard reset must be a
+ * miss, not an answer that repeats every start. Layout: tag[4] | u32 version | u32 meta bytes | u32 payload bytes |
+ * SHA-256 over (version, meta bytes, payload bytes, meta, payload) | meta | payload. Both lengths must add up to the file
+ * size exactly. Meta and payload are word multiples, so the payload stays 4-byte aligned. */
+#define NVMTL_SEAL_HDR (16u + CC_SHA256_DIGEST_LENGTH)
+static void nvmtl_seal_digest(const uint32_t v[3], const void *meta, const void *payload, size_t pn, unsigned char h[CC_SHA256_DIGEST_LENGTH]) {
+    CC_SHA256_CTX c; CC_SHA256_Init(&c);
+    CC_SHA256_Update(&c, v, 3 * sizeof *v);
+    if (v[1]) CC_SHA256_Update(&c, meta, v[1]);
+    for (size_t off = 0; off < pn; off += 1u << 30) CC_SHA256_Update(&c, (const char *)payload + off, (CC_LONG)MIN((size_t)1u << 30, pn - off));
+    CC_SHA256_Final(h, &c);
+}
+static NSData *nvmtl_seal(const char tag[4], uint32_t version, const void *meta, uint32_t metan, NSData *payload) {
+    if (metan % 4 || payload.length % 4 || payload.length > UINT32_MAX) return nil;
+    const uint32_t v[3] = { version, metan, (uint32_t)payload.length };
+    NSMutableData *f = [NSMutableData dataWithLength:NVMTL_SEAL_HDR];
+    memcpy(f.mutableBytes, tag, 4); memcpy((char *)f.mutableBytes + 4, v, sizeof v);
+    nvmtl_seal_digest(v, meta, payload.bytes, payload.length, (unsigned char *)f.mutableBytes + 16);
+    if (metan) [f appendBytes:meta length:metan];
+    if (payload.length) [f appendData:payload];
+    return f;
+}
+/* 1 = intact: meta copied out (metan bytes exactly), *payload = a copy of the payload (nil when empty). 0 = missing, torn,
+ * foreign or another version. */
+static int nvmtl_unseal(NSData *f, const char tag[4], uint32_t version, void *meta, uint32_t metan, NSData **payload) {
+    if (payload) *payload = nil;
+    if (f.length < NVMTL_SEAL_HDR || memcmp(f.bytes, tag, 4)) return 0;
+    uint32_t v[3]; memcpy(v, (const char *)f.bytes + 4, sizeof v);
+    if (v[0] != version || v[1] != metan || v[2] % 4 || f.length != (size_t)NVMTL_SEAL_HDR + v[1] + v[2]) return 0;
+    const char *m = (const char *)f.bytes + NVMTL_SEAL_HDR, *p = m + v[1];
+    unsigned char h[CC_SHA256_DIGEST_LENGTH];
+    nvmtl_seal_digest(v, m, p, v[2], h);
+    if (memcmp(h, (const char *)f.bytes + 16, sizeof h)) return 0;
+    if (metan) memcpy(meta, m, metan);
+    if (payload && v[2]) *payload = [NSData dataWithBytes:p length:v[2]];
+    return 1;
+}
+/* Cache stores outside the spv path count toward the trimmer's re-arm too (review nit: the fc and low stores did not). */
+static void nvmtl_spvcache_added(unsigned long long bytes) {
+    atomic_fetch_add_explicit(&gSpvAdded, bytes, memory_order_relaxed);
 }
 static NSCache *nvmtl_memo(void) {
     static NSCache *c; static dispatch_once_t once;
@@ -777,7 +831,7 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
         NSData *spvData = getenv("NVMTL_SPVCACHE_OFF") ? nil : [NSData dataWithContentsOfFile:spvp];
         int hit = spvData.length >= 20 && *(const uint32_t *)spvData.bytes == 0x07230203u;
         uint8_t *spv = NULL; size_t spvn = 0; char err[512] = { 0 };
-        if (hit) { gSpvHit++; utimes(spvp.fileSystemRepresentation, NULL); }
+        if (hit) { gSpvHit++; nvmtl_cache_touch(spvp.fileSystemRepresentation); }
         else {
             gSpvMiss++;
             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
@@ -1123,6 +1177,10 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
     return d;
 }
 
+// WS-CPU fix 1: specialization counters for the 30 s "pipelines:" report (nvmtl_vk.c). The per-miss "fc cache: miss" line
+// is rate-limited by nvlog after 8, and one miss of WindowServer's fixed_frag_lpf_cpf cost 2.7-3.6 s (2026-11-19 12:36).
+_Atomic unsigned long long nvmtl_fc_stat_hits, nvmtl_fc_stat_misses, nvmtl_fc_stat_miss_ns, nvmtl_fc_stat_miss_max_ns,
+                          nvmtl_fc_stat_disk_hits, nvmtl_fc_stat_disk_hit_ns;   // disk hits: read + unseal of the file
 NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *name, NSDictionary *constants,
                                        const uint32_t *idx, const uint32_t *sizes,
                                        const uint8_t *const *payloads, size_t n, NSString **err)
@@ -1133,17 +1191,26 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     NSData *json = [NSJSONSerialization dataWithJSONObject:config options:NSJSONWritingSortedKeys error:NULL];
     NVMTLAirDigest *airDigest = nvmtl_air_state(ll);
     if (!json || !airDigest) return nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
-    NSString *path = nvmtl_spvcache_path_air(airDigest, json, @"fc1");
+    /* fc2 (review of 0f2a94a): sealed file (nvmtl_seal: lengths + SHA-256), fc1 was raw SPIR-V checked by magic only. The
+       memo keeps the bare SPIR-V. A bad file is a miss and the miss path rewrites it. */
+    NSString *path = nvmtl_spvcache_path_air(airDigest, json, @"fc2");
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     const BOOL fcCacheOn = path && !getenv("NVMTL_FCCACHE_OFF");   // no folder, no key: NSCache throws on a nil key
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:path] : nil;
-    if (hit) { gFcHit++; utimes(path.fileSystemRepresentation, NULL); return hit; }   // keep the trimmer's age order
-    if (fcCacheOn) hit = [NSData dataWithContentsOfFile:path];
-    uint32_t magic = 0;
-    if (hit.length >= 20 && hit.length % 4 == 0) {
-        memcpy(&magic, hit.bytes, 4);
-        if (magic == 0x07230203) {
-            gFcHit++; utimes(path.fileSystemRepresentation, NULL);
+    if (hit) { gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation); return hit; }   // keep the trimmer's age order
+    /* a plain read, not a mapping (review of 97e286e): an unreadable block or an outside truncation would SIGBUS inside the
+       hash, every start, since the file stays; a read error is nil = miss */
+    NSData *file = fcCacheOn ? [NSData dataWithContentsOfFile:path options:0 error:nil] : nil;
+    if (file) {
+        if (!nvmtl_unseal(file, "NVFC", 2, NULL, 0, &hit) || !nvmtl_is_spirv(hit)) {
+            hit = nil; static _Atomic unsigned bad;
+            if (atomic_fetch_add(&bad, 1) < 8) nvlog("fc cache: BAD entry %s (%lu B: torn, flipped or foreign) - miss, rewritten",
+                                                     path.lastPathComponent.UTF8String, (unsigned long)file.length);
+        }
+        file = nil;
+        if (hit) {
+            gFcHit++; nvmtl_fc_stat_hits++; nvmtl_cache_touch(path.fileSystemRepresentation);
+            nvmtl_fc_stat_disk_hits++; nvmtl_fc_stat_disk_hit_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
             [nvmtl_memo() setObject:hit forKey:path cost:hit.length];
             nvlog("fc cache: HIT %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
                   (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
@@ -1153,8 +1220,20 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     }
     gFcMiss++;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
+    {   const unsigned long long dt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+        nvmtl_fc_stat_misses++; nvmtl_fc_stat_miss_ns += dt;
+        // WS-CPU 8.4: a slow miss (fixed_frag_* takes ~3 s) logs the constants it was asked for, so the specialization
+        // WindowServer really uses can be translated offline (the cache file name is only a hash of this JSON).
+        if (dt > 500000000ull) { static _Atomic unsigned slowSaid;
+            if (atomic_fetch_add(&slowSaid, 1) < 32) {
+                NSString *js = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+                nvlog_capped("fc cache: slow miss %s %.0f ms, constants %s", name.UTF8String, dt / 1e6,
+                             js.length > 900 ? [js substringToIndex:900].UTF8String : js.UTF8String ?: "?"); } }
+        unsigned long long m = nvmtl_fc_stat_miss_max_ns;
+        while (dt > m && !atomic_compare_exchange_weak(&nvmtl_fc_stat_miss_max_ns, &m, dt)) {} }
     if (result) {
-        if (path && [result writeToFile:path atomically:YES]) gFcStored++;
+        NSData *sealed = path && nvmtl_is_spirv(result) ? nvmtl_seal("NVFC", 2, NULL, 0, result) : nil;
+        if (sealed && [sealed writeToFile:path atomically:YES]) { gFcStored++; nvmtl_spvcache_added(sealed.length); }
         if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:path cost:result.length];
         nvlog("fc cache: miss %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
               (unsigned long)result.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
@@ -1211,11 +1290,11 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
     const BOOL useCache = path && !getenv("NVMTL_REFLCACHE_OFF") && !getenv("NVMTL_SPVCACHE_OFF");
     if (useCache) {
         NSData *mem = [nvmtl_memo() objectForKey:path];
-        if (mem) { ++gRfHit; utimes(path.fileSystemRepresentation, NULL); return mem; }
+        if (mem) { ++gRfHit; nvmtl_cache_touch(path.fileSystemRepresentation); return mem; }
         NSData *hit = [NSData dataWithContentsOfFile:path];
         id obj = hit.length ? [NSJSONSerialization JSONObjectWithData:hit options:0 error:NULL] : nil;
         if ([obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) {
-            unsigned long hn = ++gRfHit; utimes(path.fileSystemRepresentation, NULL);
+            unsigned long hn = ++gRfHit; nvmtl_cache_touch(path.fileSystemRepresentation);
             [nvmtl_memo() setObject:hit forKey:path cost:hit.length];
             if (!(hn & (hn - 1))) nvlog("refl cache: HIT %s %lu B %.2f ms [%lu hit, %lu miss, %lu stored]", function ? function->_fname.UTF8String : "?",
                                         (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, hn, (unsigned long)gRfMiss, (unsigned long)gRfStored);
@@ -1259,7 +1338,7 @@ static NSData *nvmtl_translate_link_cached(NSString *ll, NSString *stage, const 
     if (hit.length >= 20 && hit.length % 4 == 0) {
         memcpy(&magic, hit.bytes, 4);
         if (magic == 0x07230203) {
-            unsigned long hn = ++gLkHit; utimes(path.fileSystemRepresentation, NULL);
+            unsigned long hn = ++gLkHit; nvmtl_cache_touch(path.fileSystemRepresentation);
             if (!(hn & (hn - 1))) nvlog("link cache: HIT %lu B %.2f ms [%lu hit, %lu miss, %lu stored]", (unsigned long)hit.length,
                                         (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, hn, (unsigned long)gLkMiss, (unsigned long)gLkStored);
             return hit;
@@ -1672,7 +1751,7 @@ NSData *nvmtl_translate_variant(NVMTLFunction *fn, NSDictionary *states, NSDicti
     NSString *path=nvmtl_spvcache_path_air(airDigest,json,@"variant1");
     if(!path)return nvmtl_translate_variant_uncached(fn,states,tgLen,err);   // no writable cache folder in this process
     NSData *mem=[nvmtl_memo() objectForKey:path];
-    if(mem){utimes(path.fileSystemRepresentation,NULL);return mem;}
+    if(mem){nvmtl_cache_touch(path.fileSystemRepresentation);return mem;}
     NSData *hit=[NSData dataWithContentsOfFile:path];uint32_t magic=0;
     if(hit.length>=20 && hit.length%4==0){memcpy(&magic,hit.bytes,4);if(magic==0x07230203){[nvmtl_memo() setObject:hit forKey:path cost:hit.length];nvlog("variant cache: hit %s",fn->_fname.UTF8String);return hit;}}
     NSData *result=nvmtl_translate_variant_uncached(fn,states,tgLen,err);

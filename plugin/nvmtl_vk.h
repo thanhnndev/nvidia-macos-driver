@@ -8,9 +8,9 @@
 #include <stdint.h>
 #include <stddef.h>
 const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
-typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; } nvk_buffer;
+typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int htype; /* its memory type + 1 when known (0 = unknown) */ } nvk_buffer;
 #include "nvmtl_sample_positions.h"
-typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vpair;  uint64_t up_token; } nvk_image;
+typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vfl;  uint64_t up_token; } nvk_image;
 #define NVMTL_NVAR 16
 #define NVMTL_NVAR_MAX 4096
 #define NVMTL_NCOL 8
@@ -32,9 +32,12 @@ typedef struct { void *rp; void *pipe; void *layout; int has_depth; uint32_t dfm
     uint64_t bmask[4]; uint32_t bmask_ok;
     uint64_t gmask[2][4]; uint32_t gmask_ok;
     uint32_t ag_mask, ag_req; void *ag_src; size_t ag_srcn; void *ag_safe;
+    uint32_t kd_mask; void *kd_safe;   /* buffers the module keeps on descriptors; its all-lowered variant (see nvmtl_kept_pick) */
     uint64_t shape_identity;
     uint32_t lin;
     uint64_t tbm[2][4]; uint32_t tbany;
+    uint32_t fetch_mask;   /* colour attachments the fragment shader reads ([[color(n)]], set 3 binding 192+n) */
+    uint32_t fetch_zero;   /* framebuffer fetch is off by NVMTL_NO_FBFETCH but the shader reads [[color(n)]]: set 3 holds the dummy */
 } nvk_pipeline;
 void nvmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
@@ -62,6 +65,12 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  unsigned nobind, skipped;
                  void *dcache[32]; void *dcachepool; unsigned ndcache;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;
+                 void *fetchview[NVMTL_NCOL];   /* the open pass's colour views, read by [[color(n)]] framebuffer fetch */
+                 unsigned fetch_draw, topo;     /* the bound pipeline reads [[color(n)]] in this pass; last MTLPrimitiveType set */
+                 /* the last framebuffer fetch set made in this command buffer and what it points at: a draw whose pass
+                    and mask are the same reuses it (Core Animation draws hundreds of fetch draws per pass) */
+                 void *fetch_last_set; uint32_t fetch_last_mask; void *fetch_last_view[NVMTL_NCOL];
+                 void **btsh; unsigned nbtsh, capbtsh;
                  unsigned direct_sass;   /* recorded a dispatch of compiled machine code: never reuse this pool */
                  void *occlusion_pages; uint32_t occlusion_count;
                  void *timing_pool; nvmtl_gpu_interval timing;
@@ -69,6 +78,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *counter_recording; unsigned counter_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
+                 void *audit;   /* buffer-list audit (nvmtl_bl_audit_on): used vs listed no-copy imports of this part */
                } nvk_cmdbuf;
 int  nvmtl_vk_init(void);
 int nvmtl_vk_sample_positions_backend(void);
@@ -112,6 +122,7 @@ int  nvmtl_vk_depth_create(uint32_t w, uint32_t h, nvk_image *out);
 void nvmtl_vk_cmd_set_depth(nvk_cmdbuf *c, int test, int write, int compare);
 int  nvmtl_vk_queue_create(nvk_queue *out);
 int  nvmtl_vk_cmd_begin(nvk_queue *q, nvk_cmdbuf *out);
+int  nvmtl_vk_init_failed(void);
 int  nvmtl_vk_cmd_begin_render(nvk_cmdbuf *c, nvk_image *img, nvk_pipeline *p, const float clear[4]);
 int  nvmtl_vk_cmd_begin_render_ex(nvk_cmdbuf *c, nvk_image *img, nvk_pipeline *p, const float clear[4], uint32_t load);
 int  nvmtl_vk_cmd_begin_render_ms(nvk_cmdbuf *c, nvk_image *img, nvk_pipeline *p, const float clear[4], uint32_t load, nvk_image *resolve);
@@ -279,8 +290,28 @@ void nvmtl_vk_cmd_draw_indirect(nvk_cmdbuf *c, nvk_buffer *b, size_t off);
 void nvmtl_vk_cmd_draw_indexed_indirect(nvk_cmdbuf *c, nvk_buffer *idx, size_t idxOff, int is32, nvk_buffer *b, size_t off);
 void nvmtl_vk_cmd_dispatch_indirect(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffer *b, size_t off);
 void nvmtl_vk_cmd_barrier(nvk_cmdbuf *c);
+/* surface list (radv_nvmtl): IOSurface imports only ride the submits that use them */
+int nvmtl_vk_surface_list_mark(nvk_buffer *b);
+void nvmtl_vk_surface_list_unmark(nvk_buffer *b);
+void nvmtl_vk_cmd_use_surface(nvk_cmdbuf *c, const nvk_buffer *b);
+void nvmtl_vk_cmd_exact(nvk_cmdbuf *c);
+void nvmtl_vk_cmd_exact_xfer(nvk_cmdbuf *c);   /* a one-shot command buffer of barriers + copies/fills only (row 13) */
+int nvmtl_vk_buffer_list_mark(nvk_buffer *b);
+int nvmtl_vk_integrated(void);
+int nvmtl_bl_audit_on(void);
+void nvmtl_vk_nocopy_register(const nvk_buffer *b);
+void nvmtl_vk_audit_listed(nvk_cmdbuf *c, const nvk_buffer *b);
+void nvmtl_vk_audit_check(nvk_cmdbuf *c, const char *where);
+int nvmtl_managed_sysmem(void);
+void nvmtl_vk_buffer_list_unmark(nvk_buffer *b);
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);
 void nvmtl_vk_image_destroy(nvk_image *i);
+/* Plain device textures recycled by creation key instead of freed and reallocated (CA's per-frame blur surfaces).
+   park takes ownership (destroys on refusal or eviction); unpark returns 0 and fills *out on a hit. */
+#define NVMTL_IPARK_KEYN 10
+void nvmtl_vk_image_park(nvk_image *i, const uint32_t key[NVMTL_IPARK_KEYN]);
+int nvmtl_vk_image_unpark(const uint32_t key[NVMTL_IPARK_KEYN], nvk_image *out);
+unsigned nvmtl_vk_image_park_drain(void);
 // Finish any in-flight asynchronous texture upload to this image (NVMTL_ASYNC_TEX_UPLOAD) before its memory
 // is read back, migrated or freed. A no-op when none is pending, which is always the case with the flag off.
 void nvmtl_vk_image_upload_barrier(nvk_image *img);
@@ -305,6 +336,18 @@ void nvmtl_vk_heap_destroy(nvk_heap *h);
 int  nvmtl_vk_buffer_create_placed(size_t size, nvk_heap *heap, size_t offset, nvk_buffer *out);
 int  nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
                                         const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
+/* a read-only shadowed alias of an IOSurface plane: copy its rows only when the surface's seed moved (1: watched) */
+int  nvmtl_vk_image_btsh_watch_surface(const nvk_image *img, void *surf);
+long long nvmtl_vk_image_btsh_watched_idle_ms(const nvk_image *img, uint64_t *bytes);
+void nvmtl_vk_btsh_bytes(unsigned long long *all, unsigned long long *watched, unsigned *live);
+int  nvmtl_vk_btsh_seed_on(void);
+uint32_t nvmtl_vk_surface_seed_bump(void *surf);
+uint32_t nvmtl_vk_surface_seed_bump_now(void *surf);
+void nvmtl_vk_surface_seed_batch_begin(void);
+void nvmtl_vk_surface_seed_batch_end(void);
+/* WS-CPU 8.7 step 1: per-present census (commits, waits, submits, object churn, desc-cache), one line per 30 s */
+enum { NVC_COMMIT, NVC_CAWUS, NVC_WSCHED, NVC_WCOMP, NVC_SUBMIT, NVC_VIEW_NEW, NVC_VIEW_DEL, NVC_BUF_NEW, NVC_BUF_DEL, NVC_N };
+void nvmtl_vk_frame_census(int what);
 int  nvmtl_vk_image_placed_fits(const nvk_image *img, size_t len);
 int  nvmtl_vk_image_create_typed_placed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_heap *heap, size_t offset, nvk_image *out);
 int  nvmtl_vk_depth_create_ex_placed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t aspect, nvk_heap *heap, size_t offset, nvk_image *out);

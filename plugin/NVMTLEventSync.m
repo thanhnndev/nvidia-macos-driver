@@ -66,13 +66,18 @@ static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
         NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
+        nvmtl_vk_surface_seed_batch_begin();    // one seed move per surface, not per plane texture
         for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
             if (!t->_surf) continue;
+            // review of 4b2835e, finding 2: move a host-imported multi-plane surface's seed at commit too, so a reader that
+            // submits before our completion bump (nvmtlSurfaceOut) sees a new seed and copies (its watched shadow)
+            if (t->_hostOn && !t->_hostRO) (void)nvmtl_vk_surface_seed_bump((void *)t->_surf);
             if (!writes) { writes = [NSMutableDictionary new]; [nvmtl_surface_writers setObject:writes forKey:cb->_queue]; }
             NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
             write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
             writes[nvmtl_surface_writer_key(t)] = write;
         }
+        nvmtl_vk_surface_seed_batch_end();
     }
 }
 static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
@@ -83,6 +88,119 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
             if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
         }
         if (!writes.count) [nvmtl_surface_writers removeObjectForKey:cb->_queue];
+    }
+}
+
+
+// Fence-ordered swap (NMXAccel debug.nmxaccel_fence_wait). In WindowServer every IOSurface a command buffer writes gets
+// IOSurfaceSetValue("NMXFencePending", n) at commit and ("NMXFenceDone", n) once its work completed and its pixels are in
+// the surface. NMXAccel's display pipe waits for done >= pending before it copies the surface to the panel, so
+// commitAndWaitUntilSubmitted no longer has to wait for completion. NVMTL_NMX_FENCE=0 turns it off here.
+#include <sys/sysctl.h>
+static BOOL nvmtl_nmx_fence_on(void) {
+    static int ws = -1;
+    if (ws < 0) {
+        const char *e = getenv("NVMTL_NMX_FENCE");
+        ws = (getprogname() && !strcmp(getprogname(), "WindowServer") && !(e && e[0] == '0')) ? 1 : 0;
+        if (e && e[0] == '2') ws = 2;   // test: mark surfaces in any process, whatever the sysctl says
+    }
+    if (!ws) return NO;
+    if (ws == 2) return YES;
+    // Called on every commit (WindowServer: every frame). The sysctl is a runtime toggle, so re-read it at most once a
+    // second instead of on each commit (it was ~1 % of WindowServer's main thread in __sysctl).
+    static _Atomic int cachedOn = -1;
+    static _Atomic uint64_t nextRead;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    BOOL on;
+    if (cachedOn >= 0 && now < nextRead) {
+        on = cachedOn == 1;
+    } else {
+        int v = 0; size_t n = sizeof v;
+        on = sysctlbyname("debug.nmxaccel_fence_wait", &v, &n, NULL, 0) == 0 && v == 1;
+        cachedOn = on ? 1 : 0;
+        nextRead = now + 1000000000ull;   // 1 s
+    }
+    static int said = -1;
+    if (said != on) { said = on;
+        nvlog("commit: fence-ordered swap %s (debug.nmxaccel_fence_wait %s, NVMTL_NMX_FENCE=%s)",
+              on ? "ON - WindowServer returns once submitted, NMXAccel waits for NMXFenceDone" : "off - WindowServer waits for completion",
+              on ? "1" : "not 1", getenv("NVMTL_NMX_FENCE") ?: "unset"); }
+    return on;
+}
+static _Atomic unsigned long long gNmxFenceSeq;
+static NSMapTable *nvmtl_nmx_fence_done;   // IOSurface (weak) -> NSNumber: the highest NMXFenceDone written
+static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
+    cb->_nmxFence = nil; cb->_nmxFenced = NO; cb->_nmxSubSent = NO; cb->_nmxLastSurfPart = -1;
+    if (!nvmtl_nmx_fence_on()) return;
+    for (NSUInteger i = 0; i < cb->_parts.count; i++) {
+        NVMTLSubmissionPart *part = cb->_parts[i];
+        if ([part isKindOfClass:[NVMTLSubmissionPart class]] && part->surfaces.count) cb->_nmxLastSurfPart = (NSInteger)i;
+    }
+    NSMutableSet *seen = [NSMutableSet new];
+    for (NVMTLSubmissionPart *part in cb->_parts) for (NVMTLTexture *t in part->surfaces) {
+        if (!t->_surf || [seen containsObject:(__bridge id)t->_surf]) continue;
+        [seen addObject:(__bridge id)t->_surf];
+        const unsigned long long n = atomic_fetch_add(&gNmxFenceSeq, 1) + 1;
+        // WS-CPU 9.3: NMXFencePending is no longer written here. It goes out with NMXFenceSubmitted in ONE IOSurface call
+        // when the last surface-writing part is submitted on this thread (submit-ahead, WindowServer's normal case), or
+        // alone at the end of nvmtlSubmitWithEvents otherwise: either way before commit returns, so before the swap.
+        // The commit time (frame-path trace, FRAME-PATH.md section 7) is taken now and written with it.
+        if (!cb->_nmxFence) cb->_nmxFence = [NSMutableArray new];
+        [cb->_nmxFence addObject:@[(__bridge id)t->_surf, @(n), @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW))]];
+    }
+    cb->_nmxFenced = cb->_nmxFence.count != 0;
+    cb->_nmxPendSent = NO;
+}
+static _Atomic unsigned long long gNmxPendMerged, gNmxPendAlone;
+/* Writes NMXFencePending (once per command buffer) and, with submitted, NMXFenceSubmitted in the same call. */
+static void nvmtl_nmx_fence_publish(NVMTLCommandBuffer *cb, BOOL submitted) {
+    @synchronized ([NVMTLCommandBuffer class]) {
+        NSArray *marks = cb->_nmxFence;
+        if (!marks.count || (cb->_nmxPendSent && (!submitted || cb->_nmxSubSent))) return;
+        const BOOL pend = !cb->_nmxPendSent;
+        for (NSArray *m in marks) {
+            NSDictionary *v = pend && submitted ? @{ @"NMXFencePending": m[1], @"NMXFencePendingT": m[2], @"NMXFenceSubmitted": m[1] }
+                            : pend ? @{ @"NMXFencePending": m[1], @"NMXFencePendingT": m[2] }
+                            : @{ @"NMXFenceSubmitted": m[1] };
+            IOSurfaceSetValues((__bridge IOSurfaceRef)m[0], (__bridge CFDictionaryRef)v);
+        }
+        cb->_nmxPendSent = YES;
+        if (submitted) cb->_nmxSubSent = YES;
+        if (pend) {     /* a Submitted-only publish does not move the counts: no repeated census line (review of 97e286e) */
+            atomic_fetch_add(submitted ? &gNmxPendMerged : &gNmxPendAlone, 1);
+            const unsigned long long k = gNmxPendMerged + gNmxPendAlone;
+            if (k == 1 || !(k & (k - 1)) || !(k & 0xFFFF))
+                nvlog("commit: fence marks: %llu with NMXFenceSubmitted in one call, %llu Pending alone (part not yet submitted)",
+                      (unsigned long long)gNmxPendMerged, (unsigned long long)gNmxPendAlone);
+        }
+    }
+}
+// out-31 (FRAME-PATH row 1): NMXGPU records each CS job's fence against the IOSurfaces it writes, and NMXAccel lets the
+// display commit wait for it in the kernel - but only for a frame whose CS is already in the kernel. "Scheduled" is
+// marked before the CS ioctl and a surface may be written by a later part, so after the last part that writes a marked
+// surface has passed vkQueueSubmit (the CS ioctl; RADV on amdgpu submits immediately) this writes
+// NMXFenceSubmitted = n. NMXAccel flips with the kernel fence only when NMXFenceSubmitted >= NMXFencePending; otherwise
+// it waits for NMXFenceDone as before. Runs on the submitting thread, not the completion thread.
+static void nvmtl_nmx_fence_submitted(NVMTLCommandBuffer *cb, NSInteger partIndex) {
+    if (cb->_nmxSubSent || !cb->_nmxFence.count || partIndex < cb->_nmxLastSurfPart) return;
+    nvmtl_nmx_fence_publish(cb, YES);
+}
+static void nvmtl_nmx_fence_done_all(NVMTLCommandBuffer *cb, double gpuEndSeconds) {
+    NSArray *marks;
+    @synchronized ([NVMTLCommandBuffer class]) { marks = cb->_nmxFence; cb->_nmxFence = nil; }
+    if (!marks.count) return;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        if (!nvmtl_nmx_fence_done) nvmtl_nmx_fence_done = [NSMapTable weakToStrongObjectsMapTable];
+        for (NSArray *m in marks) {
+            id surf = m[0]; NSNumber *n = m[1];
+            NSNumber *was = [nvmtl_nmx_fence_done objectForKey:surf];
+            if (was && was.unsignedLongLongValue >= n.unsignedLongLongValue) continue;
+            [nvmtl_nmx_fence_done setObject:n forKey:surf];
+            // frame-path trace: when this thread saw the fence, and the GPU's own end time (CLOCK_UPTIME_RAW ns, 0 = none)
+            IOSurfaceSetValues((__bridge IOSurfaceRef)surf, (__bridge CFDictionaryRef)@{ @"NMXFenceDone": n,
+                @"NMXFenceDoneT": @(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)),
+                @"NMXFenceGpuEndT": @(gpuEndSeconds > 0 ? (unsigned long long)(gpuEndSeconds * 1e9) : 0ull) });
+        }
     }
 }
 
@@ -117,6 +235,30 @@ static int nvmtl_skip_empty_on(void) {
     return on;
 }
 
+// Surface list: the command buffer holds every resource it uses until it completes (that is what keeps them alive),
+// so its resource set names every IOSurface texture its commands read or write. Each one's imported allocation is added
+// to this part's command buffer, which is then marked exact: its submit no longer carries every live surface.
+static void nvmtl_part_list_surfaces(nvk_cmdbuf *c, NVMTLResSet *res, NSSet *surfaces, NVMTLTexture *present)
+{
+    if (!c || !c->cb) return;
+    const int aud = nvmtl_bl_audit_on();
+    void (^buf)(NVMTLBuffer *) = ^(NVMTLBuffer *b) { if (!b) return; if (aud) nvmtl_vk_audit_listed(c, &b->_b);
+                                                     if (b->_hostSL) nvmtl_vk_cmd_use_surface(c, &b->_b); };
+    void (^use)(id) = ^(id o) {
+        if ([o isKindOfClass:[NVMTLBuffer class]]) { buf((NVMTLBuffer *)o); return; }
+        if (![o isKindOfClass:[NVMTLTexture class]]) return;
+        NVMTLTexture *r = (NVMTLTexture *)o;
+        for (NVMTLTexture *v = r; v; v = v->_parent) if (v->_backBuf) buf(v->_backBuf);   // a texture on a buffer's pages
+        while (r->_parent) r = r->_parent;
+        if (r->_hostOn && r->_hostSL) { if (aud) nvmtl_vk_audit_listed(c, &r->_hostBuf); nvmtl_vk_cmd_use_surface(c, &r->_hostBuf); }
+    };
+    for (id o in res) use(o);
+    for (id o in surfaces) use(o);
+    if (present) use(present);
+    if (aud) nvmtl_vk_audit_check(c, "seal");
+    nvmtl_vk_cmd_exact(c);
+}
+
 @implementation NVMTLCommandBuffer (EventSubmission)
 - (void)nvmtlReserveQueue {
     if (_reservation) return;
@@ -136,6 +278,7 @@ static int nvmtl_skip_empty_on(void) {
     part->commands = _c;
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
+    nvmtl_part_list_surfaces(&part->commands, part->resources, part->surfaces, _present);
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
     static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
@@ -256,12 +399,14 @@ static int nvmtl_skip_empty_on(void) {
     if (!error && _gpuTimingSeen && !_gpuTimingInvalid)
         (void)nvmtl_vk_interval_seconds(&_gpuTiming, &deviceStart, &deviceEnd);
     nvmtl_surface_finish_writes(self);
+    nvmtl_nmx_fence_done_all(self, deviceEnd);   // after the surfaces hold the pixels (host import, or nvmtlSurfaceOut above)
     [_completionCondition lock];
     _gpuStart = deviceStart; _gpuEnd = deviceEnd;
     _legacyKernelEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
     [_completionCondition unlock];
+    if (_fsCommitNs) nvmtl_frame_stats_cb(_fsCommitNs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     [_parts removeAllObjects];
     // A finished command buffer lets go of everything only its GPU work needed: the setBytes ring and the scratch
     // buffers it filled, and any resources still listed on it. Apple's command buffers do the same. An app's
@@ -356,7 +501,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
     part->copyInputsPrepared = YES;
 }
 - (BOOL)nvmtlSubmitAhead {
-    if (_executionDone || _cbError || !_committed) return NO;
+    if (_executionDone || _cbError || !_committed || _syncHold) return NO;
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
     while (_nextSubmit < _parts.count) {
         if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
@@ -396,6 +541,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
             part->aheadFailed = r;
             return NO;
         }
+        nvmtl_nmx_fence_submitted(self, (NSInteger)_nextSubmit - 1);
         part->inflight = f;
         nvmtl_evfold_promise_part(part);
         const unsigned long long n = atomic_fetch_add(&gsub_inflight, 1) + 1;
@@ -426,7 +572,22 @@ static void nvmtl_gsub_ahead_pass1(void) {
         }
     }
 }
+// The commit thread may now run the ahead pass while the worker is inside nvmtlAdvancePart. A part the worker submits
+// itself (not submitted ahead) is held: the ahead pass must neither submit it twice nor submit a later part before it.
 - (BOOL)nvmtlAdvancePart {
+    BOOL hold = NO;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        if (!_executionDone && !_cbError && _nextPart < _parts.count) {
+            NVMTLSubmissionPart *p = _parts[_nextPart];
+            if ([p isKindOfClass:[NVMTLSubmissionPart class]] && !p->inflight && !p->aheadFailed && !p->aheadEmpty && !p->waitFolded)
+                hold = _syncHold = YES;
+        }
+    }
+    const BOOL r = [self nvmtlAdvancePart0];
+    if (hold) @synchronized ([NVMTLCommandBuffer class]) { _syncHold = NO; }
+    return r;
+}
+- (BOOL)nvmtlAdvancePart0 {
     if (_executionDone) return NO;
     if (_cbError) { [self nvmtlFinishExecution:_cbError]; return YES; }
     if (_nextPart >= _parts.count) { [self nvmtlFinishExecution:nil]; return YES; }
@@ -459,6 +620,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
             result = nvmtl_vk_submit_wait(&part->commands);
         }
+        if (result == 0) nvmtl_nmx_fence_submitted(self, (NSInteger)_nextPart);
         if (result == -2) {
             if (!nvmtl_quarantined_parts) nvmtl_quarantined_parts = [NSMutableArray new];
             [nvmtl_quarantined_parts addObject:part];
@@ -466,7 +628,9 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (result == 0) [self nvmtlCollectDeviceTiming:&part->commands];
         BOOL published = result == 0;
         if (published) {
+            nvmtl_vk_surface_seed_batch_begin();    // one seed move per surface, not per plane texture
             for (NVMTLTexture *texture in part->surfaces) if (![texture nvmtlSurfaceOut]) published = NO;
+            nvmtl_vk_surface_seed_batch_end();
             for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
         }
         if (!published) {
@@ -503,11 +667,14 @@ static void nvmtl_gsub_ahead_pass1(void) {
         _committed = YES;
         if (!__atomic_load_n(&_rep, __ATOMIC_ACQUIRE)) __atomic_store_n(&_rep, nvmtl_ep_enter(), __ATOMIC_RELEASE);
         [_completionCondition lock]; _cbstatus = MTLCommandBufferStatusCommitted; [_completionCondition unlock];
+        if (nvmtl_frame_stats_on()) _fsCommitNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         [self nvmtlSealPartWithSignal:nil value:0 restart:NO];
         nvmtl_surface_register_writes(self);
+        nvmtl_nmx_fence_mark(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
         nvmtl_pump_buffers();
+        nvmtl_nmx_fence_publish(self, NO);   // NMXFencePending, if submit-ahead did not already send it with Submitted
     }
 }
 @end
@@ -537,14 +704,34 @@ static void nvmtl_pump_buffers_sync(void) {
 }
 
 static uint64_t nvmtl_pump_generation;
+static int nvmtl_commit_ahead_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_COMMIT_AHEAD"); on = !(e && e[0] == '0');
+        nvlog("commit: submit-ahead on the committing thread %s (NVMTL_COMMIT_AHEAD=%s)", on ? "ON" : "off", e ? e : "unset"); }
+    return on;
+}
 static void nvmtl_pump_buffers(void) {
     static dispatch_once_t once; static dispatch_queue_t worker;
     const BOOL async = nvmtl_async_commit_on();
-    if (async) dispatch_once(&once, ^{ worker = dispatch_queue_create("nvmtl.execution", DISPATCH_QUEUE_SERIAL); });
+    // FRAME-PATH.md row 1: in WindowServer this queue carries "the frame's GPU work is done" to the display pipe, but a queue
+    // made without a QoS runs at the default priority, behind the owner's apps. The file below (A/B only, default off)
+    // makes it USER_INTERACTIVE; the real fix moves the fence wait into the kernel.
+    if (async) dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr = DISPATCH_QUEUE_SERIAL;
+        if (access("/Library/GPUBundles/nvmtl-exec-qos-ui", F_OK) == 0) {
+            attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+            nvlog("commit: nvmtl.execution at USER_INTERACTIVE (/Library/GPUBundles/nvmtl-exec-qos-ui)");
+        }
+        worker = dispatch_queue_create("nvmtl.execution", attr);
+    });
     if (!async) { nvmtl_vk_clock_refresh(); nvmtl_pump_buffers_sync(); return; }
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_pending_buffers.count) return;
         ++nvmtl_pump_generation;
+        // Submit (and mark scheduled) on the committing thread. WAS: only the worker ran the ahead pass, between its
+        // blocking fence waits, so a buffer committed while the worker waited for the previous one was scheduled only
+        // when that one completed: CoreDisplay's waitUntilScheduled was a wait for the previous composite (Step96 trace).
+        if (nvmtl_commit_ahead_on() && nvmtl_gsub_ahead_on()) nvmtl_gsub_ahead_pass();
         if (nvmtl_pumping) return;
         nvmtl_pumping = YES;
         dispatch_async(worker, ^{
