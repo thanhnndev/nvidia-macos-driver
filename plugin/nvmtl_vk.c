@@ -2620,6 +2620,20 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
    WindowServer's completion thread, plus fresh zero-fill faults on the next calloc. NVMTL_CB_RECYCLE=1 keeps up to 8 of
    each on a free list instead (a table is cleared like calloc on reuse; a desc-cache block is reset the way a new one is).
    Default off. */
+/* NVMTL_CB_RECYCLE and NVMTL_FENCE_BATCH: "1" = on in every process that loads NVMTL, "ws" = on in WindowServer only
+   (nvrm610.conf is read by every Metal process, so this lets a change start in WindowServer alone); anything else off.
+   *scope says which, for the log line. */
+static int nvmtl_scoped_knob(const char *name, const char **scope) {
+    const char *e = getenv(name), *me = getprogname();
+    *scope = "off";
+    if (e && !strcmp(e, "1")) { *scope = "every process"; return 1; }
+    if (e && !strcmp(e, "ws")) {
+        const int ws = me && !strcmp(me, "WindowServer");
+        *scope = ws ? "WindowServer only (=ws)" : "=ws, and this is not WindowServer";
+        return ws;
+    }
+    return 0;
+}
 #define NVMTL_BLKPOOL_N 8
 typedef struct { pthread_mutex_t lk; void *b[NVMTL_BLKPOOL_N]; unsigned n; } nvmtl_blkpool;
 static nvmtl_blkpool g_tab_pool = { PTHREAD_MUTEX_INITIALIZER }, g_dcb_pool = { PTHREAD_MUTEX_INITIALIZER };
@@ -2627,8 +2641,8 @@ static _Atomic unsigned long long g_blk_reuse, g_blk_new, g_blk_kept, g_blk_free
 static _Atomic unsigned long long g_fence_batch_resets, g_fence_batch_fences;   /* cut 1 item 3, below */
 static int nvmtl_cb_recycle_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_CB_RECYCLE"); on = e && e[0] == '1';
-        nvlog("vk: command-buffer table / desc-cache block recycling %s (NVMTL_CB_RECYCLE)", on ? "ON" : "off"); }
+    if (on < 0) { const char *scope; on = nvmtl_scoped_knob("NVMTL_CB_RECYCLE", &scope);
+        nvlog("vk: command-buffer table / desc-cache block recycling %s (NVMTL_CB_RECYCLE: %s)", on ? "ON" : "off", scope); }
     return on;
 }
 static void *nvmtl_blk_get(nvmtl_blkpool *p) {
@@ -7171,8 +7185,9 @@ static int nvmtl_fence_pool_on(void) {
 static VkFence g_fence_sig[NVMTL_FENCE_BATCH]; static unsigned g_fence_sig_n, g_fence_made;
 static int nvmtl_fence_batch_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_FENCE_BATCH"); on = nvmtl_fence_pool_on() && e && e[0] == '1';
-        nvlog("vk: batched fence resets %s (NVMTL_FENCE_BATCH)", on ? "ON (8 per reset)" : "off"); }
+    if (on < 0) { const char *scope; on = nvmtl_scoped_knob("NVMTL_FENCE_BATCH", &scope) && nvmtl_fence_pool_on();
+        nvlog("vk: batched fence resets %s (NVMTL_FENCE_BATCH: %s%s)", on ? "ON (8 per reset)" : "off", scope,
+              nvmtl_fence_pool_on() ? "" : "; NVMTL_FENCE_POOL=0 turns it off"); }
     return on;
 }
 /* under g_fence_pool_lock: reset the signaled list in one call and move it to the pool (destroying what does not fit) */

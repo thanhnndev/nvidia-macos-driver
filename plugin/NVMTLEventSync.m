@@ -154,22 +154,35 @@ static void nvmtl_nmx_fence_mark(NVMTLCommandBuffer *cb) {
 // WS-CPU cut 1 item 1 (NVMTL_NMX_FENCE_CALL=1, default off): the marks go to NMXAccel's fence table in ONE call on an
 // NMXDrmClient connection (selector 3, kexts/NVRM/accel/nmx/nmx_fence_table.h; the ABI below must stay identical)
 // instead of one IOSurfaceSetValues per surface. NMXAccel reads the table first and the properties otherwise.
-// Any failure turns the call off for the rest of the process and the marks go to the properties again, starting
-// with the ones of the failing call: kIOReturnUnsupported (debug.nmxaccel_fence_table 0), an NMXAccel without
-// selector 3 (kIOReturnBadArgument), no connection, or kIOReturnNoSpace (every table row in flight; NMXAccel then
-// drops this process's rows, so none can shadow the property values written from here on).
-// NVMTL_NMX_FENCE_CALL_SIM (tests only, no kernel call): "ok" = every call succeeds, "refuse=N" = call N fails.
+// A failed call sends that publish's marks to the properties instead (all of them, also those of an earlier chunk the
+// table took: the same values, so either read agrees), and nothing is latched:
+//  - debug.nmxaccel_fence_table is read at most once a second (as debug.nmxaccel_fence_wait is): while it reads 0 (or is
+//    missing) no call is made, and a 0 -> 1 write is picked up within a second. That write clears the kernel table, so
+//    no row from before can shadow a property written while it was 0.
+//  - kIOReturnUnsupported (the gate went 0 since the last read), kIOReturnNotPrivileged (not WindowServer at gate 1),
+//    kIOReturnBadArgument (an NMXAccel without selector 3) or no connection: calls pause until the next read, a second
+//    later at most, so a denied process costs one call a second.
+//  - kIOReturnNoSpace (every row in flight; NMXAccel drops this process's rows): that publish only.
+// Mixing is safe because NMXAccel falls back per key and every seq is new (gNmxFenceSeq only grows): a key read from a
+// stale property is always older than the same key in the table, so the wait condition errs towards waiting.
+// NVMTL_NMX_FENCE_CALL_SIM (tests only, no kernel call and no sysctl): "ok" = every call succeeds, "refuse=N" = from
+// call N on every call fails with NoSpace, "gateoff=N:M" = calls N..M (attempts, counted while paused too) see gate 0.
 #include <IOKit/IOKitLib.h>
 enum { NVMTL_FCALL_SEL = 3, NVMTL_FCALL_MAX = 16 };
 enum { NVMTL_FCALL_PENDING = 1, NVMTL_FCALL_SUBMITTED = 2, NVMTL_FCALL_DONE = 4 };
 struct nvmtl_fcall_entry { uint32_t surfaceID, flags; uint64_t seq, tNs, gpuEndNs; };
 struct nvmtl_fcall { uint32_t version, n; struct nvmtl_fcall_entry e[NVMTL_FCALL_MAX]; };
 _Static_assert(sizeof(struct nvmtl_fcall_entry) == 32, "NMXAccel fence call ABI");
-static int gNmxFcall = -1;            /* -1 unread, 0 off, 1 on, 2 fell back */
+static int gNmxFcall = -1;            /* -1 unread, 0 off (environment), 1 on */
 static io_connect_t gNmxFcallConn;
-static int gNmxFcallSim;              /* 0 kernel, 1 ok, 2 refuse at call gNmxFcallSimAt */
-static unsigned long long gNmxFcallSimAt;
-static _Atomic unsigned long long gNmxFcallCalls, gNmxFcallEntries, gNmxFcallMarks;
+static int gNmxFcallSim;              /* 0 kernel, 1 ok, 2 refuse from call gNmxFcallSimAt, 3 gate 0 for calls At..To */
+static unsigned long long gNmxFcallSimAt, gNmxFcallSimTo;
+static _Atomic unsigned long long gNmxFcallCalls, gNmxFcallEntries, gNmxFcallMarks, gNmxFcallFailed, gNmxFcallPausedPub;
+/* gate cache; caller holds @synchronized([NVMTLCommandBuffer class]) */
+static int gNmxFcallGate = -1;        /* last debug.nmxaccel_fence_table read (0 also when missing), -1 none yet */
+static uint64_t gNmxFcallNextRead;    /* CLOCK_UPTIME_RAW ns of the next read */
+static const char *gNmxFcallPause;    /* why calls are paused until the next read (NULL = not paused) */
+static const char *gNmxFcallSaid;     /* the pause reason last logged; cleared (and "resumed" logged) by a call that works */
 static BOOL nvmtl_nmx_fcall_on(void) {
     if (gNmxFcall < 0) {
         const char *e = getenv("NVMTL_NMX_FENCE_CALL");
@@ -177,21 +190,47 @@ static BOOL nvmtl_nmx_fcall_on(void) {
         const char *sim = getenv("NVMTL_NMX_FENCE_CALL_SIM");
         if (sim && !strcmp(sim, "ok")) gNmxFcallSim = 1;
         else if (sim && !strncmp(sim, "refuse=", 7)) { gNmxFcallSim = 2; gNmxFcallSimAt = strtoull(sim + 7, NULL, 10); }
-        if (gNmxFcall) nvlog("commit: fence marks through NMXAccel's fence table (NVMTL_NMX_FENCE_CALL=1%s%s)",
-                             sim ? ", simulated: " : "", sim ?: "");
+        else if (sim && !strncmp(sim, "gateoff=", 8)) {
+            char *end = NULL; gNmxFcallSim = 3; gNmxFcallSimAt = strtoull(sim + 8, &end, 10);
+            gNmxFcallSimTo = (end && *end == ':') ? strtoull(end + 1, NULL, 10) : gNmxFcallSimAt;
+        }
+        if (gNmxFcall) nvlog("commit: fence marks through NMXAccel's fence table while debug.nmxaccel_fence_table is "
+                             "on (NVMTL_NMX_FENCE_CALL=1, gate re-read once a second%s%s)", sim ? "; simulated: " : "", sim ?: "");
     }
     return gNmxFcall == 1;
 }
-static void nvmtl_nmx_fcall_off(const char *why, kern_return_t kr) {
-    gNmxFcall = 2;
-    nvlog("commit: fence table call off for this process (%s, 0x%08x) - the marks go to IOSurface properties "
-          "(%llu calls, %llu surface marks sent before)", why, kr, (unsigned long long)gNmxFcallCalls,
-          (unsigned long long)gNmxFcallEntries);
+static void nvmtl_nmx_fcall_pause(const char *why, kern_return_t kr) {
+    if (gNmxFcallSaid != why)
+        nvlog("commit: fence table calls paused (%s, 0x%08x) - marks go to IOSurface properties until the gate reads on "
+              "again (%llu calls, %llu surface marks sent before)", why, kr, (unsigned long long)gNmxFcallCalls,
+              (unsigned long long)gNmxFcallEntries);
+    gNmxFcallSaid = gNmxFcallPause = why;
+}
+/* YES when a call may be made now: the gate read (cached for a second) is on and no failure paused calls since it */
+static BOOL nvmtl_nmx_fcall_gate(unsigned long long attempt) {
+    if (gNmxFcallSim) {
+        const BOOL off = gNmxFcallSim == 3 && attempt >= gNmxFcallSimAt && attempt <= gNmxFcallSimTo;
+        if (off) { nvmtl_nmx_fcall_pause("simulated gate 0", kIOReturnUnsupported); return NO; }
+    } else {
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (gNmxFcallGate < 0 || now >= gNmxFcallNextRead) {
+            int v = 0; size_t n = sizeof v;
+            gNmxFcallGate = (sysctlbyname("debug.nmxaccel_fence_table", &v, &n, NULL, 0) == 0 && v != 0) ? 1 : 0;
+            gNmxFcallNextRead = now + 1000000000ull;
+            if (gNmxFcallGate) gNmxFcallPause = NULL;   /* try again; a failure pauses until the next read */
+        }
+        if (!gNmxFcallGate) { nvmtl_nmx_fcall_pause("debug.nmxaccel_fence_table is 0 or missing", kIOReturnUnsupported); return NO; }
+        if (gNmxFcallPause) return NO;          /* a failure paused calls until the next read */
+        return YES;
+    }
+    gNmxFcallPause = NULL;
+    return YES;
 }
 /* caller holds @synchronized([NVMTLCommandBuffer class]); YES = the kernel has every entry */
 static BOOL nvmtl_nmx_fcall_send(struct nvmtl_fcall *c) {
     if (!nvmtl_nmx_fcall_on() || !c->n) return NO;
-    const unsigned long long k = atomic_fetch_add(&gNmxFcallCalls, 1) + 1;
+    const unsigned long long k = atomic_fetch_add(&gNmxFcallCalls, 1) + 1;   /* attempts, paused ones included */
+    if (!nvmtl_nmx_fcall_gate(k)) { atomic_fetch_add(&gNmxFcallPausedPub, 1); return NO; }
     kern_return_t kr;
     if (gNmxFcallSim) {
         kr = (gNmxFcallSim == 2 && k >= gNmxFcallSimAt) ? kIOReturnNoSpace : KERN_SUCCESS;
@@ -200,22 +239,36 @@ static BOOL nvmtl_nmx_fcall_send(struct nvmtl_fcall *c) {
             io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
             kr = svc ? IOServiceOpen(svc, mach_task_self(), 0x4E4D4452u /* 'NMDR' */, &gNmxFcallConn) : kIOReturnNotFound;
             if (svc) IOObjectRelease(svc);
-            if (kr != KERN_SUCCESS) { gNmxFcallConn = 0; nvmtl_nmx_fcall_off("no NMDR connection", kr); return NO; }
+            if (kr != KERN_SUCCESS) { gNmxFcallConn = 0; nvmtl_nmx_fcall_pause("no NMDR connection", kr); return NO; }
         }
         c->version = 1;
         kr = IOConnectCallStructMethod(gNmxFcallConn, NVMTL_FCALL_SEL, c, 8 + 32 * (size_t)c->n, NULL, NULL);
     }
     if (kr != KERN_SUCCESS) {
-        nvmtl_nmx_fcall_off(kr == kIOReturnUnsupported ? "debug.nmxaccel_fence_table is 0"
-                            : kr == kIOReturnNoSpace ? "table full, NMXAccel dropped this process's rows"
-                            : kr == kIOReturnBadArgument ? "NMXAccel has no selector 3 (or refused the call)" : "call failed", kr);
-        if (gNmxFcallConn) { IOServiceClose(gNmxFcallConn); gNmxFcallConn = 0; }
+        const unsigned long long f = atomic_fetch_add(&gNmxFcallFailed, 1) + 1;
+        if (kr == kIOReturnNoSpace) {           /* this publish only; NMXAccel dropped this process's rows */
+            if (f == 1 || !(f & (f - 1)))
+                nvlog("commit: fence table full, NMXAccel dropped this process's rows; this publish goes to properties "
+                      "(%llu failed calls)", f);
+        } else {
+            nvmtl_nmx_fcall_pause(kr == kIOReturnUnsupported ? "debug.nmxaccel_fence_table went 0"
+                                  : kr == kIOReturnNotPrivileged ? "not WindowServer at gate 1"
+                                  : kr == kIOReturnBadArgument ? "NMXAccel has no selector 3 (or refused the call)"
+                                  : "call failed", kr);
+            if (kr == kIOReturnUnsupported) gNmxFcallGate = 0;   /* known off until the next read */
+        }
         return NO;
     }
-    atomic_fetch_add(&gNmxFcallEntries, c->n);
+    const unsigned long long ok = atomic_fetch_add(&gNmxFcallEntries, c->n) + c->n;
+    if (gNmxFcallSaid) {
+        nvlog("commit: fence table calls resumed (call %llu; %llu publishes went to properties while paused)", k,
+              (unsigned long long)gNmxFcallPausedPub);
+        gNmxFcallSaid = NULL;
+    }
     if (k == 1 || !(k & (k - 1)) || !(k & 0xFFFF))
-        nvlog("commit: fence table: %llu calls, %llu surface marks (%llu IOSurfaceSetValues saved)", k,
-              (unsigned long long)gNmxFcallEntries, (unsigned long long)gNmxFcallEntries);
+        nvlog("commit: fence table: %llu calls, %llu surface marks (%llu IOSurfaceSetValues saved), %llu failed, "
+              "%llu publishes while paused", k, ok, ok, (unsigned long long)gNmxFcallFailed,
+              (unsigned long long)gNmxFcallPausedPub);
     return YES;
 }
 /* marks = [surface, seq, time] arrays; YES when the table took all of them (else the caller writes properties) */

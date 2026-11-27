@@ -3,6 +3,8 @@
 // WindowServer), then reads the surfaces' NMXFence* properties back:
 //   FCALL_EXPECT=props   the marks went to the properties (Done == Pending on every surface)   - call off, or fell back
 //   FCALL_EXPECT=none    no surface carries NMXFencePending (every mark went through the call)  - SIM=ok
+//   FCALL_EXPECT=resume  surfaces 0-2 carry NMXFencePending (written while the gate read 0), the 20 of phase 2 none
+//                        (calls resumed)                                                       - SIM=gateoff=5:40
 // Phase 1: 3 surfaces, FCALL_FRAMES frames (one surface per command buffer); phase 2: one command buffer writing 20
 // surfaces (two calls: 16 + 4).
 //   xcrun clang -fobjc-arc -o fcall_test fcall_test.m -framework Foundation -framework Metal -framework IOSurface -framework IOKit
@@ -60,13 +62,16 @@ int main(void) { @autoreleasepool {
     for (int i = 3; i < NS; i++) pass(cb, t[i], 0.5);
     [cb commit]; [cb waitUntilCompleted];
     usleep(200000);   /* the completion thread publishes Done after the completed handler */
-    int withProps = 0, consistent = 0;
+    int withProps = 0, consistent = 0, early = 0;
     for (int i = 0; i < NS; i++) {
         BOOL hp, hd; unsigned long long p = prop(s[i], @"NMXFencePending", &hp), dn = prop(s[i], @"NMXFenceDone", &hd);
         if (hp) withProps++;
+        if (hp && i < 3) early++;
         if (hp && hd && dn >= p) consistent++;
     }
-    int ok = !strcmp(expect, "none") ? withProps == 0 : (withProps == NS && consistent == NS);
+    int ok = !strcmp(expect, "none") ? withProps == 0
+           : !strcmp(expect, "resume") ? (early == 3 && withProps == 3)
+           : (withProps == NS && consistent == NS);
     printf("%s: expect %s, %d/%d surfaces carry NMXFencePending, %d with Done >= Pending\n", ok ? "PASS" : "FAIL", expect,
            withProps, NS, consistent);
     for (int i = 0; i < NS; i++) CFRelease(s[i]);
