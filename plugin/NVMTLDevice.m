@@ -1083,7 +1083,10 @@ static struct { uint64_t hits, misses, fresh, otherKey, gone[8], shadowDrops, sh
                 // F1: memory-pressure events and their drops
                 uint64_t idleSurfaces, idleSurfBytes, idleAgeBytes[5], expBack7[7], pressWarn, pressCrit, pressNormal, pressDrops, pressBytes, pressBack[2];
                 // WS-CPU 9.9 adaptive keep timeout (per 30 s report)
-                uint64_t kaDrops, kaBack, kaSaved, kaRaise, kaDecay, kaPress, kaBeyondBytes; } nvmtl_sk;
+                uint64_t kaDrops, kaBack, kaSaved, kaRaise, kaDecay, kaPress, kaBeyondBytes;
+                // WS-CPU 9.10 park-aware keep (per 30 s report): parked entries / bytes at the last sweep, hits on parked
+                // entries, of them hits only the parked rule kept, and drops by the parked caps
+                uint64_t pkN, pkBytes, pkHits, pkSaved, pkCapDrops; } nvmtl_sk;
 // WS-CPU 9.9 (2026-11-27 spindump, owner load): expired entries that came back cost ~0.65 ms per present in WindowServer
 // (re-import 0.30 on the main thread: pin + GPU map in the kernel; BO free 0.35 on the release queue), ~24 % of all driver
 // CPU there. Most came back 10-60 s after the NVMTL_KEEP_MS (30 s) drop. The idle timeout now adapts like the plane-shadow
@@ -1099,6 +1102,37 @@ static void nvmtl_ka_press_reset(uint64_t now);
 // NVMTL_KEEP_SMALL_KB in bytes, at file scope: the touch path below counts only entries above it as kept by the raise
 // (small tiles stay NVMTL_KEEP_SMALL_MS, 120 s, whatever the adaptive timeout; review of c53ab829 F1)
 static long nvmtl_sk_smallBytes = 2048 * 1024;
+// WS-CPU 9.10 park-aware keep. Since Step142 NMXGPU unwires an IOSurface userptr BO that no command buffer used for
+// debug.nmx_userptr_park_ms (60 s; a 1 s kernel sweep, 32 BOs per pass) and re-wires it at its next use. A keep entry
+// idle that long is parked: it still holds its BO, GPU mapping and surface retain, but no wired pages. The idle cap
+// (NVMTL_KEEP_IDLE_MB, 1024 MB) and the 120 s small-tile rule counted those entries as if they were wired: on the
+// 2026-11-28 21:36 boot WindowServer held ~100k parked pages (390 MB) in the keep, the cap dropped entries idle 126 ms
+// (a 2880x1800 layer, re-imported on the main thread right after), and small tiles expired at 120 s came back seconds
+// to minutes later (4923 parks, 99 restores: parked entries were dropped and imported again instead of restored).
+// NVMTL_KEEP_PARKED=1 (default off): an entry idle for park_ms + NVMTL_KEEP_PARK_SLACK_MS (10 s) counts as parked:
+// - it is left out of the idle cap's bytes and count (NVMTL_KEEP_IDLE_MB / _MAX bound wired idle memory only);
+// - a small one (<= NVMTL_KEEP_SMALL_KB) is kept up to NVMTL_KEEP_PARKED_MS (600 s) instead of NVMTL_KEEP_SMALL_MS;
+//   a large one keeps the base / adaptive timeout (it only parks when the adaptive raise passes park_ms);
+// - parked entries have their own caps, NVMTL_KEEP_PARKED_MB (256 MB of surface memory: the keep's retain keeps a
+//   surface alive) and NVMTL_KEEP_PARKED_MAX (1024 entries), oldest dropped first.
+// Memory pressure (F1), dead / held / shadow rules are unchanged. park_ms is re-read every 10 s (sysctl, no root);
+// 0 or no NMXGPU = nothing counts as parked (the old rules). Under g_sk_lock.
+static uint64_t nvmtl_sk_parkAfter;      // ms of idle after which an entry counts as parked; 0 = off
+static long nvmtl_sk_keepSmallMs = 120000, nvmtl_sk_keepParkedMs = 600000;
+static void nvmtl_sk_park_refresh(int on, long slack, uint64_t now) {
+    static uint64_t readAt; static long last = -1;
+    if (!on) { nvmtl_sk_parkAfter = 0; return; }
+    if (readAt && now - readAt < 10000) return;
+    readAt = now;
+    int v = 0; size_t n = sizeof v;
+    // NVMTL_KEEP_PARK_MS: tests only (parkedkeep_test), stands in for the kernel's value; never set it in nvrm610.conf
+    static long forced = -2; if (forced == -2) { const char *e = getenv("NVMTL_KEEP_PARK_MS"); forced = e ? atol(e) : -1; }
+    const long ms = forced >= 0 ? forced
+                  : sysctlbyname("debug.nmx_userptr_park_ms", &v, &n, NULL, 0) == 0 && n == sizeof v && v > 0 ? v : 0;
+    nvmtl_sk_parkAfter = ms ? (uint64_t)ms + (uint64_t)MAX(0L, slack) : 0;
+    if (ms != last) { last = ms; nvlog("surface keep: parked rule %s (debug.nmx_userptr_park_ms %ld, counted parked after %llu ms idle)",
+                                       ms ? "ON" : "idle (the kernel does not park)", ms, (unsigned long long)nvmtl_sk_parkAfter); }
+}
 static struct { int on; long base, ceil, eff; uint64_t winStart, winBack, winDrops, winSaved, winNeed, lastAct; } nvmtl_ka = { .eff = 30000, .base = 30000, .ceil = 30000 };
 // surface ID -> (drop time ms << 20) | idle ms at the drop (clamped), so an expired miss says how long the entry had been
 // idle when it went and how soon the surface came back (expBack: < 250 ms, < 1 s, < 3 s, later)
@@ -1150,6 +1184,11 @@ static void nvmtl_sk_report(NSDictionary *keep, uint64_t now) {
           nvmtl_ka.eff, nvmtl_ka.base, nvmtl_ka.ceil, nvmtl_ka.on ? "adaptive" : "fixed (NVMTL_KEEP_ADAPT=0)",
           (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.kaDrops, nvmtl_sk.kaBack, nvmtl_sk.kaSaved, nvmtl_sk.kaRaise,
           nvmtl_sk.kaDecay, nvmtl_sk.kaPress, nvmtl_sk.idleBytes >> 20, nvmtl_sk.kaBeyondBytes >> 20);
+    if (nvmtl_sk_parkAfter)
+        nvlog_report("surface keep: parked rule (idle >= %llu ms): %llu entries %llu MB parked at the last sweep (not in the idle cap); last %llu s: "
+              "hits on parked entries %llu (restored by the kernel, not imported), of them small tiles past the small timeout %llu; "
+              "parked-cap drops %llu", (unsigned long long)nvmtl_sk_parkAfter, nvmtl_sk.pkN, nvmtl_sk.pkBytes >> 20,
+              (unsigned long long)((now - nvmtl_sk.lastLogMs) / 1000), nvmtl_sk.pkHits, nvmtl_sk.pkSaved, nvmtl_sk.pkCapDrops);
     const uint64_t logged = nvmtl_sk.logged;
     memset(&nvmtl_sk, 0, sizeof nvmtl_sk); nvmtl_sk.logged = logged; nvmtl_sk.lastLogMs = now;
 }
@@ -1253,6 +1292,10 @@ static void nvmtl_surface_touch(id dev, NVMTLSurfKey *key) {
              // and counting it held a raised timeout up forever (review of c53ab829 F1)
              if (nvmtl_ka.eff > nvmtl_ka.base && tn - e->_last >= (uint64_t)nvmtl_ka.base && e->_tex->_surf
                  && (long)IOSurfaceGetAllocSize(e->_tex->_surf) > nvmtl_sk_smallBytes) { nvmtl_ka.winSaved++; nvmtl_sk.kaSaved++; nvmtl_ka.lastAct = tn; }
+             if (nvmtl_sk_parkAfter && tn - e->_last >= nvmtl_sk_parkAfter) {
+                 nvmtl_sk.pkHits++;   // a restore in the kernel instead of an import + release here
+                 if (e->_tex->_surf && (long)IOSurfaceGetAllocSize(e->_tex->_surf) <= nvmtl_sk_smallBytes
+                     && tn - e->_last >= (uint64_t)MAX(nvmtl_ka.eff, nvmtl_sk_keepSmallMs)) nvmtl_sk.pkSaved++; }
              e->_last = e->_wrap = tn; }
     nvmtl_sk.hits++;
     if (keep) nvmtl_sk_report(keep, e ? e->_last : nvmtl_keep_now_ms());
@@ -1287,6 +1330,7 @@ static void nvmtl_surface_keep(id dev, NVMTLSurfKey *key, NVMTLTexture *t) {
 // press: 0 = a normal insert or timer sweep; 1 / 2 = the sweep a memory-pressure WARN / CRITICAL event runs (F1 below)
 static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t, int press) {
     static long keepMs = -1, keepIdle = -1, keepIdleMax = -1, keepViewMs = -1, sweepMs = -1, keepSmallMs = -1, smallBytes = -1, keepShadowMs = 0; static uint64_t keepIdleBytes, lastSweep; static int dropDead = -1; static long keepShadowMaxMs = 0;
+    static int keepParked = 0; static long keepParkedMax = 1024, parkSlackMs = 10000; static uint64_t keepParkedBytes = 256ull << 20;
     if (keepMs < 0) { const char *e = getenv("NVMTL_KEEP_MS"); keepMs = e ? atol(e) : 30000;
                       e = getenv("NVMTL_KEEP_IDLE"); keepIdle = e ? atol(e) : 48;
                       e = getenv("NVMTL_KEEP_IDLE_MAX"); keepIdleMax = e ? atol(e) : 2048; if (keepIdleMax < keepIdle) keepIdleMax = keepIdle;
@@ -1295,6 +1339,15 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
                       e = getenv("NVMTL_KEEP_SWEEP_MS"); sweepMs = e ? atol(e) : 100;
                       e = getenv("NVMTL_KEEP_SMALL_MS"); keepSmallMs = e ? atol(e) : 120000;
                       e = getenv("NVMTL_KEEP_SMALL_KB"); smallBytes = (e ? atol(e) : 2048) * 1024; nvmtl_sk_smallBytes = smallBytes;
+                      nvmtl_sk_keepSmallMs = keepSmallMs;
+                      e = getenv("NVMTL_KEEP_PARKED"); keepParked = e && e[0] == '1';
+                      e = getenv("NVMTL_KEEP_PARKED_MS"); nvmtl_sk_keepParkedMs = e ? atol(e) : 600000; if (nvmtl_sk_keepParkedMs > 3600000) nvmtl_sk_keepParkedMs = 3600000;
+                      e = getenv("NVMTL_KEEP_PARKED_MB"); keepParkedBytes = (uint64_t)(e ? atol(e) : 256) << 20;
+                      e = getenv("NVMTL_KEEP_PARKED_MAX"); keepParkedMax = e ? atol(e) : 1024;
+                      e = getenv("NVMTL_KEEP_PARK_SLACK_MS"); parkSlackMs = e ? atol(e) : 10000;
+                      nvlog("surface keep: parked rule %s (NVMTL_KEEP_PARKED): entries idle past the kernel's park time + %ld ms leave the idle cap; "
+                            "small ones kept up to %ld ms; parked caps %llu MB / %ld entries (NVMTL_KEEP_PARKED_MS / _MB / _MAX, NVMTL_KEEP_PARK_SLACK_MS)",
+                            keepParked ? "on" : "OFF", parkSlackMs, nvmtl_sk_keepParkedMs, (unsigned long long)(keepParkedBytes >> 20), keepParkedMax);
                       // Dead entries (see the sweep) go at once outside WindowServer; NVMTL_KEEP_DEAD=0/1 overrides.
                       e = getenv("NVMTL_KEEP_DEAD"); dropDead = e ? e[0] == '1' : strcmp(getprogname(), "WindowServer") != 0;
                       e = getenv("NVMTL_KEEP_SHADOW_MS"); keepShadowMs = e ? atol(e) : 3000;
@@ -1322,7 +1375,9 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     if (key) nvmtl_sk_miss(keep, key);
     // The sweep walks every entry (849 us average at 600 entries, YouTube 2026-11-08). Once per NVMTL_KEEP_SWEEP_MS
     // (100 ms) is enough for 30 s idle times; a table well over the cap sweeps at once.
-    if (!press && key && now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8) {
+    nvmtl_sk_park_refresh(keepParked, parkSlackMs, now);
+    const long parkRoom = nvmtl_sk_parkAfter ? keepParkedMax : 0;
+    if (!press && key && now - lastSweep < (uint64_t)sweepMs && (long)keep.count < keepIdleMax + keepIdleMax / 8 + parkRoom) {
         nvmtl_sk.sweepSkips++;
         NVMTLSurfKeep *e = [NVMTLSurfKeep new]; e->_tex = t; e->_last = e->_wrap = now;
         nvmtl_sk_put(keep, key, e);
@@ -1353,7 +1408,8 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
     }
     const long effMs = nvmtl_ka.on ? nvmtl_ka.eff : keepMs;
     NSMutableArray<NVMTLSurfKey *> *idle = [NSMutableArray new], *gone = [NSMutableArray new], *dead = [NSMutableArray new], *unshadow = [NSMutableArray new],
-                                  *pressed = [NSMutableArray new];
+                                  *pressed = [NSMutableArray new], *parked = [NSMutableArray new];
+    const uint64_t parkAfter = nvmtl_sk_parkAfter;   // 0: nothing counts as parked (NVMTL_KEEP_PARKED off, or no park)
     // Unused plane shadows (2026-11-23, working load: Edge 4K 10-bit video): an x420 plane starts at +64 in its surface, so
     // each read-only plane texture carries a full GPU copy of the plane (nvmtl_btsh; a 4K frame's two planes = 25 MB of
     // GTT pages, wired). The entries below that a held surface keeps alive for NVMTL_KEEP_VIEW_MS after their last wrap
@@ -1426,13 +1482,18 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
             nvmtl_sk.deadDrops++; nvmtl_sk.deadBytes += nvmtl_sk_bytes(b); [dead addObject:k]; return; }
         // Small surfaces (Electron / CoreAnimation tiles, <= NVMTL_KEEP_SMALL_KB) stay NVMTL_KEEP_SMALL_MS (120 s): on
         // 2026-11-08 1472x256 / 768x64 / 320x64 tiles came back 40-200 ms after a drop at ~28 s idle (CPU-THERMALS.md).
-        if (b->_surf && b->_hostOn && now - e->_last < (uint64_t)((long)nvmtl_sk_bytes(b) <= smallBytes ? MAX(effMs, keepSmallMs) : effMs)) {
+        const BOOL small = (long)nvmtl_sk_bytes(b) <= smallBytes;
+        const uint64_t idleFor = now - e->_last;
+        const BOOL isParked = parkAfter && b->_surf && b->_hostOn && idleFor >= parkAfter;   // WS-CPU 9.10
+        long tmo = small ? MAX(effMs, keepSmallMs) : effMs;
+        if (isParked && small) tmo = MAX(tmo, nvmtl_sk_keepParkedMs);
+        if (b->_surf && b->_hostOn && idleFor < (uint64_t)tmo) {
             // F1: under memory pressure an idle entry goes now (WARN: idle >= 5 s; CRITICAL: any idle one), but only one
             // that nothing else holds: retain count 1 on the texture = no live wrapper or view, and no command buffer in
             // flight (each retains its resources until it completes), so the BO cannot go under a CS or a present.
             // Everything above this rule (held, live wrapper, in use, dead, shadow) is untouched.
             if (press && CFGetRetainCount((__bridge CFTypeRef)b) == 1 && (press >= 2 || now - e->_last >= 5000)) { [pressed addObject:k]; return; }
-            [idle addObject:k]; return; }
+            [(isParked ? parked : idle) addObject:k]; return; }
         [gone addObject:k];
     }];
     CFRelease(own);
@@ -1484,6 +1545,23 @@ static void nvmtl_surface_keep_locked(id dev, NVMTLSurfKey *key, NVMTLTexture *t
         }
         capFrom = i;
     }
+    // WS-CPU 9.10: parked entries, own caps (surface memory the keep's retain holds, and entry count), oldest first
+    if (parked.count) {
+        uint64_t pb = 0;
+        for (NVMTLSurfKey *k in parked) pb += nvmtl_sk_bytes(keep[k]->_tex);
+        if ((long)parked.count > keepParkedMax || pb > keepParkedBytes) {
+            [parked sortUsingComparator:^NSComparisonResult(NVMTLSurfKey *a, NVMTLSurfKey *b) {
+                const uint64_t xa = keep[a]->_last, xb = keep[b]->_last;   // oldest (smallest _last) first
+                return xa < xb ? NSOrderedAscending : xa > xb ? NSOrderedDescending : NSOrderedSame; }];
+            NSUInteger i = 0, n = parked.count;
+            while (i < n && ((long)(n - i) > keepParkedMax || pb > keepParkedBytes)) {
+                pb -= MIN(pb, (uint64_t)nvmtl_sk_bytes(keep[parked[i]]->_tex));
+                nvmtl_sk_drop(keep, parked[i], NVMTL_GONE_CAP); nvmtl_sk.pkCapDrops++; i++;
+            }
+            nvmtl_sk.pkN = n - i;
+        } else nvmtl_sk.pkN = parked.count;
+        nvmtl_sk.pkBytes = pb;
+    } else { nvmtl_sk.pkN = 0; nvmtl_sk.pkBytes = 0; }
     // F2: what stays idle, per distinct surface, by age (read-only; the rules above do not use it). Only in the last 5 s
     // before a 30 s report is due (the sweep runs on WindowServer's main thread under the device lock); the 5 s timer
     // sweeps the table in that window whenever it has entries, so the report always has a recent value.
