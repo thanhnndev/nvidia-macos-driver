@@ -67,7 +67,7 @@ int nmx_import_reuse = 0;
 int nmx_import_reuse_cap = 65536;          /* idle records in all (~300 B each: 64k = ~19 MB) */
 volatile long long gNmxReuseRevived, gNmxReuseKept, gNmxReuseIdle, gNmxReuseEvicted, gNmxReuseDrained;
 volatile long long gNmxReuseBlocks, gNmxReuseBlockRefs, gNmxReuseSegs, gNmxReuseSegPages, gNmxReuseBlocksLive;
-#define PIN_BLK_REFS 127                   /* bit 2: 8 B head + 127 x 24 B = 3056 B, fits the 3072 B kalloc zone */
+#define PIN_BLK_REFS 125                   /* bit 2: 8 B head + 125 x 24 B = 3008 B; malloc() adds a 48 B header + 16 B align = 3072 B, the kalloc zone */
 
 struct backing {
     int kind;

@@ -133,7 +133,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     CHECK(nmx_page_init() == 0);
-    CHECK(sizeof(struct pin_blk) + PIN_BLK_REFS * sizeof(struct pin_ref) <= 3072);
+    CHECK(sizeof(struct pin_blk) + PIN_BLK_REFS * sizeof(struct pin_ref) + 48 + 16 <= 3072);   /* + nmx_malloc header and 16 B align */
     uint64_t phys[600];
     for (int i = 0; i < 600; i++) phys[i] = (0x100000ull + (uint64_t)i * 7) << PAGE_SHIFT;
     long base = live_allocs;

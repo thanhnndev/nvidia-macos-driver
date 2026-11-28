@@ -391,7 +391,7 @@ NMX_CNT(nmx_import_reuse_revived, gNmxReuseRevived, "import reuse: idle page rec
 NMX_CNT(nmx_import_reuse_kept, gNmxReuseKept, "import reuse: page records kept idle at their last unpin instead of freed");
 NMX_CNT(nmx_import_reuse_idle, gNmxReuseIdle, "import reuse: idle page records now");
 NMX_CNT(nmx_import_reuse_evicted, gNmxReuseEvicted, "import reuse: idle page records freed over the cap");
-NMX_CNT(nmx_import_reuse_drained, gNmxReuseDrained, "import reuse: idle page records freed by clearing bit 1 or unload");
+NMX_CNT(nmx_import_reuse_drained, gNmxReuseDrained, "import reuse: idle page records freed by clearing bit 1, a cap write or unload");
 NMX_CNT(nmx_import_reuse_blocks, gNmxReuseBlocks, "import reuse: pin entry blocks allocated (bit 2)");
 NMX_CNT(nmx_import_reuse_blocks_live, gNmxReuseBlocksLive, "import reuse: pin entry blocks not yet freed (an entry still on a page)");
 NMX_CNT(nmx_import_reuse_block_refs, gNmxReuseBlockRefs, "import reuse: pin entries in those blocks");
