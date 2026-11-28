@@ -370,16 +370,30 @@ static int nmx_import_reuse_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, nmx_import_reuse, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
             nmx_import_reuse_sysctl, "I",
             "import reuse: bit 1 keep idle user page records, 2 pin entries in blocks, 4 phys addresses by segment; 0 = off");
-SYSCTL_INT(_debug, OID_AUTO, nmx_import_reuse_cap, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_import_reuse_cap, 0,
-           "import reuse bit 1: idle user page records kept at most (all stripes; per stripe cap/256, at least 1)");
+extern "C" void nmx_import_reuse_cap_set(int cap);
+static int nmx_import_reuse_cap_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = nmx_import_reuse_cap;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err != 0 || req->newptr == USER_ADDR_NULL)
+        return err;
+    if (v < 0)
+        return EINVAL;
+    nmx_import_reuse_cap_set(v);
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_import_reuse_cap, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_import_reuse_cap_sysctl, "I",
+            "import reuse bit 1: idle user page records kept at most (per stripe cap/256, at least 1); a write frees what is over it, 0 = none kept");
 extern "C" volatile SInt64 gNmxReuseRevived, gNmxReuseKept, gNmxReuseIdle, gNmxReuseEvicted, gNmxReuseDrained;
-extern "C" volatile SInt64 gNmxReuseBlocks, gNmxReuseBlockRefs, gNmxReuseSegs, gNmxReuseSegPages;
+extern "C" volatile SInt64 gNmxReuseBlocks, gNmxReuseBlockRefs, gNmxReuseSegs, gNmxReuseSegPages, gNmxReuseBlocksLive;
 NMX_CNT(nmx_import_reuse_revived, gNmxReuseRevived, "import reuse: idle page records revived by a new pin");
 NMX_CNT(nmx_import_reuse_kept, gNmxReuseKept, "import reuse: page records kept idle at their last unpin instead of freed");
 NMX_CNT(nmx_import_reuse_idle, gNmxReuseIdle, "import reuse: idle page records now");
 NMX_CNT(nmx_import_reuse_evicted, gNmxReuseEvicted, "import reuse: idle page records freed over the cap");
 NMX_CNT(nmx_import_reuse_drained, gNmxReuseDrained, "import reuse: idle page records freed by clearing bit 1 or unload");
 NMX_CNT(nmx_import_reuse_blocks, gNmxReuseBlocks, "import reuse: pin entry blocks allocated (bit 2)");
+NMX_CNT(nmx_import_reuse_blocks_live, gNmxReuseBlocksLive, "import reuse: pin entry blocks not yet freed (an entry still on a page)");
 NMX_CNT(nmx_import_reuse_block_refs, gNmxReuseBlockRefs, "import reuse: pin entries in those blocks");
 NMX_CNT(nmx_import_reuse_segs, gNmxReuseSegs, "import reuse: getPhysicalSegment calls of the bit 4 loop");
 NMX_CNT(nmx_import_reuse_seg_pages, gNmxReuseSegPages, "import reuse: pages those calls filled");
@@ -646,6 +660,7 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_import_reuse_evicted,
     &sysctl__debug_nmx_import_reuse_drained,
     &sysctl__debug_nmx_import_reuse_blocks,
+    &sysctl__debug_nmx_import_reuse_blocks_live,
     &sysctl__debug_nmx_import_reuse_block_refs,
     &sysctl__debug_nmx_import_reuse_segs,
     &sysctl__debug_nmx_import_reuse_seg_pages,

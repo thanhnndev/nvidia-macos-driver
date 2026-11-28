@@ -99,13 +99,32 @@ static int reg_count(vm_paddr_t pfn)
     for (struct reg_entry *e = reg_table[reg_bucket(pfn)]; e; e = e->next) n += e->pfn == pfn;
     return n;
 }
+/* sets fields LinuxKPI or a caller may leave on a record, so a reset can be checked */
+static void dirty(vm_page_t m)
+{
+    m->nmx_lkpi = (void *)0xdead; m->a_flags = 0x55; m->pindex = 77; m->oflags = 0; m->md.pat_mode = 1;
+    m->order = 3; m->pool = 2; m->flags |= 0x8000; m->nmx_npages = 9;
+}
+/* the record as out-55 makes it: page_record_init + PG_FICTITIOUS + ref 1 */
+static int fresh(vm_page_t m, vm_paddr_t pa)
+{
+    return m->phys_addr == pa && m->ref_count == 1 && m->flags == PG_FICTITIOUS && m->nmx_lkpi == NULL &&
+           m->a_flags == 0 && m->pindex == 0 && m->oflags == VPO_UNMANAGED && m->md.pat_mode == VM_MEMATTR_WRITE_BACK &&
+           m->order == 0 && m->pool == 0 && m->nmx_npages == 0 && m->nmx_kva == NULL && m->object == NULL;
+}
 /* one owned-pin import + put_pages + destroy of npages at phys base, the BO cycle of a re-imported IOSurface */
 static void cycle(uint64_t *phys, int n)
 {
     vm_page_t pages[600]; void *pin;
     wire_phys = phys; wire_n = n;
     CHECK(nmx_upin_create(0x1000, n, 1, pages, &pin) == n);
-    for (int i = 0; i < n; i++) CHECK(pages[i] && pages[i]->ref_count == 1 && pages[i]->phys_addr == phys[i]);
+    for (int i = 0; i < n; i++) {
+        CHECK(pages[i] && pages[i]->phys_addr == phys[i]);
+        if (((struct backing *)pages[i]->nmx_alloc)->kind != BK_USER)
+            continue;           /* the permanent record of phys[3]: out-55 keeps its state, not under test here */
+        CHECK(fresh(pages[i], phys[i]));    /* new, or revived after it was dirtied: identical */
+        dirty(pages[i]);
+    }
     nmx_upin_put_pages(pin, pages, n);
     nmx_upin_destroy(pin);
 }
@@ -114,6 +133,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     CHECK(nmx_page_init() == 0);
+    CHECK(sizeof(struct pin_blk) + PIN_BLK_REFS * sizeof(struct pin_ref) <= 3072);
     uint64_t phys[600];
     for (int i = 0; i < 600; i++) phys[i] = (0x100000ull + (uint64_t)i * 7) << PAGE_SHIFT;
     long base = live_allocs;
@@ -153,6 +173,8 @@ int main(void)
     /* nmx_phys_to_page on an idle record: leaves the list, turns permanent */
     vm_page_t f = nmx_phys_to_page(phys[3]);
     CHECK(f && ((struct backing *)f->nmx_alloc)->kind == BK_FICTITIOUS && gNmxReuseIdle == 499 && gNmxUserRecKept == 1);
+    CHECK(f && fresh(f, phys[3]));     /* dirtied before it went idle (cycle), handed out as out-55's fresh one */
+    CHECK(gNmxReuseBlocksLive == 0);
 
     /* a chunk page registered later at the same frame shadows the idle record; its removal leaves the idle one */
     struct backing *ck = calloc(1, sizeof(*ck) + sizeof(struct vm_page));
@@ -183,6 +205,20 @@ int main(void)
     for (unsigned s = 0; s < REG_LOCKS; s++) CHECK(idle_n[s] <= 1);
     CHECK(gNmxReuseIdle == gNmxUserRecLive);
     nmx_import_reuse_cap = 65536;
+
+    /* a lower cap frees what is over it at once; cap 0 frees every idle record and keeps none */
+    nmx_import_reuse_cap = 65536;
+    cycle(phys, 500);
+    CHECK(gNmxReuseIdle == 499);
+    nmx_import_reuse_cap_set(256);
+    for (unsigned s = 0; s < REG_LOCKS; s++) CHECK(idle_n[s] <= 1);
+    nmx_import_reuse_cap_set(0);
+    CHECK(gNmxReuseIdle == 0 && gNmxUserRecLive == 0);
+    cycle(phys, 100);
+    CHECK(gNmxReuseIdle == 0 && gNmxUserRecLive == 0);
+    nmx_import_reuse_cap_set(65536);
+    cycle(phys, 500);
+    CHECK(gNmxReuseIdle == 499 && gNmxReuseBlocksLive == 0);
 
     /* clearing bit 1 frees every idle record; the registry holds only the permanent one */
     nmx_import_reuse_set(2);

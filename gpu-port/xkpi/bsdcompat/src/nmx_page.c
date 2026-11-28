@@ -66,8 +66,8 @@ int nmx_userptr_park_ms = 60000;      /* Step142b: 10 s re-wired whole swap chai
 int nmx_import_reuse = 0;
 int nmx_import_reuse_cap = 65536;          /* idle records in all (~300 B each: 64k = ~19 MB) */
 volatile long long gNmxReuseRevived, gNmxReuseKept, gNmxReuseIdle, gNmxReuseEvicted, gNmxReuseDrained;
-volatile long long gNmxReuseBlocks, gNmxReuseBlockRefs, gNmxReuseSegs, gNmxReuseSegPages;
-#define PIN_BLK_REFS 128                   /* bit 2: 128 x 24 B = 3 KB per block, stays in a kalloc zone */
+volatile long long gNmxReuseBlocks, gNmxReuseBlockRefs, gNmxReuseSegs, gNmxReuseSegPages, gNmxReuseBlocksLive;
+#define PIN_BLK_REFS 127                   /* bit 2: 8 B head + 127 x 24 B = 3056 B, fits the 3072 B kalloc zone */
 
 struct backing {
     int kind;
@@ -692,8 +692,10 @@ static void pin_ref_free(struct pin_ref *r)
     struct pin_blk *b = r->blk;
     if (b == NULL)
         free(r, M_NMXPAGE);
-    else if (__atomic_sub_fetch(&b->live, 1, __ATOMIC_SEQ_CST) == 0)
+    else if (__atomic_sub_fetch(&b->live, 1, __ATOMIC_SEQ_CST) == 0) {
         free(b, M_NMXPAGE);
+        __atomic_sub_fetch(&gNmxReuseBlocksLive, 1, __ATOMIC_RELAXED);
+    }
 }
 
 /* refs[0..n) = n new pin entries: blocks of PIN_BLK_REFS with bit 2, else one malloc each. 0, or ENOMEM with none left */
@@ -712,6 +714,7 @@ static int pin_refs_alloc(struct pin_ref **refs, int n)
                 refs[i++] = &b->refs[j];
             }
             __atomic_add_fetch(&gNmxReuseBlocks, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&gNmxReuseBlocksLive, 1, __ATOMIC_RELAXED);
             __atomic_add_fetch(&gNmxReuseBlockRefs, k, __ATOMIC_RELAXED);
         }
         return 0;
@@ -784,7 +787,8 @@ static bool page_unref(vm_page_t m);
  *      block with its last entry) instead of one malloc per page.
  *   4  (xnu/nmx_mm.cpp) the physical address loop of a wire / rewire takes each segment's length and fills the
  *      contiguous pages from one getPhysicalSegment call instead of one call per page.
- * Counters: debug.nmx_import_reuse_{revived,kept,idle,evicted,drained,blocks,block_refs,segs,seg_pages}.
+ * Counters: debug.nmx_import_reuse_{revived,kept,idle,evicted,drained,blocks,blocks_live,block_refs,segs,seg_pages}.
+ * Writing debug.nmx_import_reuse_cap frees the idle records over the new cap at once (0: all of them).
  */
 static struct backing *idle_head[REG_LOCKS], *idle_tail[REG_LOCKS];   /* newest first; links bk->next/prev */
 static u_int idle_n[REG_LOCKS];
@@ -855,8 +859,16 @@ static void idle_free_chain(struct backing *bk, struct reg_entry *e, volatile lo
     }
 }
 
-/* frees every idle record (bit 1 cleared, unload); records revived meanwhile are not touched */
-void nmx_import_reuse_drain(void)
+/* per-stripe idle limit for a total cap: cap/256, at least 1 while cap > 0; 0 = keep none */
+static u_int stripe_cap(int cap)
+{
+    if (cap <= 0)
+        return 0;
+    return (u_int)cap / REG_LOCKS ? (u_int)cap / REG_LOCKS : 1;
+}
+
+/* frees the oldest idle records of every stripe until each holds at most per_stripe; revived records are not touched */
+static void idle_trim(u_int per_stripe)
 {
     if (reg_table == NULL)
         return;
@@ -868,7 +880,7 @@ void nmx_import_reuse_drain(void)
         lck_spin_lock(reg_locks[s]);
         struct reg_entry *e;
         struct backing *bk;
-        while ((bk = idle_pop_oldest_locked(s, &e)) != NULL) {
+        while (idle_n[s] > per_stripe && (bk = idle_pop_oldest_locked(s, &e)) != NULL) {
             bk->next = chain;
             chain = bk;
             if (e) {
@@ -881,6 +893,21 @@ void nmx_import_reuse_drain(void)
     }
 }
 
+/* frees every idle record (bit 1 cleared, cap 0, unload) */
+void nmx_import_reuse_drain(void)
+{
+    idle_trim(0);
+}
+
+/* sysctl write of debug.nmx_import_reuse_cap: a lower cap frees what is over it now (0 frees every idle record) */
+void nmx_import_reuse_cap_set(int cap)
+{
+    if (cap < 0)
+        cap = 0;
+    __atomic_store_n(&nmx_import_reuse_cap, cap, __ATOMIC_SEQ_CST);
+    idle_trim(stripe_cap(cap));
+}
+
 /* sysctl write of debug.nmx_import_reuse (xnu/nmx_kext.cpp): clearing bit 1 frees the idle records */
 void nmx_import_reuse_set(int v)
 {
@@ -889,11 +916,20 @@ void nmx_import_reuse_set(int v)
         nmx_import_reuse_drain();
 }
 
-/* an idle record about to be handed out without a reference (nmx_phys_to_page): off the list, it turns permanent */
-static void idle_forget_locked(struct backing *bk)
+/*
+ * an idle record about to be handed out without a reference (nmx_phys_to_page): off the list and re-initialised as
+ * out-55's fresh fictitious record is (ref 1, PG_FICTITIOUS, nothing else), then the caller makes it permanent
+ */
+static void idle_forget_locked(struct vm_page *m)
 {
-    if (bk->idle)
-        idle_unlink_locked(stripe_of(bk->pages[0].phys_addr >> PAGE_SHIFT), bk);
+    struct backing *bk = m->nmx_alloc;
+    if (!bk->idle)
+        return;
+    vm_paddr_t pa = m->phys_addr;
+    idle_unlink_locked(stripe_of(pa >> PAGE_SHIFT), bk);
+    page_record_init(m, bk, pa, NULL);
+    m->flags = PG_FICTITIOUS;
+    m->ref_count = 1;
 }
 
 /* one more reference on a registered record (stripe lock held); an idle one (import reuse bit 1: ref 0, no pins,
@@ -1035,7 +1071,7 @@ static bool page_unref(vm_page_t m)
         if ((__atomic_load_n(&nmx_import_reuse, __ATOMIC_RELAXED) & 1) && cap > 0 && !bk->idle) {
             /* import reuse bit 1: keep it registered and idle; free the stripe's oldest ones over the cap */
             unsigned s = stripe_of(pfn);
-            u_int scap = (u_int)cap / REG_LOCKS ? (u_int)cap / REG_LOCKS : 1;
+            u_int scap = stripe_cap(cap);
             idle_push_locked(s, bk);
             __atomic_add_fetch(&gNmxReuseKept, 1, __ATOMIC_RELAXED);
             for (int k = 0; k < REUSE_EVICT_MAX && idle_n[s] > scap; k++) {
@@ -1402,7 +1438,7 @@ vm_page_t nmx_phys_to_page(vm_paddr_t pa)
     struct vm_page *m = reg_find_locked(pfn);
     if (m != NULL && m->nmx_alloc != NULL && ((struct backing *)m->nmx_alloc)->kind == BK_USER) {
         /* reached without a reference: the caller may keep it, so it can no longer be freed (Step138) */
-        idle_forget_locked(m->nmx_alloc);
+        idle_forget_locked(m);
         ((struct backing *)m->nmx_alloc)->kind = BK_FICTITIOUS;
         __atomic_sub_fetch(&gNmxUserRecLive, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&gNmxUserRecKept, 1, __ATOMIC_RELAXED);
