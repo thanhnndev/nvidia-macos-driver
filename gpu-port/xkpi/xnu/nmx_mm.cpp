@@ -295,6 +295,43 @@ static UserWire *wire_make(IOMemoryDescriptor *md, bool surface)
 }
 
 #include "../bsdcompat/include/nmx_import_trace.h"     /* WS-CPU item 2 probes (C1-C5, D3) */
+
+extern "C" int nmx_import_reuse;
+extern "C" volatile long long gNmxReuseSegs, gNmxReuseSegPages;
+/*
+ * phys[0..npages) of a prepared descriptor; false if a page has no physical address. With import reuse bit 4
+ * (debug.nmx_import_reuse) one getPhysicalSegment call covers every page of its segment (the length it returns),
+ * instead of one call per page. Only whole pages inside the returned length are filled from it.
+ */
+static bool phys_fill(IOMemoryDescriptor *md, size_t npages, uint64_t *phys)
+{
+    if (!(__atomic_load_n(&nmx_import_reuse, __ATOMIC_RELAXED) & 4)) {
+        for (size_t i = 0; i < npages; i++) {
+            IOByteCount len = 0;
+            addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
+            if (pa == 0)
+                return false;
+            phys[i] = pa;
+        }
+        return true;
+    }
+    long long segs = 0;
+    for (size_t i = 0; i < npages;) {
+        IOByteCount len = 0;
+        addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
+        if (pa == 0)
+            return false;
+        segs++;
+        size_t n = len / PAGE_SIZE;
+        if (n == 0)
+            n = 1;
+        for (size_t k = 0; k < n && i < npages; k++, i++)
+            phys[i] = pa + k * PAGE_SIZE;
+    }
+    __atomic_add_fetch(&gNmxReuseSegs, segs, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&gNmxReuseSegPages, (long long)npages, __ATOMIC_RELAXED);
+    return true;
+}
 /* 0 and the surface wiring's record in *handle, or an errno (the caller then wires the user range) */
 
 int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write, uint64_t *phys, void **handle)
@@ -350,15 +387,10 @@ int surf_wire(task_t task, uint32_t id, uint64_t uaddr, size_t npages, int write
         return EPERM;
     }
     NMX_IMP_T0(it4);
-    for (size_t i = 0; i < npages; i++) {
-        IOByteCount len = 0;
-        addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
-        if (pa == 0) {
-            md->complete();
-            md->release();
-            return EFAULT;
-        }
-        phys[i] = pa;
+    if (!phys_fill(md, npages, phys)) {
+        md->complete();
+        md->release();
+        return EFAULT;
     }
     NMX_IMP_STAGE(NMX_IMP_C4_PHYS, it4, npages);
     NMX_IMP_T0(it5);
@@ -533,15 +565,10 @@ extern "C" int nmx_xnu_user_wire(void *mm, uint64_t uaddr, size_t npages, int wr
         return EFAULT;
     }
     NMX_IMP_T0(it4);
-    for (size_t i = 0; i < npages; i++) {
-        IOByteCount len = 0;
-        addr64_t pa = md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
-        if (pa == 0) {
-            md->complete();
-            md->release();
-            return EFAULT;
-        }
-        phys[i] = pa;
+    if (!phys_fill(md, npages, phys)) {
+        md->complete();
+        md->release();
+        return EFAULT;
     }
     NMX_IMP_STAGE(NMX_IMP_C4_PHYS, it4, npages);
     NMX_IMP_T0(it5);
@@ -644,13 +671,8 @@ extern "C" int nmx_xnu_user_rewire(void *handle, size_t npages, uint64_t *phys)
         IOLockUnlock(gWireLock);
     }
     NMX_IMP_T0(it4);
-    for (size_t i = 0; i < npages; i++) {
-        IOByteCount len = 0;
-        addr64_t pa = w->md->getPhysicalSegment(i * PAGE_SIZE, &len, kIOMemoryMapperNone);
-        if (pa == 0)
-            return EFAULT;
-        phys[i] = pa;
-    }
+    if (!phys_fill(w->md, npages, phys))
+        return EFAULT;
     NMX_IMP_STAGE(NMX_IMP_C4_PHYS, it4, npages);
     return 0;
 }

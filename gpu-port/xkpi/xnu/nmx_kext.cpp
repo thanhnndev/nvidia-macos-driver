@@ -352,6 +352,37 @@ SYSCTL_INT(_debug, OID_AUTO, nmx_fault_kick_on, CTLFLAG_RW | CTLFLAG_LOCKED | CT
 extern "C" int nmx_userptr_park_ms;
 SYSCTL_INT(_debug, OID_AUTO, nmx_userptr_park_ms, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_userptr_park_ms, 0,
            "Step142: unwire an IOSurface userptr BO's memory after this many ms without GPU use; 0 = never");
+/* import reuse (WS-CPU item 2 cut, bsdcompat/src/nmx_page.c): bit 1 idle page records, 2 pin entry blocks, 4 phys by
+ * segment; default 0 = the out-55 path. A write that clears bit 1 frees the idle records. */
+extern "C" int nmx_import_reuse, nmx_import_reuse_cap;
+extern "C" void nmx_import_reuse_set(int v);
+static int nmx_import_reuse_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = nmx_import_reuse;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err != 0 || req->newptr == USER_ADDR_NULL)
+        return err;
+    if (v < 0 || v > 7)
+        return EINVAL;
+    nmx_import_reuse_set(v);
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nmx_import_reuse, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, 0, 0,
+            nmx_import_reuse_sysctl, "I",
+            "import reuse: bit 1 keep idle user page records, 2 pin entries in blocks, 4 phys addresses by segment; 0 = off");
+SYSCTL_INT(_debug, OID_AUTO, nmx_import_reuse_cap, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_import_reuse_cap, 0,
+           "import reuse bit 1: idle user page records kept at most (all stripes; per stripe cap/256, at least 1)");
+extern "C" volatile SInt64 gNmxReuseRevived, gNmxReuseKept, gNmxReuseIdle, gNmxReuseEvicted, gNmxReuseDrained;
+extern "C" volatile SInt64 gNmxReuseBlocks, gNmxReuseBlockRefs, gNmxReuseSegs, gNmxReuseSegPages;
+NMX_CNT(nmx_import_reuse_revived, gNmxReuseRevived, "import reuse: idle page records revived by a new pin");
+NMX_CNT(nmx_import_reuse_kept, gNmxReuseKept, "import reuse: page records kept idle at their last unpin instead of freed");
+NMX_CNT(nmx_import_reuse_idle, gNmxReuseIdle, "import reuse: idle page records now");
+NMX_CNT(nmx_import_reuse_evicted, gNmxReuseEvicted, "import reuse: idle page records freed over the cap");
+NMX_CNT(nmx_import_reuse_drained, gNmxReuseDrained, "import reuse: idle page records freed by clearing bit 1 or unload");
+NMX_CNT(nmx_import_reuse_blocks, gNmxReuseBlocks, "import reuse: pin entry blocks allocated (bit 2)");
+NMX_CNT(nmx_import_reuse_block_refs, gNmxReuseBlockRefs, "import reuse: pin entries in those blocks");
+NMX_CNT(nmx_import_reuse_segs, gNmxReuseSegs, "import reuse: getPhysicalSegment calls of the bit 4 loop");
+NMX_CNT(nmx_import_reuse_seg_pages, gNmxReuseSegPages, "import reuse: pages those calls filled");
 extern "C" int nmx_ft_on;
 SYSCTL_INT(_debug, OID_AUTO, nmx_ft, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nmx_ft_on, 0,
            "frame-path trace (FRAME-PATH.md section 7): 0 stops the NMXGPU-side hooks (flip records, VBL timer phase, memory stalls)");
@@ -607,6 +638,17 @@ static struct sysctl_oid *const nmx_oids[] = {
     &sysctl__debug_nmx_ttm_shrink_calls,
     &sysctl__debug_nmx_fault_kick_on,
     &sysctl__debug_nmx_userptr_park_ms,
+    &sysctl__debug_nmx_import_reuse,
+    &sysctl__debug_nmx_import_reuse_cap,
+    &sysctl__debug_nmx_import_reuse_revived,
+    &sysctl__debug_nmx_import_reuse_kept,
+    &sysctl__debug_nmx_import_reuse_idle,
+    &sysctl__debug_nmx_import_reuse_evicted,
+    &sysctl__debug_nmx_import_reuse_drained,
+    &sysctl__debug_nmx_import_reuse_blocks,
+    &sysctl__debug_nmx_import_reuse_block_refs,
+    &sysctl__debug_nmx_import_reuse_segs,
+    &sysctl__debug_nmx_import_reuse_seg_pages,
     &sysctl__debug_nmx_ft,
     &sysctl__debug_nmx_flip_kfence,
     &sysctl__debug_nmx_flip_irq,
